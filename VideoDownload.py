@@ -32,6 +32,10 @@ ffmpegAvailable = shutil.which('ffmpeg') is not None
 # These clients are incompatible with cookies, so none are used.
 YOUTUBE_CLIENTS = ['android_vr', 'android']
 
+# Substrings stripped from a folder name before searching, so YouTube does not
+# return Clone Hero / Rock Band playthrough results instead of the real video.
+TITLE_ISSUES = ['(2x Bass Pedal Expert+)', '(2x Bass Pedal)', 'RB3', '(RB3 version)', '(Rh)']
+
 # Intermediate files that must never be mistaken for a finished video. A real
 # 'video.mp4' is only ever created by an atomic rename once it is fully complete,
 # so anything below is a leftover from an interrupted run and is safe to delete.
@@ -181,6 +185,48 @@ def determine_start_time(url):
     return ms
 
 
+def set_start_time(config, start_ms):
+    """Set video_start_time in whichever [song]/[Song] section the file uses.
+    Returns True if a section was found and updated."""
+    for section in ('song', 'Song'):
+        if config.has_section(section):
+            config.set(section, 'video_start_time', str(start_ms))
+            return True
+    return False
+
+
+def resync_existing_video(url1, url2):
+    """Find video_start_time for a video that is already downloaded.
+
+    The saved video has no audio, so its source can't be read back directly.
+    Instead the chart is aligned against the audio of the current top search
+    result, which is almost always the same upload that was downloaded originally.
+    The top result is tried first; the second is only tried if the first is not a
+    confident match. Returns the offset (ms), or None when nothing is trustworthy
+    (in which case song.ini is left untouched so any manual timing is kept)."""
+    if not ffmpegAvailable or audiosync is None or not audiosync.is_available():
+        return None
+    candidates = [url1] if url1 == url2 else [url1, url2]
+    for u in candidates:
+        try:
+            audio = fetch_sync_audio(u)
+            if not audio:
+                continue
+            ms, info = audiosync.compute_offset_ms('.', audio)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print('  Re-sync error (skipping this candidate): ' + str(e))
+            ms = None
+        finally:
+            cleanup_temp_files()
+        if ms is not None:
+            print('  Re-synced: ' + info)
+            return ms
+    print('  No confident match - timing left unchanged')
+    return None
+
+
 print('Checking for home folder...')
 songsFolder = os.getcwd() + "\\songs"
 time.sleep(0.5)
@@ -188,13 +234,15 @@ if os.path.exists(songsFolder):
     print('Songs folder found\n')
     time.sleep(0.5)
     replace = 'false'
+    resync = False
     videoQuality = '720p'
 
     qualityInput = input('Type the number to pick from the following options:\n'
                       + '1. Default quality (720p)\n'
                       + '2. Best quality (1080p, where available; significantly bigger files):\n'
-                      + '3. [EXPERIMENTAL] Replace existing videos with 1080p (Caution: Use at your own risk. May malfunction and delete videos)\n\n'
-                      + 'Pick between 1-3: ')
+                      + '3. [EXPERIMENTAL] Replace existing videos with 1080p (Caution: Use at your own risk. May malfunction and delete videos)\n'
+                      + '4. Re-sync existing videos (keeps your videos, only fixes their timing)\n\n'
+                      + 'Pick between 1-4: ')
 
     if qualityInput == '1':
         print('Set to 720p')
@@ -206,24 +254,32 @@ if os.path.exists(songsFolder):
         print('Replacing all videos with 1080p. You have time for a nap!')
         videoQuality = 'bestvideo[vcodec^=avc]/best[ext=mp4]/best'
         replace = 'true'
+    elif qualityInput == '4':
+        if not (ffmpegAvailable and audiosync is not None and audiosync.is_available()):
+            print('Re-sync needs ffmpeg and numpy. Place ffmpeg.exe next to this program (see the README).')
+            exit()
+        print('Re-syncing existing videos. Your videos are kept; only the timing is updated.')
+        print('Songs without a video are left alone - run a normal pass to download those.')
+        resync = True
     else:
-        print('You must choose between 1-3. Try again')
+        print('You must choose between 1-4. Try again')
         exit()
 
     # Auto-sync needs ffmpeg (to decode audio for fingerprinting) and numpy.
     syncReady = ffmpegAvailable and audiosync is not None and audiosync.is_available()
 
-    if not ffmpegAvailable:
-        print('\nNote: ffmpeg was not found.')
-        if videoQuality != 'mp4':
-            print('  - 1080p videos are saved as-is (still h264 — they play fine in Clone Hero).')
-        print('  - Auto-sync is off, so videos use a default 3-second offset.')
-        print('  Place ffmpeg.exe next to this program to enable both (see the README).')
-    elif syncReady:
-        print('\nAuto-sync is on: each video is lined up to its chart automatically')
-        print('(this fetches a little extra audio per song to match them up).')
-    else:
-        print('\nNote: auto-sync is off (numpy unavailable); using the default offset.')
+    if not resync:
+        if not ffmpegAvailable:
+            print('\nNote: ffmpeg was not found.')
+            if videoQuality != 'mp4':
+                print('  - 1080p videos are saved as-is (still h264 - they play fine in Clone Hero).')
+            print('  - Auto-sync is off, so videos use a default 3-second offset.')
+            print('  Place ffmpeg.exe next to this program to enable both (see the README).')
+        elif syncReady:
+            print('\nAuto-sync is on: each video is lined up to its chart automatically')
+            print('(this fetches a little extra audio per song to match them up).')
+        else:
+            print('\nNote: auto-sync is off (numpy unavailable); using the default offset.')
 
     homeFolder = os.path.abspath(os.getcwd() + "\\songs")
     os.chdir(homeFolder)
@@ -252,7 +308,7 @@ if os.path.exists(songsFolder):
     print('\n' + '-' * 64)
     print('You can safely stop this program at any time (Ctrl+C or close the')
     print('window). Nothing will be left corrupt, and re-running it later resumes')
-    print('where you left off — songs that already have a video are skipped.')
+    print('where you left off - songs that already have a video are skipped.')
     print('-' * 64 + '\n')
 
     interrupted = False
@@ -264,6 +320,38 @@ if os.path.exists(songsFolder):
                 os.chdir(currentSongFileFolder)
                 pbar.update(1)
 
+                # Re-sync mode: only touch songs that already have a video, fix
+                # their timing in place, and never re-download the video itself.
+                if resync:
+                    if not os.path.exists('video.mp4'):
+                        continue
+                    try:
+                        name = currentSongName
+                        for issue in TITLE_ISSUES:
+                            name = name.replace(issue, '')
+                        query = '{} (Official Music Video)'.format(name)
+                        print('\nRe-syncing: ' + query)
+                        url, url2, _ = search_youtube(query)
+                        ms = resync_existing_video(url, url2)
+                        if ms is not None:
+                            with open('song.ini', encoding='utf-8-sig') as songCheck:
+                                songContents = songCheck.read()
+                            if '//Converted' not in songContents:
+                                config = configparser.ConfigParser()
+                                config.read_string(songContents)
+                                if set_start_time(config, ms):
+                                    write_song_ini(config)
+                                    print('Timing updated.\n')
+                                else:
+                                    print('Could not update song.ini.\n')
+                    except KeyboardInterrupt:
+                        raise
+                    except Exception as e:
+                        print(e)
+                        print('Error re-syncing: ' + currentSongName + '. Skipping')
+                        cleanup_temp_files()
+                    continue
+
                 if (not os.path.exists("video.mp4") and currentSongName not in erroredSongNames) or replace == 'true':
                     try:
                         # In replace mode, drop the existing video first.
@@ -272,8 +360,7 @@ if os.path.exists(songsFolder):
                         cleanup_temp_files()
 
                         # Strip strings that cause YouTube to return Clone Hero/Rock Band playthrough results
-                        titleIssues = ['(2x Bass Pedal Expert+)', '(2x Bass Pedal)', 'RB3', '(RB3 version)', '(Rh)']
-                        for issue in titleIssues:
+                        for issue in TITLE_ISSUES:
                             currentSongName = currentSongName.replace(issue, '')
 
                         query = '{} (Official Music Video)'.format(currentSongName)
@@ -315,13 +402,8 @@ if os.path.exists(songsFolder):
                         else:
                             config = configparser.ConfigParser()
                             config.read_string(songContents)
-                            startTime = str(determine_start_time(usedUrl))
-                            # Check uppercase/lowercase config section name
-                            if config.has_section('song'):
-                                config.set('song', 'video_start_time', startTime)
-                                print('Song ready. Next song...\n')
-                            elif config.has_section('Song'):
-                                config.set('Song', 'video_start_time', startTime)
+                            startTime = determine_start_time(usedUrl)
+                            if set_start_time(config, startTime):
                                 print('Song ready. Next song...\n')
                             else:
                                 print('Could not update song.ini. Check the song.ini for potential issues\n')
@@ -341,7 +423,7 @@ if os.path.exists(songsFolder):
         # cwd is the song that was mid-flight; remove its partial artifacts so it
         # is treated as "not yet downloaded" and retried cleanly next time.
         cleanup_temp_files()
-        print('\n\nStopped. The song in progress was cleaned up — nothing corrupt was left behind.')
+        print('\n\nStopped. The song in progress was cleaned up - nothing corrupt was left behind.')
         print('Everything already downloaded is safe. Re-run this program any time to')
         print('resume; finished songs are skipped automatically.')
 
@@ -353,7 +435,7 @@ if os.path.exists(songsFolder):
             for song in erroredSongs:
                 print(song, end='\n')
         print('\nTip: you can re-run this program any time to fill in anything that')
-        print('was skipped or errored — it only downloads what is still missing.')
+        print('was skipped or errored - it only downloads what is still missing.')
         input("All downloads complete. Checked a total of " + str(totalcount) + " songs. Press Enter button to exit.")
 else:
     input("Did not detect a 'Songs' folder. Check you have placed the .exe file in the directory one level above it. Press any button to exit")

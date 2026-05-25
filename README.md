@@ -67,13 +67,16 @@ The finished `BackstageHero.exe` is placed in `dist\`. PyInstaller is installed 
 
 When you run the tool, you are prompted to choose a quality level:
 
-| # | Quality | Notes |
-|---|---------|-------|
+| # | Option | Notes |
+|---|--------|-------|
 | 1 | 720p | Default. Smaller files, works without ffmpeg. |
 | 2 | 1080p | Significantly larger files. ffmpeg recommended but not required. |
 | 3 | Replace all with 1080p | Deletes existing videos and re-downloads everything at 1080p. Use with caution. |
+| 4 | Re-sync existing videos | Keeps your videos, only fixes their timing. Re-downloads no video, just a little audio per song. Requires ffmpeg. |
 
 720p is the recommended starting point. 1080p files are typically 2–3× larger and require considerably more download time and disk space.
+
+**Already have a library from an earlier version?** Re-running a normal pass won't re-time videos you already have — it only touches songs that are missing one. Use option 4 to add automatic sync to an existing library without re-downloading the videos.
 
 ---
 
