@@ -1,12 +1,12 @@
 """
-Build script -- produces VideoDownload.exe from VideoDownload.py.
+Build script -- produces BackstageHero.exe from VideoDownload.py.
 
 Usage:
     python build.py
 
 Requirements: Python 3.8+, internet connection (first run only).
 PyInstaller and Pillow are installed automatically if missing.
-The finished exe appears in dist\\VideoDownload.exe.
+The finished exe appears in dist\\BackstageHero.exe.
 """
 
 import subprocess
@@ -57,14 +57,14 @@ else:
 
 # ── 3. Run PyInstaller ────────────────────────────────────────────────────────
 
-print('\nBuilding VideoDownload.exe...\n')
+print('\nBuilding BackstageHero.exe...\n')
 subprocess.run(
     [
         sys.executable, '-m', 'PyInstaller',
         '--onefile',                  # single portable exe
         '--noconfirm',                # overwrite previous build without asking
         '--collect-all', 'yt_dlp',   # bundle all yt-dlp extractors (dynamic imports)
-        '--name', 'VideoDownload',
+        '--name', 'BackstageHero',
         *icon_flag,
         'VideoDownload.py',
     ],
@@ -75,10 +75,10 @@ subprocess.run(
 # ── 4. Done ───────────────────────────────────────────────────────────────────
 
 print('\n' + '-' * 60)
-print('Build complete!  -->  dist\\VideoDownload.exe')
+print('Build complete!  -->  dist\\BackstageHero.exe')
 print('-' * 60)
 print('To deploy:')
-print('  1. Copy dist\\VideoDownload.exe to your Clone Hero directory')
+print('  1. Copy dist\\BackstageHero.exe to your Clone Hero directory')
 print('     (the folder that contains your Songs\\ folder).')
 print('  2. For 1080p downloads, also place ffmpeg.exe in that same')
 print('     directory. Get it from:')

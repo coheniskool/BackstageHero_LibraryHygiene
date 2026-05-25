@@ -30,7 +30,7 @@ Clone Hero displays a `video.mp4` file as a background during gameplay if one ex
 
 ### Option 1 — Pre-built executable (Windows)
 
-1. Download `VideoDownload.exe` from the [Releases page](https://github.com/jmb988/BackstageHero/releases/latest).
+1. Download `BackstageHero.exe` from the [Releases page](https://github.com/jmb988/BackstageHero/releases/latest).
 2. Place it in your Clone Hero directory — the folder that **contains** your `Songs` folder, not inside it.
 3. Run it.
 
@@ -58,7 +58,7 @@ python VideoDownload.py
 python build.py
 ```
 
-The finished `VideoDownload.exe` is placed in `dist\`. PyInstaller is installed automatically if not already present.
+The finished `BackstageHero.exe` is placed in `dist\`. PyInstaller is installed automatically if not already present.
 
 ---
 
