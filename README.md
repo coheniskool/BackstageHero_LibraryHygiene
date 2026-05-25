@@ -20,6 +20,7 @@ Clone Hero displays a `video.mp4` file as a background during gameplay if one ex
 
 - Searches YouTube by folder name and downloads the top result
 - Falls back to the second result automatically if the first fails
+- Lines each video up with the chart automatically when it can confirm the same recording
 - Skips songs that already have a video — safe to re-run after adding new songs
 - Resumes cleanly after any interruption; nothing is left corrupt
 - Handles libraries with thousands of songs in deeply nested folders
@@ -34,7 +35,7 @@ Clone Hero displays a `video.mp4` file as a background during gameplay if one ex
 2. Place it in your Clone Hero directory — the folder that **contains** your `Songs` folder, not inside it.
 3. Run it.
 
-For 1080p downloads, also place `ffmpeg.exe` in the same directory. Grab it from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) — download the latest `ffmpeg-master-latest-win64-gpl.zip` and extract `ffmpeg.exe` from the `bin` folder.
+Placing `ffmpeg.exe` in the same directory is recommended — it enables 1080p remuxing and automatic video sync (see [How it works](#how-it-works)). Grab it from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) — download the latest `ffmpeg-master-latest-win64-gpl.zip` and extract `ffmpeg.exe` from the `bin` folder. The tool still runs without it.
 
 ### Option 2 — Run from source
 
@@ -42,7 +43,7 @@ Requires Python 3.8 or later.
 
 ```
 git clone https://github.com/jmb988/BackstageHero
-cd CloneHeroVideoDownloader
+cd BackstageHero
 pip install -r requirements.txt
 ```
 
@@ -90,9 +91,17 @@ This is why every other tool in this space stopped working: they all use the web
 
 On startup, the tool scans the full library and removes any leftover temp files and zero-byte videos from prior interrupted runs before processing begins.
 
+### Automatic sync
+
+A background video only looks right if the music in the video lines up with the chart. Every music video opens with a different amount of intro before the song actually starts, so any fixed offset is just a guess.
+
+After downloading a video, the tool fetches the matching audio track and fingerprints it against the chart's own audio — the same landmark-matching technique Shazam uses. When it can confirm the video uses the same recording as the chart, it measures exactly how far into the video the song begins and writes that as `video_start_time`, so the video lines up on its own. When it can't — the top result is a live take, a remix, or a different master — it falls back to a sensible default offset instead of guessing wrong.
+
+This matching is robust to the EQ, loudness, and compression differences between a YouTube upload and the chart audio, because it compares the *pattern* of audio peaks rather than the raw waveform. It requires ffmpeg. You can always fine-tune `video_start_time` in a song's `song.ini` by hand afterwards.
+
 ### ffmpeg
 
-For 1080p, the tool optionally remuxes the downloaded file into a container format that Clone Hero handles cleanly. Because the Android VR API already delivers h264/MP4, the raw download plays correctly in Clone Hero even without remuxing — ffmpeg is not required. If ffmpeg is absent, the download is used as-is with a one-time notice.
+ffmpeg enables two things: remuxing 1080p downloads into a container Clone Hero handles cleanly, and decoding audio for automatic sync. It is not strictly required — the Android VR API already delivers h264/MP4 that plays in Clone Hero, so without ffmpeg, videos are saved as-is and use the default sync offset. The tool prints a one-time notice if it is missing.
 
 ---
 

@@ -8,8 +8,16 @@ import yt_dlp
 import ffmpeg
 from tqdm import tqdm
 
+# audiosync aligns each video to the chart automatically by fingerprinting the
+# audio. It depends on numpy and ffmpeg; if either is missing we fall back to a
+# fixed offset, so the import is allowed to fail without breaking anything.
+try:
+    import audiosync
+except Exception:
+    audiosync = None
+
 # When running as a PyInstaller exe, add the exe's directory to PATH so that
-# ffmpeg.exe placed alongside VideoDownload.exe is found by ffmpeg-python.
+# ffmpeg.exe placed alongside the program is found by ffmpeg and yt-dlp.
 if getattr(sys, 'frozen', False):
     exe_dir = os.path.dirname(sys.executable)
     os.environ['PATH'] = exe_dir + os.pathsep + os.environ.get('PATH', '')
@@ -46,6 +54,12 @@ def cleanup_temp_files(folder='.'):
                 os.remove(path)
             except OSError:
                 pass
+    # The throwaway audio fetched for syncing has a variable extension.
+    for path in glob.glob(os.path.join(folder, 'video.sync.*')):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def search_youtube(query):
@@ -76,7 +90,7 @@ def download_video(ydl, url):
         # 720p needs no remux; and when ffmpeg is missing the raw android_vr
         # download is already h264/mp4 and plays in Clone Hero. Promote as-is.
         os.replace('video.download.mp4', 'video.mp4')
-        return
+        return url
 
     # Remux into a Clone Hero-friendly container, then atomically promote so that
     # 'video.mp4' only ever appears in its final, correct form.
@@ -99,6 +113,7 @@ def download_video(ydl, url):
         os.remove('video.download.mp4')
         os.replace('video.tmp.mp4', 'video.mp4')
         print('Video ready')
+    return url
 
 
 def write_song_ini(config):
@@ -107,6 +122,63 @@ def write_song_ini(config):
     with open('song.ini.tmp', 'w', encoding='utf-8') as configfile:
         config.write(configfile)
     os.replace('song.ini.tmp', 'song.ini')
+
+
+# A music video almost always opens with a few seconds of intro before the song
+# itself begins, so this is the fallback head start used when alignment can't run
+# or isn't confident. It matches what this tool has always shipped.
+DEFAULT_START_TIME = -3000
+
+
+def fetch_sync_audio(url):
+    """Download just the audio of the chosen video, for fingerprinting only.
+
+    The saved video.mp4 is video-only (Clone Hero supplies the audio), so there
+    is nothing in it to align against. This grabs the matching audio track to a
+    throwaway file and returns its path, or None on failure. The file is small
+    and is deleted as soon as the offset has been computed."""
+    cleanup_temp_files()
+    opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': 'video.sync.%(ext)s',
+        'noplaylist': 1,
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {'youtube': {'player_client': YOUTUBE_CLIENTS}},
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+    matches = glob.glob('video.sync.*')
+    return matches[0] if matches else None
+
+
+def determine_start_time(url):
+    """Return video_start_time (ms) for the song in the current folder.
+
+    Fetches the chosen video's audio and fingerprints it against the chart's own
+    stems to find where the song actually starts, so the video lines up on its
+    own. Falls back to DEFAULT_START_TIME when ffmpeg/numpy are unavailable or the
+    match is not trustworthy (e.g. the top YouTube result is a live take, a remix,
+    or a different master than the chart)."""
+    if not ffmpegAvailable or audiosync is None or not audiosync.is_available():
+        return DEFAULT_START_TIME
+    try:
+        audio = fetch_sync_audio(url)
+        if not audio:
+            return DEFAULT_START_TIME
+        ms, info = audiosync.compute_offset_ms('.', audio)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        print('  Auto-sync error (using default offset): ' + str(e))
+        return DEFAULT_START_TIME
+    finally:
+        cleanup_temp_files()
+    if ms is None:
+        print('  Auto-sync skipped (' + info + '); using default offset')
+        return DEFAULT_START_TIME
+    print('  Auto-synced: ' + info)
+    return ms
 
 
 print('Checking for home folder...')
@@ -138,10 +210,20 @@ if os.path.exists(songsFolder):
         print('You must choose between 1-3. Try again')
         exit()
 
-    if videoQuality != 'mp4' and not ffmpegAvailable:
-        print('\nNote: ffmpeg was not found, so 1080p videos are saved as-is (still')
-        print('h264 — they play fine in Clone Hero). To enable remuxing for maximum')
-        print('compatibility, place ffmpeg.exe next to this program (see the README).')
+    # Auto-sync needs ffmpeg (to decode audio for fingerprinting) and numpy.
+    syncReady = ffmpegAvailable and audiosync is not None and audiosync.is_available()
+
+    if not ffmpegAvailable:
+        print('\nNote: ffmpeg was not found.')
+        if videoQuality != 'mp4':
+            print('  - 1080p videos are saved as-is (still h264 — they play fine in Clone Hero).')
+        print('  - Auto-sync is off, so videos use a default 3-second offset.')
+        print('  Place ffmpeg.exe next to this program to enable both (see the README).')
+    elif syncReady:
+        print('\nAuto-sync is on: each video is lined up to its chart automatically')
+        print('(this fetches a little extra audio per song to match them up).')
+    else:
+        print('\nNote: auto-sync is off (numpy unavailable); using the default offset.')
 
     homeFolder = os.path.abspath(os.getcwd() + "\\songs")
     os.chdir(homeFolder)
@@ -211,14 +293,15 @@ if os.path.exists(songsFolder):
                             'extractor_args': {'youtube': {'player_client': YOUTUBE_CLIENTS}},
                         }
 
+                        usedUrl = url
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             try:
-                                download_video(ydl, url)
+                                usedUrl = download_video(ydl, url)
                             except KeyboardInterrupt:
                                 raise
                             except Exception as e:
                                 print('Error while downloading: ' + str(e) + '. Trying second video')
-                                download_video(ydl, url2)
+                                usedUrl = download_video(ydl, url2)
 
                         # Read song.ini fully and close it before writing, so the
                         # atomic replace isn't blocked by an open handle on Windows.
@@ -232,12 +315,13 @@ if os.path.exists(songsFolder):
                         else:
                             config = configparser.ConfigParser()
                             config.read_string(songContents)
+                            startTime = str(determine_start_time(usedUrl))
                             # Check uppercase/lowercase config section name
                             if config.has_section('song'):
-                                config.set('song', 'video_start_time', '-3000')
+                                config.set('song', 'video_start_time', startTime)
                                 print('Song ready. Next song...\n')
                             elif config.has_section('Song'):
-                                config.set('Song', 'video_start_time', '-3000')
+                                config.set('Song', 'video_start_time', startTime)
                                 print('Song ready. Next song...\n')
                             else:
                                 print('Could not update song.ini. Check the song.ini for potential issues\n')
@@ -265,7 +349,7 @@ if os.path.exists(songsFolder):
         input('\nPress Enter to exit...')
     else:
         if erroredSongs:
-            print("The following videos were downloaded but not audio-synced")
+            print("The following songs ran into problems and may need a manual look:")
             for song in erroredSongs:
                 print(song, end='\n')
         print('\nTip: you can re-run this program any time to fill in anything that')
