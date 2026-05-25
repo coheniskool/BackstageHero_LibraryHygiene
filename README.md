@@ -35,7 +35,7 @@ Clone Hero displays a `video.mp4` file as a background during gameplay if one ex
 2. Place it in your Clone Hero directory — the folder that **contains** your `Songs` folder, not inside it.
 3. Run it.
 
-Placing `ffmpeg.exe` in the same directory is recommended — it enables 1080p remuxing and automatic video sync (see [How it works](#how-it-works)). Grab it from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) — download the latest `ffmpeg-master-latest-win64-gpl.zip` and extract `ffmpeg.exe` from the `bin` folder. The tool still runs without it.
+That's the whole setup. ffmpeg is bundled inside the exe, so automatic sync and 1080p remuxing work out of the box with nothing else to install.
 
 ### Option 2 — Run from source
 
@@ -53,13 +53,15 @@ Place `VideoDownload.py` in your Clone Hero directory (the folder containing `So
 python VideoDownload.py
 ```
 
+Running from source has no bundled ffmpeg. For automatic sync and 1080p remuxing, put an `ffmpeg.exe` next to the program (or anywhere on your `PATH`). Grab it from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases). Without it, videos still download and play; they just use the default sync offset.
+
 ### Option 3 — Build the exe yourself
 
 ```
 python build.py
 ```
 
-The finished `BackstageHero.exe` is placed in `dist\`. PyInstaller is installed automatically if not already present.
+The finished `BackstageHero.exe` is placed in `dist\`. PyInstaller is installed automatically if not already present. To bundle ffmpeg into the exe (so sync works with no setup), drop an `ffmpeg.exe` into the project folder before building — the build picks it up automatically.
 
 ---
 
@@ -69,10 +71,10 @@ When you run the tool, you are prompted to choose a quality level:
 
 | # | Option | Notes |
 |---|--------|-------|
-| 1 | 720p | Default. Smaller files, works without ffmpeg. |
-| 2 | 1080p | Significantly larger files. ffmpeg recommended but not required. |
+| 1 | 720p | Default. Smaller files. |
+| 2 | 1080p | Best quality where available; significantly larger files. |
 | 3 | Replace all with 1080p | Deletes existing videos and re-downloads everything at 1080p. Use with caution. |
-| 4 | Re-sync existing videos | Keeps your videos, only fixes their timing. Re-downloads no video, just a little audio per song. Requires ffmpeg. |
+| 4 | Re-sync existing videos | Re-times videos you already have, without re-downloading them. Only fetches a little audio per song. |
 
 720p is the recommended starting point. 1080p files are typically 2–3× larger and require considerably more download time and disk space.
 
@@ -104,7 +106,7 @@ This matching is robust to the EQ, loudness, and compression differences between
 
 ### ffmpeg
 
-ffmpeg enables two things: remuxing 1080p downloads into a container Clone Hero handles cleanly, and decoding audio for automatic sync. It is not strictly required — the Android VR API already delivers h264/MP4 that plays in Clone Hero, so without ffmpeg, videos are saved as-is and use the default sync offset. The tool prints a one-time notice if it is missing.
+ffmpeg does two jobs here: remuxing 1080p downloads into a container Clone Hero handles cleanly, and decoding audio for automatic sync. **The Windows exe bundles ffmpeg**, so both work with no setup. If you run from source instead, install ffmpeg separately (see below) — without it, videos still download and play, they just skip remuxing and use the default sync offset.
 
 ---
 
@@ -121,6 +123,12 @@ The program can be stopped at any time with `Ctrl+C` or by closing the window. T
 
 **Re-downloading a video**  
 To replace a specific video, delete the `video.mp4` from that song's folder and re-run the tool.
+
+---
+
+## Credits
+
+The Windows release bundles [ffmpeg](https://ffmpeg.org), used under the GPLv3 (build by [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)). ffmpeg is a separate program invoked by this tool; its source is available from [ffmpeg.org/download](https://www.ffmpeg.org/download.html). Downloading is handled by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
 
 ---
 

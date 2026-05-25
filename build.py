@@ -55,7 +55,21 @@ else:
     print('Warning: assets/icon.png not found, building without custom icon.')
 
 
-# ── 3. Run PyInstaller ────────────────────────────────────────────────────────
+# ── 3. Bundle ffmpeg if it is sitting next to this script ─────────────────────
+# Placing ffmpeg.exe in this folder makes auto-sync (and 1080p remux) work out of
+# the box, with nothing for the user to install. Build without it and the exe
+# still runs; sync just needs an ffmpeg.exe at runtime instead.
+
+ffmpeg_flag = []
+if os.path.exists('ffmpeg.exe'):
+    ffmpeg_flag = ['--add-binary', 'ffmpeg.exe' + os.pathsep + '.']
+    print('Bundling ffmpeg.exe into the exe.')
+else:
+    print('No ffmpeg.exe in this folder - building without it.')
+    print('(Auto-sync will then need an ffmpeg.exe next to the program at runtime.)')
+
+
+# ── 4. Run PyInstaller ────────────────────────────────────────────────────────
 
 print('\nBuilding BackstageHero.exe...\n')
 subprocess.run(
@@ -65,6 +79,7 @@ subprocess.run(
         '--noconfirm',                # overwrite previous build without asking
         '--collect-all', 'yt_dlp',   # bundle all yt-dlp extractors (dynamic imports)
         '--name', 'BackstageHero',
+        *ffmpeg_flag,
         *icon_flag,
         'VideoDownload.py',
     ],
@@ -72,15 +87,14 @@ subprocess.run(
 )
 
 
-# ── 4. Done ───────────────────────────────────────────────────────────────────
+# ── 5. Done ───────────────────────────────────────────────────────────────────
 
 print('\n' + '-' * 60)
 print('Build complete!  -->  dist\\BackstageHero.exe')
 print('-' * 60)
 print('To deploy:')
-print('  1. Copy dist\\BackstageHero.exe to your Clone Hero directory')
-print('     (the folder that contains your Songs\\ folder).')
-print('  2. For 1080p downloads and automatic sync, also place ffmpeg.exe')
-print('     in that same directory. Get it from:')
-print('     https://github.com/BtbN/FFmpeg-Builds/releases')
+print('  Copy dist\\BackstageHero.exe to your Clone Hero directory')
+print('  (the folder that contains your Songs\\ folder), then run it.')
+if ffmpeg_flag:
+    print('  ffmpeg is bundled inside the exe, so there is nothing else to install.')
 print('-' * 60)

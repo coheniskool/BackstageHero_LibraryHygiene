@@ -16,11 +16,13 @@ try:
 except Exception:
     audiosync = None
 
-# When running as a PyInstaller exe, add the exe's directory to PATH so that
-# ffmpeg.exe placed alongside the program is found by ffmpeg and yt-dlp.
+# When running as a PyInstaller exe, make ffmpeg findable. The exe bundles its own
+# ffmpeg.exe (extracted to sys._MEIPASS at runtime); the exe's own directory is
+# also added so a user can drop in a newer ffmpeg.exe to override the bundled one.
 if getattr(sys, 'frozen', False):
     exe_dir = os.path.dirname(sys.executable)
-    os.environ['PATH'] = exe_dir + os.pathsep + os.environ.get('PATH', '')
+    bundle_dir = getattr(sys, '_MEIPASS', exe_dir)
+    os.environ['PATH'] = exe_dir + os.pathsep + bundle_dir + os.pathsep + os.environ.get('PATH', '')
 
 # ffmpeg is optional. The android_vr client already delivers h264/mp4 that Clone
 # Hero plays, so when ffmpeg is missing we simply use the download as-is. When it
