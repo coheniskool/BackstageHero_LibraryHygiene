@@ -1,0 +1,15 @@
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Generated icon (converted from icon.png at build time)
+assets/icon.ico
+
+# Bundled at build time into the exe; not part of the source
+ffmpeg.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
