@@ -5,131 +5,92 @@
 <h1 align="center">BackstageHero</h1>
 
 <p align="center">
-  Automatically downloads background music videos for every song in your Clone Hero library.
+  Downloads background videos for your entire Clone Hero library.<br>
+  Finds the right video, lines it up with the chart, saves it where Clone Hero expects it.
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.8%2B-blue" alt="Python 3.8+">
-  <img src="https://img.shields.io/badge/platform-Windows-lightgrey" alt="Windows">
-  <img src="https://img.shields.io/badge/powered_by-yt--dlp-red" alt="yt-dlp">
+  <a href="https://github.com/jmb988/BackstageHero/releases/latest">
+    <img src="https://img.shields.io/github/v/release/jmb988/BackstageHero?label=download&style=for-the-badge" alt="Download">
+  </a>
+  &nbsp;
+  <img src="https://img.shields.io/badge/platform-Windows-lightgrey?style=for-the-badge" alt="Windows">
 </p>
 
 ---
 
-Clone Hero displays a `video.mp4` file as a background during gameplay if one exists in the song folder. This tool scans your entire library, finds every song missing a video, searches YouTube for a matching music video, and downloads it into the right place — all in one run.
+The first release was a working script. This is the version it should have been from the start.
 
-- Searches YouTube by folder name and downloads the top result
-- Falls back to the second result automatically if the first fails
-- Lines each video up with the chart automatically when it can confirm the same recording
-- Skips songs that already have a video — safe to re-run after adding new songs
-- Resumes cleanly after any interruption; nothing is left corrupt
-- Handles libraries with thousands of songs in deeply nested folders
+---
+
+## What's in v2
+
+| | |
+|---|---|
+| **GUI** | Dark-theme interface. See your full library, filter by status, search by name, track resolution per song. |
+| **Audio fingerprinting** | Landmark-based matching (the same idea Shazam uses) measures exactly where the song starts in the video. No fixed-offset guessing. |
+| **Community resolver** | Crowdsourced video-to-chart mappings. Once one person confirms the right video, every install gets it automatically — no fingerprinting needed for known charts. |
+| **Sync editor** | Adjust timing with a live preview. Nudge in 10ms steps, drag the slider, see the result immediately. Save locally and optionally share the offset back to the community. |
+| **Single exe** | ffmpeg is bundled inside. Download, run, done. Nothing else to install. |
+| **Auto-updater** | Both the app and yt-dlp update themselves. yt-dlp breaks every few weeks as YouTube changes — the tool fixes itself overnight. |
 
 ---
 
 ## Getting started
 
-### Option 1 — Pre-built executable (Windows)
+1. Download `BackstageHero.exe` from the **[Releases page](https://github.com/jmb988/BackstageHero/releases/latest)**
+2. Run it from anywhere — no installation, no dependencies
+3. Point it at your Clone Hero `Songs` folder on first launch
 
-1. Download `BackstageHero.exe` from the [Releases page](https://github.com/jmb988/BackstageHero/releases/latest).
-2. Place it in your Clone Hero directory — the folder that **contains** your `Songs` folder, not inside it.
-3. Run it.
+It scans your library, skips anything that already has a video, and works through the rest. Close it at any time — nothing is left corrupt and it picks up where it left off on the next run.
 
-That's the whole setup. ffmpeg is bundled inside the exe, so automatic sync and 1080p remuxing work out of the box with nothing else to install.
+---
 
-### Option 2 — Run from source
+## How the sync works
 
-Requires Python 3.8 or later.
+Every music video has a different amount of intro before the song actually starts, so any fixed offset is a guess. BackstageHero solves this properly:
+
+After finding a candidate video, it fetches just the audio and fingerprints it against the chart's own stems. If the pattern of peaks matches — meaning it's the same recording — it measures exactly how far into the video the song begins and writes that as `video_start_time`. If it doesn't match (live take, remix, wrong master) it falls back to a default rather than writing a wrong value.
+
+This is robust to the EQ and loudness differences between a YouTube upload and chart audio because it compares structure, not waveform.
+
+**For charts where fingerprinting can't match** — community packs with trimmed intros, unusual masters, no chart audio — use the sync editor. Right-click any song that has a video, adjust the offset with live preview, and save. Checking *Share with community* votes that offset into the resolver; once enough users confirm the same value it becomes the default for that chart automatically.
+
+---
+
+## Why it still works when other tools don't
+
+YouTube's standard web player API requires bot-challenge tokens that change constantly. This tool uses the **Android VR client API** — the same endpoint the official YouTube VR app uses. It delivers h264 up to 1080p with no cookies, no browser sign-in, and no JavaScript. That's why the web-client approach breaks repeatedly and this doesn't.
+
+---
+
+## Rate limiting
+
+On large libraries downloaded in one sitting, YouTube may start returning bot-challenge errors. Stop, wait an hour, re-run — completed songs are skipped automatically. The app detects this and warns you when it happens.
+
+---
+
+## Running from source
 
 ```
 git clone https://github.com/jmb988/BackstageHero
 cd BackstageHero
 pip install -r requirements.txt
+python gui.py
 ```
 
-Place `VideoDownload.py` in your Clone Hero directory (the folder containing `Songs\`), then run:
+For audio sync to work from source, ffmpeg needs to be on your PATH or placed in the project folder. Grab a static build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases).
 
-```
-python VideoDownload.py
-```
-
-Running from source has no bundled ffmpeg. For automatic sync and 1080p remuxing, put an `ffmpeg.exe` next to the program (or anywhere on your `PATH`). Grab it from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases). Without it, videos still download and play; they just use the default sync offset.
-
-### Option 3 — Build the exe yourself
+### Building the exe
 
 ```
 python build.py
 ```
 
-The finished `BackstageHero.exe` is placed in `dist\`. PyInstaller is installed automatically if not already present. To bundle ffmpeg into the exe (so sync works with no setup), drop an `ffmpeg.exe` into the project folder before building — the build picks it up automatically.
-
----
-
-## Quality options
-
-When you run the tool, you are prompted to choose a quality level:
-
-| # | Option | Notes |
-|---|--------|-------|
-| 1 | 720p | Default. Smaller files. |
-| 2 | 1080p | Best quality where available; significantly larger files. |
-| 3 | Replace all with 1080p | Deletes existing videos and re-downloads everything at 1080p. Use with caution. |
-| 4 | Re-sync existing videos | Re-times videos you already have, without re-downloading them. Only fetches a little audio per song. |
-
-720p is the recommended starting point. 1080p files are typically 2–3× larger and require considerably more download time and disk space.
-
-**Already have a library from an earlier version?** Re-running a normal pass won't re-time videos you already have — it only touches songs that are missing one. Use option 4 to add automatic sync to an existing library without re-downloading the videos.
-
----
-
-## How it works
-
-### Bypassing YouTube's bot detection
-
-YouTube's standard web player API now requires bot-challenge tokens that change frequently and are difficult to generate programmatically. Rather than fighting that, this tool uses YouTube's **Android VR client API** — the same backend endpoint that the official YouTube VR app communicates with. That API delivers h264/AVC video up to 1080p and is not subject to the bot-detection checks applied to the web client. No cookies, no browser sign-in, and no JavaScript runtime are required.
-
-This is why every other tool in this space stopped working: they all use the web client by default. Switching to the Android VR API endpoint is the fix.
-
-### File integrity
-
-`video.mp4` inside a song folder is only ever created by a final rename from a temporary staging file, once the download (and optional remux) is fully complete. If the process is killed mid-download, the partial file sits under a different name (`video.download.mp4` or `video.tmp.mp4`) and is cleaned up automatically on the next run. A completed `video.mp4` is never modified or deleted during a normal run.
-
-On startup, the tool scans the full library and removes any leftover temp files and zero-byte videos from prior interrupted runs before processing begins.
-
-### Automatic sync
-
-A background video only looks right if the music in the video lines up with the chart. Every music video opens with a different amount of intro before the song actually starts, so any fixed offset is just a guess.
-
-After downloading a video, the tool fetches the matching audio track and fingerprints it against the chart's own audio — the same landmark-matching technique Shazam uses. When it can confirm the video uses the same recording as the chart, it measures exactly how far into the video the song begins and writes that as `video_start_time`, so the video lines up on its own. When it can't — the top result is a live take, a remix, or a different master — it falls back to a sensible default offset instead of guessing wrong.
-
-This matching is robust to the EQ, loudness, and compression differences between a YouTube upload and the chart audio, because it compares the *pattern* of audio peaks rather than the raw waveform. It requires ffmpeg. You can always fine-tune `video_start_time` in a song's `song.ini` by hand afterwards.
-
-### ffmpeg
-
-ffmpeg does two jobs here: remuxing 1080p downloads into a container Clone Hero handles cleanly, and decoding audio for automatic sync. **The Windows exe bundles ffmpeg**, so both work with no setup. If you run from source instead, install ffmpeg separately (see below) — without it, videos still download and play, they just skip remuxing and use the default sync offset.
-
----
-
-## Notes
-
-**Song folder naming**  
-The folder containing `song.ini` should be named `Artist - Song Title`. That name is what gets submitted to YouTube as the search query. Malformed folder names produce irrelevant results.
-
-**Rate limiting**  
-On very large libraries downloaded in a single sitting, YouTube may start returning "Sign in to confirm you're not a bot" errors. This is IP-based rate limiting. Stop the program, wait a while, and re-run — it will skip everything already downloaded and pick up from where it left off.
-
-**Interrupting a run**  
-The program can be stopped at any time with `Ctrl+C` or by closing the window. The song currently in progress is cleaned up before exit. On the next run, completed songs are skipped and the interrupted one is retried.
-
-**Re-downloading a video**  
-To replace a specific video, delete the `video.mp4` from that song's folder and re-run the tool.
+Downloads ffmpeg automatically, bundles everything with PyInstaller, and produces `dist\BackstageHero.exe`. A SHA-256 sidecar is written alongside it for the auto-updater to verify against.
 
 ---
 
 ## Credits
 
-The Windows release bundles [ffmpeg](https://ffmpeg.org), used under the GPLv3 (build by [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)). ffmpeg is a separate program invoked by this tool; its source is available from [ffmpeg.org/download](https://www.ffmpeg.org/download.html). Downloading is handled by [yt-dlp](https://github.com/yt-dlp/yt-dlp).
-
----
-
-*Successor to [jshackles/CloneHeroVideoDownloader](https://github.com/jshackles/CloneHeroVideoDownloader), updated to work against current YouTube infrastructure.*
+Bundles [ffmpeg](https://ffmpeg.org) (GPLv3, build by [BtbN](https://github.com/BtbN/FFmpeg-Builds)). Downloading handled by [yt-dlp](https://github.com/yt-dlp/yt-dlp).

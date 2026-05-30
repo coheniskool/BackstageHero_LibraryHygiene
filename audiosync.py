@@ -19,6 +19,9 @@ Only numpy and ffmpeg are required.
 import os
 import subprocess
 
+# Suppress the console window ffmpeg would otherwise flash on a windowed build.
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
 try:
     import numpy as np
     from numpy.lib.stride_tricks import sliding_window_view
@@ -27,7 +30,7 @@ except Exception:
     _NUMPY = False
 
 
-# ── Tunables ──────────────────────────────────────────────────────────────────
+# Tunables
 
 SAMPLE_RATE = 8000      # Hz. Plenty for fingerprinting; keeps the FFTs small.
 ANALYZE_SECONDS = 240   # Only the first few minutes are needed to find the offset.
@@ -71,7 +74,7 @@ def is_available():
     return _NUMPY
 
 
-# ── ffmpeg decoding ───────────────────────────────────────────────────────────
+# ffmpeg decoding
 
 def _decode(inputs, sr, seconds):
     """Decode one or more audio files down to a single mono float array.
@@ -92,7 +95,8 @@ def _decode(inputs, sr, seconds):
     cmd += ['-t', str(seconds), '-ac', '1', '-ar', str(sr), '-f', 's16le', '-']
 
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               creationflags=_NO_WINDOW)
     except Exception:
         return None
     if proc.returncode != 0 or not proc.stdout:
@@ -120,7 +124,7 @@ def _chart_stems(folder, exclude=None):
     return stems
 
 
-# ── Fingerprinting ────────────────────────────────────────────────────────────
+# Fingerprinting
 
 def _spectrogram(x):
     frames = sliding_window_view(x, N_FFT)[::HOP]
@@ -217,7 +221,7 @@ def _offset_seconds(ref_table, probe_table):
     return lead, votes, score, conc
 
 
-# ── Public entry point ────────────────────────────────────────────────────────
+# Public entry point
 
 def compute_offset_ms(folder, probe_audio):
     """Work out video_start_time (ms) for one song folder.

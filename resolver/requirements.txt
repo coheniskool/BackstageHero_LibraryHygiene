@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+# Used only by the curator "Suggest" tool (server-side YouTube search). The
+# public resolve/report path does not need it; suggest degrades gracefully if
+# it is ever absent.
+yt-dlp>=2024.11.4

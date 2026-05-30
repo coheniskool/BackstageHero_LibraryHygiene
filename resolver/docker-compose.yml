@@ -1,0 +1,29 @@
+# BackstageHero resolver - resolver container ONLY.
+#
+# This host already runs a Cloudflare tunnel (Unraid-Cloudflared-Tunnel) for
+# external access, so we do NOT start another cloudflared here. Point the tunnel
+# at http://192.168.10.20:8099 - the Unraid IP and published port, exactly like
+# your Vaultwarden entry (see DEPLOY.md). Only that one public-hostname entry in
+# the Cloudflare dashboard is needed. (NPM is your LAN-only path, not involved.)
+#
+#   docker compose up -d --build      (or paste as a Portainer stack)
+
+services:
+  resolver:
+    build: .
+    container_name: backstagehero-resolver
+    restart: unless-stopped
+    # Published on the host so the tunnel can reach it at the Unraid IP and port
+    # (192.168.10.20:8099), the same way Vaultwarden is routed. 8099 is free.
+    ports:
+      - "8099:8080"
+    environment:
+      BACKSTAGEHERO_DB: /data/resolver.sqlite3
+      BACKSTAGEHERO_ADMIN_TOKEN: ${BACKSTAGEHERO_ADMIN_TOKEN}
+      BACKSTAGEHERO_PUBLIC_URL: ${BACKSTAGEHERO_PUBLIC_URL}
+      # Optional - AI "Suggest" pick and instant cache purges.
+      BACKSTAGEHERO_LLM_KEY: ${BACKSTAGEHERO_LLM_KEY:-}
+      CF_API_TOKEN: ${CF_API_TOKEN:-}
+      CF_ZONE_ID: ${CF_ZONE_ID:-}
+    volumes:
+      - /mnt/user/appdata/backstagehero:/data

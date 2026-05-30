@@ -2,14 +2,24 @@
 build/
 dist/
 *.spec
+build_log.txt
 
 # Generated icon (converted from icon.png at build time)
 assets/icon.ico
 
 # Bundled at build time into the exe; not part of the source
 ffmpeg.exe
+ffplay.exe
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+
+# Resolver runtime secrets and data - must never be committed
+resolver/.env
+resolver/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+admin_token.txt
