@@ -409,6 +409,7 @@ class App(ctk.CTk):
 
         self._build_ui()
         self.after(120, self._startup)
+        self.after(500, self._start_update_check)
 
     def _build_ui(self):
         self.grid_rowconfigure(2, weight=1)
@@ -629,6 +630,35 @@ class App(ctk.CTk):
                 f'  {saved}\n\n'
                 f'Has it been moved or renamed? Please choose its new location.')
         self._pick_folder(first_run=True)
+
+    def _start_update_check(self):
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self):
+        """Background thread: check for app and yt-dlp updates without blocking startup."""
+        try:
+            import VideoDownload as _vd
+            cur_ver   = _vd.__version__
+            ytdlp_ver = getattr(_vd.yt_dlp.version, '__version__', '0')
+
+            info = updater.check_app_update(cur_ver)
+            if info:
+                latest, asset, sha = info
+                self._queue.put(('app_update_available', latest, asset, sha))
+
+            new_ytdlp = updater.maybe_update_ytdlp(ytdlp_ver)
+            if new_ytdlp:
+                self._queue.put(('ytdlp_updated', new_ytdlp))
+        except Exception:
+            pass
+
+    def _do_app_update(self, asset, sha):
+        """Called on the main thread after user confirms. Runs download on a thread."""
+        def _worker():
+            ok = updater.apply_app_update(asset, sha)
+            if ok:
+                self.after(0, self.destroy)
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _pick_folder(self, first_run=False):
         while True:
@@ -1023,6 +1053,19 @@ class App(ctk.CTk):
             if not self._running:
                 self._status_lbl.configure(text=status_text)
 
+        elif kind == 'app_update_available':
+            _, latest, asset, sha = msg
+            if messagebox.askyesno(
+                    'Update available',
+                    f'v{latest} is available. Install now?\n\n'
+                    'The app will restart automatically.'):
+                self._do_app_update(asset, sha)
+
+        elif kind == 'ytdlp_updated':
+            _, ver = msg
+            self._status_lbl.configure(
+                text=f'Downloader updated ({ver}) — active next launch')
+
     def destroy(self):
         self._stop_evt.set()
         super().destroy()
@@ -1038,16 +1081,7 @@ def run():
     except Exception:
         pass
 
-    # Updater runs before the window appears; may relaunch and not return.
-    try:
-        import VideoDownload as _vd
-        updater.run_startup_updates(
-            _vd.__version__,
-            getattr(_vd.yt_dlp.version, '__version__', '0'))
-    except SystemExit:
-        raise
-    except Exception:
-        pass
+    updater._cleanup_old_exe()   # fast, no network — always safe at startup
 
     app = App()
     app.mainloop()

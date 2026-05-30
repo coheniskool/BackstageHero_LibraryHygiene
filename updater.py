@@ -264,43 +264,46 @@ def _apply_app_update(asset_url, expected_sha):
         subprocess.Popen([cur], cwd=os.getcwd(), close_fds=True)
     except Exception:
         pass
-    sys.exit(0)
+    return True  # caller is responsible for exiting the current process
 
 
-def maybe_update_app(current_version):
-    """Check GitHub for a newer release and offer to update. Prompts the user,
-    swaps the exe and relaunches if they say yes (or don't respond in time)."""
+def check_app_update(current_version):
+    """Check GitHub for a newer release. Returns (latest_tag, asset_url, sha256) if one
+    exists, or None if already current / offline / any error."""
     if not _frozen():
-        return
+        return None
     try:
         release = _get_json(_API_LATEST)
-    except Exception:
-        return  # offline, no releases, whatever - just skip
-    try:
         tag = release.get('tag_name') or ''
         if _ver_tuple(tag) <= _ver_tuple(current_version):
-            return
+            return None
         asset = _find_release_asset(release, EXE_ASSET_NAME)
         if not asset:
-            return
-        # strip leading non-digits so 'v.2.0.0' shows as '2.0.0'
+            return None
         latest = re.sub(r'^\D*', '', tag) or tag
-        if not _prompt_yes(
-            f'\nUpdate available: v{current_version} -> v{latest}. '
-            'Install now? [Y/n] '):
-            print('  Skipping update for now.')
-            return
-        _apply_app_update(asset, _expected_sha256(release))
-    except SystemExit:
-        raise
+        return latest, asset, _expected_sha256(release)
     except Exception:
-        return
+        return None
+
+
+def apply_app_update(asset_url, expected_sha):
+    """Download the new exe, verify it, swap it in place and relaunch.
+    Returns False on any failure (current exe untouched)."""
+    return _apply_app_update(asset_url, expected_sha)
 
 
 def run_startup_updates(app_version, ytdlp_version):
-    """Run both update checks at startup. May relaunch (and not return) if the user accepts an app update."""
+    """Legacy entry-point kept for the CLI path. GUI uses check_app_update instead."""
     _cleanup_old_exe()
-    maybe_update_app(app_version)  # may exit + relaunch
+    info = check_app_update(app_version)
+    if info:
+        latest, asset, sha = info
+        if _prompt_yes(
+                f'\nUpdate available: v{app_version} -> v{latest}. '
+                'Install now? [Y/n] '):
+            _apply_app_update(asset, sha)
+        else:
+            print('  Skipping update for now.')
     staged = maybe_update_ytdlp(ytdlp_version)
     if staged:
         print(f'  Updated downloader (yt-dlp {staged}) - active next launch.')
