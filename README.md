@@ -41,7 +41,7 @@ Official videos sort themselves out this way. Community packs are the awkward on
 
 ## Why it still works
 
-Most YouTube downloaders use the web player API, which now expects bot-challenge tokens that change constantly and are awkward to produce. This uses the Android VR client API instead, the backend the YouTube VR app talks to. It returns h264 up to 1080p with no cookies, no login, and no JavaScript engine, and it isn't behind those same checks. That's why the older tools kept breaking and this one holds up.
+Most YouTube downloaders use the web player API, which now requires bot-challenge tokens that rotate constantly. This uses the TV embedded and Android client APIs instead — different code paths that don't need those tokens. It also keeps yt-dlp updated automatically, so when YouTube changes something and yt-dlp patches it, the fix lands within a day without needing a new release.
 
 Push a big library hard enough and YouTube can still rate-limit your IP. When that happens it backs off and retries on its own; if it does give up, you re-run later and it continues from where it stopped.
 

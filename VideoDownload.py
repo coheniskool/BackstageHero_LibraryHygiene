@@ -38,8 +38,9 @@ ffplayPath      = shutil.which('ffplay')
 # is a harmless 0 everywhere else.
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
-# android_vr gives us h264 up to 1080p without needing cookies or a JS runtime
-YOUTUBE_CLIENTS = ['android_vr', 'android']
+# tv_embedded gets DASH streams (needed for bestvideo above 360p) without PO tokens.
+# android_vr / android are fallbacks if embedded is blocked.
+YOUTUBE_CLIENTS = ['tv_embedded', 'android_vr', 'android']
 
 # strip these from titles before searching so we don't get playthrough results
 # longer forms first, otherwise 'RB3' strips inside '(RB3 version)' and leaves '( version)'
@@ -87,6 +88,7 @@ def quality_format(max_height):
         f'bestvideo[height<={max_height}][ext=mp4][vcodec^=avc]/'
         f'bestvideo[height<={max_height}][vcodec^=avc]/'
         f'best[height<={max_height}][ext=mp4]/'
+        f'best[height<={max_height}]/'
         f'best[ext=mp4]/best'
     )
 
