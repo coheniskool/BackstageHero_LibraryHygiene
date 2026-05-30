@@ -52,7 +52,7 @@ Every music video has a different amount of intro before the song actually start
 
 After finding a candidate video, it fetches just the audio and fingerprints it against the chart's own stems. If the pattern of peaks matches — meaning it's the same recording — it measures exactly how far into the video the song begins and writes that as `video_start_time`. If it doesn't match (live take, remix, wrong master) it falls back to a default rather than writing a wrong value.
 
-This is robust to the EQ and loudness differences between a YouTube upload and chart audio because it compares structure, not waveform.
+EQ and loudness differences between a YouTube upload and chart audio don't trip it up — it's comparing the shape of the audio, not the raw waveform.
 
 **For charts where fingerprinting can't match** — community packs with trimmed intros, unusual masters, no chart audio — use the sync editor. Right-click any song that has a video, adjust the offset with live preview, and save. Checking *Share with community* votes that offset into the resolver; once enough users confirm the same value it becomes the default for that chart automatically.
 
