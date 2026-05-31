@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import resolver_client
 
-__version__ = '2.0.3'
+__version__ = '2.0.4'
 
 try:
     import audiosync

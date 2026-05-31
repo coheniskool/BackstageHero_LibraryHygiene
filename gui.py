@@ -138,7 +138,13 @@ class SyncEditor(ctk.CTkToplevel):
         self._song         = song
         self._on_save      = on_save
         self._proc         = None   # running ffplay process
+        self._proc_aux     = None   # ffmpeg feeder process when piping audio
         self._after_id     = None   # pending debounce after() id
+
+        # SW_SHOWNOACTIVATE: ffplay window opens without stealing keyboard/mouse focus
+        self._si = subprocess.STARTUPINFO()
+        self._si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
+        self._si.wShowWindow = 4   # SW_SHOWNOACTIVATE
 
         self._ms    = tk.IntVar(value=self._read_offset())
         self._share = tk.BooleanVar(value=True)
@@ -316,26 +322,75 @@ class SyncEditor(ctk.CTkToplevel):
                 pass
         self._after_id = self.after(self._DEBOUNCE_MS, self._launch_preview)
 
+    def _find_preview_audio(self):
+        """Return a path to use as the audio track in the preview, or None.
+        Prefers video.sync.* (music-video audio downloaded during fingerprinting)
+        so the user can hear when the song kicks in inside the video.
+        Falls back to chart stems if the sync file is gone."""
+        folder = self._song.folder
+        for f in sorted(os.listdir(folder)):
+            if f.startswith('video.sync.'):
+                return os.path.join(folder, f)
+        for name in ('song.ogg', 'guitar.ogg', 'rhythm.ogg', 'bass.ogg', 'song.mp3'):
+            p = os.path.join(folder, name)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _kill_preview(self):
+        """Terminate any running ffplay / ffmpeg preview processes."""
+        for p in (self._proc, self._proc_aux):
+            if p and p.poll() is None:
+                p.terminate()
+        self._proc = self._proc_aux = None
+
     def _launch_preview(self):
         self._after_id = None
         if not ffplayPath:
             return
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-        ms    = self._ms.get()
-        seek  = max(0.0, -ms / 1000.0)
-        video = os.path.join(self._song.folder, 'video.mp4')
+        self._kill_preview()
+
+        ms      = self._ms.get()
+        v_seek  = max(0.0, -ms / 1000.0)  # how far into the video to start
+        a_seek  = max(0.0,  ms / 1000.0)  # how far into the audio to start
+        video   = os.path.join(self._song.folder, 'video.mp4')
         if not os.path.exists(video):
             return
-        self._proc = subprocess.Popen(
-            [ffplayPath,
-             '-ss', f'{seek:.3f}',
-             '-x', '640', '-y', '360',   # compact preview window
-             '-autoexit',
-             '-window_title', f'Preview — {self._song.label}',
-             video],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=NO_WINDOW)
+
+        audio = self._find_preview_audio()
+
+        ffplay_base = [ffplayPath, '-hide_banner',
+                       '-x', '640', '-y', '360', '-autoexit',
+                       '-window_title', f'Preview — {self._song.label}']
+
+        if audio and ffmpegAvailable:
+            # Pipe ffmpeg (video + audio merged) into ffplay so the user
+            # can hear when the music starts inside the video.
+            # video.sync.* and video.mp4 share the same seek point;
+            # chart stems use a_seek so the chart audio is at the right offset.
+            audio_seek = v_seek if os.path.basename(audio).startswith('video.sync.') else a_seek
+            feeder = subprocess.Popen(
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                 '-ss', f'{v_seek:.3f}',     '-i', video,
+                 '-ss', f'{audio_seek:.3f}', '-i', audio,
+                 '-map', '0:v', '-map', '1:a',
+                 '-shortest', '-f', 'nut', 'pipe:1'],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW)
+            self._proc = subprocess.Popen(
+                ffplay_base + ['-'],
+                stdin=feeder.stdout,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW, startupinfo=self._si)
+            feeder.stdout.close()
+            self._proc_aux = feeder
+        else:
+            # No audio available — play video-only, still without focus steal
+            self._proc = subprocess.Popen(
+                ffplay_base + ['-ss', f'{v_seek:.3f}', video],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW, startupinfo=self._si)
+
         if self._live_lbl:
             self._live_lbl.configure(text='● live', text_color=_GREEN)
         self._poll_live()
@@ -361,8 +416,7 @@ class SyncEditor(ctk.CTkToplevel):
                 self.after_cancel(self._after_id)
             except Exception:
                 pass
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        self._kill_preview()
         self.grab_release()
         self.destroy()
 
