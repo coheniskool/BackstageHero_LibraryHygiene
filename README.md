@@ -14,6 +14,8 @@
 
 ---
 
+![BackstageHero GUI](assets/screenshot.png)
+
 Clone Hero plays a `video.mp4` from a song's folder as the background while you play. Getting one for every song by hand is a slog. This searches YouTube, downloads a match, and works out the timing so the song starts when the video's audio does.
 
 Point it at your Songs folder and it handles everything that's missing a video.
