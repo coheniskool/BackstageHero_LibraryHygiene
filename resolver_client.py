@@ -20,7 +20,8 @@ RESOLVER_BASE = os.environ.get('BACKSTAGEHERO_RESOLVER', _DEFAULT_RESOLVER).rstr
 _CHART_FILES = ('notes.chart', 'notes.mid', 'notes.eof')
 
 _RESOLVE_TIMEOUT = 3
-_REPORT_TIMEOUT = 3
+_REPORT_TIMEOUT  = 3
+_PING_TIMEOUT    = 3
 _UA = 'BackstageHero-Client'
 
 
@@ -80,6 +81,24 @@ def resolve(ch):
     except Exception:
         pass
     return None
+
+
+def ping(sharing=True, app_version=''):
+    """Fire-and-forget heartbeat on app startup so the server can count active users."""
+    if not RESOLVER_BASE:
+        return
+    try:
+        body = json.dumps({
+            'client_id':   _client_id(),
+            'sharing':     bool(sharing),
+            'app_version': app_version,
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            RESOLVER_BASE + '/ping', data=body,
+            headers={'User-Agent': _UA, 'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=_PING_TIMEOUT).close()
+    except Exception:
+        pass
 
 
 def report(ch, video_id, start_ms, confidence, artist=None, title=None):

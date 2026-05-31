@@ -635,11 +635,14 @@ class App(ctk.CTk):
         threading.Thread(target=self._update_worker, daemon=True).start()
 
     def _update_worker(self):
-        """Background thread: check for app and yt-dlp updates without blocking startup."""
+        """Background thread: ping the resolver, then check for app and yt-dlp updates."""
         try:
             import VideoDownload as _vd
             cur_ver   = _vd.__version__
             ytdlp_ver = getattr(_vd.yt_dlp.version, '__version__', '0')
+
+            resolver_client.ping(sharing=resolver_client.enabled(),
+                                 app_version=cur_ver)
 
             info = updater.check_app_update(cur_ver)
             if info:

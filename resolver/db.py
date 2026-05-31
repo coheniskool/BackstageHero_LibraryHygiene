@@ -37,7 +37,14 @@ CREATE TABLE IF NOT EXISTS charts (
     title      TEXT,
     last_seen  INTEGER
 );
+CREATE TABLE IF NOT EXISTS client_pings (
+    client_id    TEXT PRIMARY KEY,
+    last_seen    INTEGER NOT NULL,
+    sharing      INTEGER NOT NULL DEFAULT 0,  -- 1 if the user has sharing enabled
+    app_version  TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_mappings_hash ON mappings(chart_hash);
+CREATE INDEX IF NOT EXISTS idx_pings_last_seen ON client_pings(last_seen);
 """
 
 
@@ -194,13 +201,52 @@ def list_pending(conn, limit=200):
            ORDER BY m.last_seen DESC LIMIT ?""", (limit,)).fetchall()]
 
 
+def record_ping(conn, client_id, sharing, app_version=''):
+    """Upsert a client heartbeat. Called on app startup."""
+    now = int(time.time())
+    conn.execute(
+        """INSERT INTO client_pings (client_id, last_seen, sharing, app_version)
+           VALUES (?,?,?,?)
+           ON CONFLICT(client_id) DO UPDATE SET
+             last_seen=excluded.last_seen,
+             sharing=excluded.sharing,
+             app_version=excluded.app_version""",
+        (client_id, now, 1 if sharing else 0, app_version or ''))
+    conn.commit()
+
+
+def client_stats(conn):
+    """Active user counts over several windows."""
+    now = int(time.time())
+    def active(window):
+        cutoff = now - window
+        return conn.execute(
+            'SELECT COUNT(*) FROM client_pings WHERE last_seen >= ?',
+            (cutoff,)).fetchone()[0]
+    def sharing(window):
+        cutoff = now - window
+        return conn.execute(
+            'SELECT COUNT(*) FROM client_pings WHERE last_seen >= ? AND sharing=1',
+            (cutoff,)).fetchone()[0]
+    return {
+        'total_ever':    conn.execute('SELECT COUNT(*) FROM client_pings').fetchone()[0],
+        'active_24h':    active(86400),
+        'active_7d':     active(604800),
+        'active_30d':    active(2592000),
+        'sharing_24h':   sharing(86400),
+        'sharing_7d':    sharing(604800),
+    }
+
+
 def stats(conn):
     def scalar(sql):
         return conn.execute(sql).fetchone()[0]
-    return {
-        'charts': scalar('SELECT COUNT(*) FROM charts'),
+    s = {
+        'charts':   scalar('SELECT COUNT(*) FROM charts'),
         'mappings': scalar('SELECT COUNT(*) FROM mappings'),
         'approved': scalar("SELECT COUNT(*) FROM mappings WHERE status='approved'"),
-        'pending': scalar("SELECT COUNT(*) FROM mappings WHERE status='pending'"),
-        'votes': scalar('SELECT COUNT(*) FROM votes'),
+        'pending':  scalar("SELECT COUNT(*) FROM mappings WHERE status='pending'"),
+        'votes':    scalar('SELECT COUNT(*) FROM votes'),
     }
+    s.update(client_stats(conn))
+    return s

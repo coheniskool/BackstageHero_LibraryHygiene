@@ -99,6 +99,20 @@ class ReportIn(BaseModel):
     title: str = ''
 
 
+class PingIn(BaseModel):
+    client_id:   str
+    sharing:     bool = False
+    app_version: str  = ''
+
+
+@app.post('/ping')
+def ping(body: PingIn, conn=Depends(_conn)):
+    if not body.client_id:
+        raise HTTPException(status_code=400, detail='client_id required')
+    db.record_ping(conn, body.client_id, body.sharing, body.app_version)
+    return {'ok': True}
+
+
 @app.post('/report')
 def report(body: ReportIn, conn=Depends(_conn)):
     if not body.hash or not body.video_id or not body.client_id:
@@ -212,7 +226,9 @@ function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>'
 async function load(){
   const s = await (await api('/admin/stats',{headers:hdr(false)})).json();
   document.getElementById('stats').innerHTML =
-    `charts <b>${s.charts}</b> &middot; approved <b>${s.approved}</b> &middot; pending <b>${s.pending}</b> &middot; votes <b>${s.votes}</b>`;
+    `charts <b>${s.charts}</b> &middot; approved <b>${s.approved}</b> &middot; pending <b>${s.pending}</b> &middot; votes <b>${s.votes}</b>`
+  + ` &nbsp;|&nbsp; users 24h <b>${s.active_24h}</b> / 7d <b>${s.active_7d}</b> / ever <b>${s.total_ever}</b>`
+  + ` &middot; sharing 24h <b>${s.sharing_24h}</b> / 7d <b>${s.sharing_7d}</b>`;
   const data = await (await api('/admin/pending',{headers:hdr(false)})).json();
   const list = document.getElementById('list');
   if(!data.pending.length){ list.innerHTML='<div class="card">Nothing pending. All caught up.</div>'; return; }
