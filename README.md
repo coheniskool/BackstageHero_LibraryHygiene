@@ -14,7 +14,7 @@
 
 ---
 
-![BackstageHero](assets/screenshot.png)
+![BackstageHero](https://raw.githubusercontent.com/jmb988/BackstageHero/master/assets/screenshot.png)
 
 If a song folder has a `video.mp4` in it, Clone Hero plays it behind the chart. Doing that by hand across a whole library takes forever. This searches YouTube for the ones that are missing it, downloads a match, and lines the video up so it starts with the song.
 
