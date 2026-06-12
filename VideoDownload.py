@@ -46,7 +46,7 @@ from tqdm import tqdm
 
 import resolver_client
 
-__version__ = '2.1.0'
+__version__ = '2.1.1'
 
 try:
     import audiosync
@@ -303,24 +303,34 @@ def search_candidates(query, n=SEARCH_RESULTS):
 
 
 def fetch_audio(folder, url):
-    """Download audio-only for fingerprinting. Returns the file path, or None on failure.
+    """Download audio-only for fingerprinting. Returns (path, max_video_height),
+    or (None, 0) on failure.
 
     Grabs a low-bitrate stream on purpose: the fingerprinter analyses at 8 kHz
     mono, so a ~50-70kbps opus carries everything it can use at a fraction of
-    the bytes (and requests) of bestaudio. Quality floor first, then whatever."""
+    the bytes (and requests) of bestaudio. Quality floor first, then whatever.
+
+    The max video height comes free out of the same extraction (the info dict
+    lists every format), so select_video can prefer a higher-res source without
+    a second request."""
     cleanup_temp_files(folder)
     opts = _base_opts()
     opts.update({'format': 'bestaudio[abr<=80]/worstaudio/bestaudio/best',
                  'outtmpl': os.path.join(folder, 'video.sync.%(ext)s')})
+    max_h = 0
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+            info = ydl.extract_info(url, download=True)
+        if info:
+            heights = [f.get('height') for f in (info.get('formats') or [])
+                       if f.get('height')]
+            max_h = max(heights) if heights else 0
     except Exception as e:
         if is_bot_error(e):
             raise BotDetected(str(e))
-        return None
+        return None, 0
     matches = glob.glob(os.path.join(folder, 'video.sync.*'))
-    return matches[0] if matches else None
+    return (matches[0] if matches else None), max_h
 
 
 def _chart_duration(folder):
@@ -396,9 +406,15 @@ def download_video(folder, url, quality):
         print('  Video ready')
 
 
-def select_video(folder, candidates, sync_ready):
+def select_video(folder, candidates, sync_ready, target_h=0):
     """Pick the right candidate. With sync available, fingerprints each one against
-    the chart audio until we get a confident match. Returns (url, title, offset_ms, matched)."""
+    the chart audio until we get a confident match. Returns (url, title, offset_ms, matched).
+
+    target_h is the resolution the user asked for. Among the candidates that
+    match the song, a match that actually has that resolution wins; if the first
+    match is lower-res we keep looking for a better one and only settle for it
+    if nothing higher turns up. Stops as soon as a match meets the target, so a
+    good first hit costs nothing extra."""
     if not sync_ready:
         url, title = candidates[0][0], candidates[0][1]
         return url, title, DEFAULT_START_TIME, False
@@ -425,8 +441,9 @@ def select_video(folder, candidates, sync_ready):
     else:
         ordered = list(candidates)
 
+    best = None   # (url, title, ms, height) - best matching song seen so far
     for url, title, _ in ordered[:GATE_CANDIDATES]:
-        audio = fetch_audio(folder, url)
+        audio, max_h = fetch_audio(folder, url)
         try:
             if not audio:
                 continue
@@ -438,9 +455,20 @@ def select_video(folder, candidates, sync_ready):
             ms = None
         finally:
             cleanup_temp_files(folder)
-        if ms is not None:
-            print('  Matched: ' + title + '  (' + info + ')')
+        if ms is None:
+            continue
+        if max_h >= target_h:
+            print(f'  Matched: {title}  ({info}, {max_h or "?"}p)')
             return url, title, ms, True
+        # right song but below the resolution we want - remember the best one
+        # and keep looking for something higher
+        if best is None or max_h > best[3]:
+            best = (url, title, ms, max_h)
+        print(f'  Matched {title} but only {max_h}p, looking for higher')
+
+    if best is not None:
+        print(f'  Using best available match ({best[3]}p)')
+        return best[0], best[1], best[2], True
 
     # nothing matched - use top result with default offset
     url, title = candidates[0][0], candidates[0][1]
@@ -506,7 +534,11 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     print('\nLooking on YouTube for: ' + query)
 
     candidates = search_candidates(query)
-    url, vid_title, offset, matched = select_video(folder, candidates, sync_ready)
+    # the format string caps at height<=N; pass N so selection prefers a source
+    # that actually has it
+    m = re.search(r'height<=(\d+)', quality)
+    target_h = int(m.group(1)) if m else 0
+    url, vid_title, offset, matched = select_video(folder, candidates, sync_ready, target_h)
     print('Downloading: ' + vid_title)
 
     # old video stays until new one is fully downloaded, so nothing is left half-done
@@ -552,7 +584,7 @@ def process_resync(folder, song_name, sync_ready):
     if source:
         url = f'https://www.youtube.com/watch?v={source}'
         print('\nRe-syncing: ' + build_query(artist, title) + '  (known source)')
-        audio = fetch_audio(folder, url)
+        audio, _ = fetch_audio(folder, url)
         try:
             ms, info = (audiosync.compute_offset_ms(folder, audio)
                         if audio else (None, 'no audio'))
