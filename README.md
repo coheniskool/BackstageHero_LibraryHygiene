@@ -14,7 +14,7 @@
 
 ---
 
-![BackstageHero GUI](assets/screenshot.png)
+![BackstageHero](assets/screenshot.png)
 
 Clone Hero plays a `video.mp4` from a song's folder as the background while you play. Getting one for every song by hand is a slog. This searches YouTube, downloads a match, and works out the timing so the song starts when the video's audio does.
 
@@ -37,13 +37,13 @@ Songs that already have a video are skipped, so re-running after you add charts 
 
 ## How the timing works
 
-Every music video opens with a different amount of intro before the track starts, so one fixed offset can't be right for all of them. Once a video is chosen, it grabs the audio on its own and fingerprints it against the song's stems, the same idea Shazam uses, matching the pattern of peaks instead of the raw waveform so a differently-mastered YouTube upload still lines up. If it's sure the recording matches, it writes the measured offset to `video_start_time`. If it isn't (a live take, a remix, the wrong song) it leaves a default instead of locking in a bad guess.
+Every music video has a different amount of intro before the song kicks in, so a single fixed offset is never right for all of them. After it picks a video it pulls the audio and fingerprints it against the chart's stems to find where they line up. It matches on the pattern of peaks rather than the raw waveform, so a louder or differently-mastered YouTube rip still matches. Confident match, it writes the measured offset to `video_start_time`. Not confident (live version, remix, wrong song), it leaves the default rather than commit to a bad guess.
 
 Official videos sort themselves out this way. Community packs are the awkward ones: trimmed intros, custom audio, charts with no audio to match against. The manual editor is there for those, and anything you set can be shared the same way.
 
 ## Why it still works
 
-Most YouTube downloaders use the web player API, which now requires bot-challenge tokens that rotate constantly. This uses the TV embedded and Android client APIs instead — different code paths that don't need those tokens. It also keeps yt-dlp updated automatically, so when YouTube changes something and yt-dlp patches it, the fix lands within a day without needing a new release.
+Most YouTube downloaders use the web player API, which now wants bot-challenge tokens that rotate constantly. This goes through the TV embedded and Android client APIs instead, which don't need those tokens. It also keeps yt-dlp updated on its own, so when YouTube breaks something and yt-dlp patches it, the fix shows up within a day or so, no new release needed.
 
 Push a big library hard enough and YouTube can still rate-limit your IP. When that happens it backs off and retries on its own; if it does give up, you re-run later and it continues from where it stopped.
 

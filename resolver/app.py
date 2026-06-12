@@ -6,15 +6,40 @@
 
 import json
 import os
+import re
 import urllib.request
 import urllib.parse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import db
 import suggest as suggest_mod
+
+# video_id has to be a real YouTube id, hash is our chart-hash format. check them
+# here so junk/markup never reaches the DB or the dashboard.
+_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+_HASH_RE     = re.compile(r'^[A-Za-z0-9:._-]{1,128}$')
+
+
+def _require_video_id(v):
+    if not _VIDEO_ID_RE.match(v or ''):
+        raise HTTPException(status_code=400, detail='invalid video_id')
+
+
+def _require_hash(h):
+    if not _HASH_RE.match(h or ''):
+        raise HTTPException(status_code=400, detail='invalid hash')
+
+
+def _client_ip(request):
+    """Client IP, as best we can get it. Behind Cloudflare it's in
+    CF-Connecting-IP, otherwise the socket peer. Only used to dedup the made-up
+    client_ids so one machine can't stack a quorum."""
+    return (request.headers.get('cf-connecting-ip')
+            or (request.client.host if request.client else '')
+            or '')
 
 # Optional Cloudflare single-URL cache purge, so a curator change is served
 # immediately instead of waiting out the edge TTL. All three must be set, else
@@ -90,23 +115,23 @@ def resolve(hash: str, response: Response, conn=Depends(_conn)):
 
 
 class ReportIn(BaseModel):
-    hash: str
-    video_id: str
+    hash: str = Field(max_length=128)
+    video_id: str = Field(max_length=32)
     start_ms: int
-    client_id: str
+    client_id: str = Field(max_length=64)
     confidence: float = 1.0
-    artist: str = ''
-    title: str = ''
+    artist: str = Field(default='', max_length=200)
+    title: str = Field(default='', max_length=200)
 
 
 class PingIn(BaseModel):
-    client_id:   str
+    client_id:   str = Field(max_length=64)
     sharing:     bool = False
-    app_version: str  = ''
+    app_version: str  = Field(default='', max_length=32)
 
 
 @app.post('/ping')
-def ping(body: PingIn, conn=Depends(_conn)):
+def ping(body: PingIn, request: Request, conn=Depends(_conn)):
     if not body.client_id:
         raise HTTPException(status_code=400, detail='client_id required')
     db.record_ping(conn, body.client_id, body.sharing, body.app_version)
@@ -114,12 +139,15 @@ def ping(body: PingIn, conn=Depends(_conn)):
 
 
 @app.post('/report')
-def report(body: ReportIn, conn=Depends(_conn)):
-    if not body.hash or not body.video_id or not body.client_id:
-        raise HTTPException(status_code=400, detail='hash, video_id, client_id required')
+def report(body: ReportIn, request: Request, conn=Depends(_conn)):
+    if not body.client_id:
+        raise HTTPException(status_code=400, detail='client_id required')
+    _require_hash(body.hash)
+    _require_video_id(body.video_id)
     status = db.record_vote(
         conn, body.hash, body.video_id, body.start_ms, body.client_id,
-        body.confidence, body.artist, body.title)
+        max(0.0, min(1.0, body.confidence)), body.artist, body.title,
+        ip=_client_ip(request))
     return {'status': status}
 
 
@@ -134,8 +162,8 @@ def admin_stats(conn=Depends(_conn)):
 
 
 class SetIn(BaseModel):
-    hash: str
-    video_id: str
+    hash: str = Field(max_length=128)
+    video_id: str = Field(default='', max_length=32)
     status: str          # 'approved' | 'rejected' | 'pending'
 
 
@@ -143,6 +171,9 @@ class SetIn(BaseModel):
 def admin_set(body: SetIn, conn=Depends(_conn)):
     if body.status not in ('approved', 'rejected', 'pending'):
         raise HTTPException(status_code=400, detail='bad status')
+    _require_hash(body.hash)
+    if body.video_id:                 # may be empty for a 'rejected' chart
+        _require_video_id(body.video_id)
     db.set_status(conn, body.hash, body.video_id, body.status, lock=True)
     _purge_resolve(body.hash)
     return {'ok': True}
@@ -156,14 +187,16 @@ class OffsetIn(BaseModel):
 
 @app.post('/admin/offset', dependencies=[Depends(_require_admin)])
 def admin_offset(body: OffsetIn, conn=Depends(_conn)):
+    _require_hash(body.hash)
+    _require_video_id(body.video_id)
     db.set_start_ms(conn, body.hash, body.video_id, body.start_ms)
     _purge_resolve(body.hash)
     return {'ok': True}
 
 
 class SuggestIn(BaseModel):
-    artist: str = ''
-    title: str = ''
+    artist: str = Field(default='', max_length=200)
+    title: str = Field(default='', max_length=200)
 
 
 @app.post('/admin/suggest', dependencies=[Depends(_require_admin)])
@@ -201,15 +234,17 @@ _ADMIN_HTML = """<!doctype html>
  <h1>BackstageHero - Curator</h1>
  <span class="stat" id="stats">loading...</span>
  <span style="flex:1"></span>
- <button onclick="load()">Refresh</button>
+ <button id="refresh">Refresh</button>
 </header>
 <main id="list">loading...</main>
 <script>
+"use strict";
+// everything here is built with createElement + textContent. nothing from a
+// report (artist/title/video_id/chart_hash/channel) gets dropped into an HTML
+// string or an onclick, so a junk payload can't run anything in the dashboard.
 let TOKEN = sessionStorage.getItem('bh_token') || '';
 function hdr(j){ return j?{'Content-Type':'application/json'}:{}; }
 async function api(path, opts){
-  // Inject the current token freshly on every call (including retries) so a
-  // token entered at the prompt actually reaches the next request.
   opts = opts || {};
   const headers = Object.assign({}, opts.headers||{});
   if(TOKEN) headers['Authorization'] = 'Bearer '+TOKEN;
@@ -221,54 +256,100 @@ async function api(path, opts){
   return r;
 }
 async function post(path, body){ return api(path,{method:'POST',headers:hdr(true),body:JSON.stringify(body)}); }
-function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+function el(tag, opts){
+  const e = document.createElement(tag);
+  if(opts){
+    if(opts.cls) e.className = opts.cls;
+    if(opts.text != null) e.textContent = opts.text;   // textContent = no HTML injection
+    if(opts.attrs) for(const k in opts.attrs) e.setAttribute(k, opts.attrs[k]);
+    if(opts.on) for(const ev in opts.on) e.addEventListener(ev, opts.on[ev]);
+  }
+  return e;
+}
+function statNode(label, value){
+  const span = el('span'); span.append(label+' ');
+  span.append(el('b', {text:String(value)})); return span;
+}
 
 async function load(){
   const s = await (await api('/admin/stats',{headers:hdr(false)})).json();
-  document.getElementById('stats').innerHTML =
-    `charts <b>${s.charts}</b> &middot; approved <b>${s.approved}</b> &middot; pending <b>${s.pending}</b> &middot; votes <b>${s.votes}</b>`
-  + ` &nbsp;|&nbsp; users 24h <b>${s.active_24h}</b> / 7d <b>${s.active_7d}</b> / ever <b>${s.total_ever}</b>`
-  + ` &middot; sharing 24h <b>${s.sharing_24h}</b> / 7d <b>${s.sharing_7d}</b>`;
+  const stats = document.getElementById('stats');
+  stats.textContent = '';
+  const items = [['charts',s.charts],['approved',s.approved],['pending',s.pending],
+    ['votes',s.votes],['| users 24h',s.active_24h],['/7d',s.active_7d],
+    ['/ever',s.total_ever],['· sharing 24h',s.sharing_24h],['/7d',s.sharing_7d]];
+  items.forEach(([l,v],i)=>{ if(i) stats.append('  '); stats.append(statNode(l,v)); });
+
   const data = await (await api('/admin/pending',{headers:hdr(false)})).json();
   const list = document.getElementById('list');
-  if(!data.pending.length){ list.innerHTML='<div class="card">Nothing pending. All caught up.</div>'; return; }
-  list.innerHTML = data.pending.map(rowHtml).join('');
+  list.textContent = '';
+  if(!data.pending.length){
+    list.append(el('div',{cls:'card',text:'Nothing pending. All caught up.'}));
+    return;
+  }
+  data.pending.forEach(m => list.append(rowCard(m)));
 }
 
-function rowHtml(m){
-  const name = (esc(m.artist)? esc(m.artist)+' - ':'') + (esc(m.title)||'(unknown title)');
-  const cid = 'c_'+Math.random().toString(36).slice(2);
-  return `<div class="card" id="${cid}">
-    <div class="row">
-      <span class="song">${name}</span>
-      <span class="muted">votes ${m.votes} &middot; status ${m.status} &middot; ${m.video_id?('vid '+esc(m.video_id)):'no video yet'}</span>
-    </div>
-    <div class="row" style="margin-top:8px">
-      <button class="ok" onclick="setStatus('${m.chart_hash}','${esc(m.video_id)}','approved')">Approve</button>
-      <button class="no" onclick="setStatus('${m.chart_hash}','${esc(m.video_id)}','rejected')">Reject</button>
-      <input id="${cid}_vid" placeholder="set video id" size="14">
-      <button onclick="setVid('${m.chart_hash}','${cid}')">Set &amp; approve</button>
-      <button onclick="suggest('${m.chart_hash}','${cid}','${esc(m.artist)}','${esc(m.title)}')">Suggest</button>
-    </div>
-    <div class="cands" id="${cid}_cands"></div></div>`;
+function rowCard(m){
+  const card = el('div',{cls:'card'});
+  const name = (m.artist ? m.artist+' - ' : '') + (m.title || '(unknown title)');
+
+  const top = el('div',{cls:'row'});
+  top.append(el('span',{cls:'song',text:name}));
+  top.append(el('span',{cls:'muted',
+    text:`votes ${m.votes} · status ${m.status} · ` +
+         (m.video_id ? 'vid '+m.video_id : 'no video yet')}));
+  card.append(top);
+
+  const actions = el('div',{cls:'row',attrs:{style:'margin-top:8px'}});
+  actions.append(el('button',{cls:'ok',text:'Approve',
+    on:{click:()=>setStatus(m.chart_hash,m.video_id,'approved')}}));
+  actions.append(el('button',{cls:'no',text:'Reject',
+    on:{click:()=>setStatus(m.chart_hash,m.video_id,'rejected')}}));
+  const vidInput = el('input',{attrs:{placeholder:'set video id',size:'14'}});
+  actions.append(vidInput);
+  actions.append(el('button',{text:'Set & approve',
+    on:{click:()=>setStatus(m.chart_hash, vidInput.value.trim(), 'approved')}}));
+  const cands = el('div',{cls:'cands'});
+  actions.append(el('button',{text:'Suggest',
+    on:{click:()=>suggest(m.chart_hash, m.artist, m.title, cands)}}));
+  card.append(actions);
+  card.append(cands);
+  return card;
 }
 
-async function setStatus(h,v,st){ if(!v&&st!=='rejected'){alert('no video id; use Set & approve');return;} await post('/admin/set',{hash:h,video_id:v,status:st}); load(); }
-async function setVid(h,cid){ const v=document.getElementById(cid+'_vid').value.trim(); if(!v)return; await post('/admin/set',{hash:h,video_id:v,status:'approved'}); load(); }
-
-async function suggest(h,cid,artist,title){
-  const box=document.getElementById(cid+'_cands'); box.style.display='block'; box.innerHTML='searching...';
-  const r=await (await post('/admin/suggest',{artist,title})).json();
-  if(!r.search_enabled){ box.innerHTML='<div class="muted">Server-side search unavailable (yt-dlp not installed).</div>'; return; }
-  if(!r.candidates.length){ box.innerHTML='<div class="muted">No candidates found.</div>'; return; }
-  box.innerHTML = r.candidates.map((c,i)=>`<div class="cand">
-     <div class="row"><span>${i===r.recommended?'<span class="rec">AI pick &rarr; </span>':''}${esc(c.title)}</span>
-       <span class="muted">${esc(c.channel)} &middot; ${c.duration||'?'}s</span></div>
-     <div class="row" style="margin-top:6px">
-       <a href="${c.url}" target="_blank">preview</a>
-       <button class="ok" onclick="post('/admin/set',{hash:'${h}',video_id:'${c.id}',status:'approved'}).then(load)">Approve this</button>
-     </div></div>`).join('') +
-     (r.llm_enabled?'':'<div class="muted" style="margin-top:6px">(set BACKSTAGEHERO_LLM_KEY for an AI pick)</div>');
+async function setStatus(h,v,st){
+  if(!v && st!=='rejected'){ alert('no video id; type one then Set & approve'); return; }
+  await post('/admin/set',{hash:h,video_id:v,status:st}); load();
 }
+
+async function suggest(h, artist, title, box){
+  box.style.display='block'; box.textContent='searching...';
+  const r = await (await post('/admin/suggest',{artist,title})).json();
+  box.textContent='';
+  if(!r.search_enabled){ box.append(el('div',{cls:'muted',text:'Server-side search unavailable (yt-dlp not installed).'})); return; }
+  if(!r.candidates.length){ box.append(el('div',{cls:'muted',text:'No candidates found.'})); return; }
+  r.candidates.forEach((c,i)=>{
+    const cand = el('div',{cls:'cand'});
+    const line = el('div',{cls:'row'});
+    if(i===r.recommended) line.append(el('span',{cls:'rec',text:'AI pick: '}));
+    line.append(el('span',{text:c.title||''}));
+    line.append(el('span',{cls:'muted',text:` ${c.channel||''} · ${c.duration||'?'}s`}));
+    cand.append(line);
+    const act = el('div',{cls:'row',attrs:{style:'margin-top:6px'}});
+    const link = el('a',{text:'preview',attrs:{target:'_blank',rel:'noopener'}});
+    link.href = 'https://www.youtube.com/watch?v=' + encodeURIComponent(c.id || '');
+    act.append(link);
+    act.append(el('button',{cls:'ok',text:'Approve this',
+      on:{click:()=>setStatus(h, c.id, 'approved')}}));
+    cand.append(act);
+    box.append(cand);
+  });
+  if(!r.llm_enabled) box.append(el('div',{cls:'muted',attrs:{style:'margin-top:6px'},
+    text:'(set BACKSTAGEHERO_LLM_KEY for an AI pick)'}));
+}
+
+document.getElementById('refresh').addEventListener('click', load);
 load();
 </script></body></html>"""

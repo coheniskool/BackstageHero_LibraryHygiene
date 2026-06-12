@@ -5,12 +5,15 @@
 
 import hashlib
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
 import uuid
 
 import updater
+
+log = logging.getLogger('backstagehero')
 
 _DEFAULT_RESOLVER = 'https://backstage.jimmyproton.co.uk'
 RESOLVER_BASE = os.environ.get('BACKSTAGEHERO_RESOLVER', _DEFAULT_RESOLVER).rstrip('/')
@@ -23,6 +26,20 @@ _RESOLVE_TIMEOUT = 3
 _REPORT_TIMEOUT  = 3
 _PING_TIMEOUT    = 3
 _UA = 'BackstageHero-Client'
+
+# share back to the pool or not. look-ups still work either way, this only stops
+# the outbound /report and /ping. GUI sets it from the saved setting; on by
+# default. BACKSTAGEHERO_NO_SHARE=1 forces it off if you're not using the GUI.
+_sharing = os.environ.get('BACKSTAGEHERO_NO_SHARE', '') not in ('1', 'true', 'yes')
+
+
+def set_sharing(on):
+    global _sharing
+    _sharing = bool(on)
+
+
+def sharing_enabled():
+    return _sharing
 
 
 def enabled():
@@ -79,13 +96,14 @@ def resolve(ch):
         if data.get('status') == 'approved' and data.get('video_id'):
             return data
     except Exception:
-        pass
+        log.debug('resolve() failed', exc_info=True)
     return None
 
 
 def ping(sharing=True, app_version=''):
-    """Fire-and-forget heartbeat on app startup so the server can count active users."""
-    if not RESOLVER_BASE:
+    """Heartbeat on startup so the server can count active users. Only goes out
+    when sharing is on, since it carries the per-machine UUID. Ignore failures."""
+    if not RESOLVER_BASE or not _sharing:
         return
     try:
         body = json.dumps({
@@ -98,12 +116,13 @@ def ping(sharing=True, app_version=''):
             headers={'User-Agent': _UA, 'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=_PING_TIMEOUT).close()
     except Exception:
-        pass
+        log.debug('ping() failed', exc_info=True)
 
 
 def report(ch, video_id, start_ms, confidence, artist=None, title=None):
-    """Send a vote for this chart->video mapping. Only called on confident fingerprint matches."""
-    if not RESOLVER_BASE or not ch or not video_id:
+    """Send a vote for this chart->video mapping. Only called on confident
+    fingerprint matches, and only when the user has sharing enabled."""
+    if not RESOLVER_BASE or not _sharing or not ch or not video_id:
         return
     try:
         body = json.dumps({
@@ -120,4 +139,4 @@ def report(ch, video_id, start_ms, confidence, artist=None, title=None):
             headers={'User-Agent': _UA, 'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=_REPORT_TIMEOUT).close()
     except Exception:
-        pass
+        log.debug('report() failed', exc_info=True)

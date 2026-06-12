@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -14,6 +15,8 @@ import threading
 import time
 import urllib.request
 import zipfile
+
+log = logging.getLogger('backstagehero')
 
 GITHUB_REPO = 'jmb988/BackstageHero'
 EXE_ASSET_NAME = 'BackstageHero.exe'
@@ -137,26 +140,26 @@ def maybe_update_ytdlp(current_version):
         finally:
             shutil.rmtree(work, ignore_errors=True)
     except Exception:
+        log.warning('yt-dlp update check failed', exc_info=True)
         return None
 
 
-def _download(url, dest, progress=False):
-    """Download a URL to a file, optionally printing progress."""
+def _download(url, dest, progress_cb=None):
+    """Download a URL to a file. progress_cb(got, total) is called as bytes arrive."""
     req = urllib.request.Request(url, headers={'User-Agent': _UA})
     with urllib.request.urlopen(req, timeout=_DL_TIMEOUT) as resp, open(dest, 'wb') as out:
         total = int(resp.headers.get('Content-Length') or 0)
         got = 0
+        if progress_cb:
+            progress_cb(0, total)
         while True:
             chunk = resp.read(65536)
             if not chunk:
                 break
             out.write(chunk)
             got += len(chunk)
-            if progress and total:
-                pct = got * 100 // total
-                print(f'\r  Downloading update... {pct}%', end='', flush=True)
-        if progress and total:
-            print()
+            if progress_cb:
+                progress_cb(got, total)
 
 
 def _find_release_asset(release, name):
@@ -227,20 +230,35 @@ def _cleanup_old_exe():
         pass
 
 
-def _apply_app_update(asset_url, expected_sha):
+def _apply_app_update(asset_url, expected_sha, status_cb=None):
     """Download the new exe, verify the checksum, swap it in and relaunch.
-    Returns False if anything fails - the current exe is left alone."""
+    Returns False if anything fails - the current exe is left alone.
+
+    status_cb(stage, **info) reports progress for a UI. Stages:
+      'download' (got, total) | 'verify' | 'install' | 'restart' | 'error' (msg)
+    """
+    def emit(stage, **info):
+        if status_cb:
+            try:
+                status_cb(stage, **info)
+            except Exception:
+                pass
+
     cur = sys.executable
     work = tempfile.mkdtemp(prefix='bh_app_')
     new = os.path.join(work, EXE_ASSET_NAME)
     try:
-        _download(asset_url, new, progress=True)
+        emit('download', got=0, total=0)
+        _download(asset_url, new,
+                  progress_cb=lambda got, total: emit('download', got=got, total=total))
         if expected_sha:
-            actual = _sha256_of(new)
-            if actual != expected_sha:
+            emit('verify')
+            if _sha256_of(new) != expected_sha:
+                emit('error', msg='Downloaded file failed its integrity check.')
                 print('  Update checksum did not match - keeping the current version.')
                 return False
 
+        emit('install')
         old = cur + '.old'
         if os.path.exists(old):
             try:
@@ -254,11 +272,13 @@ def _apply_app_update(asset_url, expected_sha):
             os.rename(old, cur)  # put it back if the move fails
             raise
     except Exception as e:
+        emit('error', msg=str(e))
         print(f'  Could not install the update ({e}). Continuing with the current version.')
         return False
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
+    emit('restart')
     print('  Update installed. Restarting...')
     try:
         subprocess.Popen([cur], cwd=os.getcwd(), close_fds=True)
@@ -283,13 +303,15 @@ def check_app_update(current_version):
         latest = re.sub(r'^\D*', '', tag) or tag
         return latest, asset, _expected_sha256(release)
     except Exception:
+        log.warning('App update check failed', exc_info=True)
         return None
 
 
-def apply_app_update(asset_url, expected_sha):
+def apply_app_update(asset_url, expected_sha, status_cb=None):
     """Download the new exe, verify it, swap it in place and relaunch.
-    Returns False on any failure (current exe untouched)."""
-    return _apply_app_update(asset_url, expected_sha)
+    Returns False on any failure (current exe untouched). status_cb reports
+    progress stages, see _apply_app_update."""
+    return _apply_app_update(asset_url, expected_sha, status_cb=status_cb)
 
 
 def run_startup_updates(app_version, ytdlp_version):

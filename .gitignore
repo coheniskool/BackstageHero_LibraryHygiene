@@ -4,12 +4,17 @@ dist/
 *.spec
 build_log.txt
 
-# Generated icon (converted from icon.png at build time)
+# Generated at build time by make_brand.py / build.py
 assets/icon.ico
+assets/logo.png
+assets/splash.png
 
 # Bundled at build time into the exe; not part of the source
 ffmpeg.exe
 ffplay.exe
+ffmpeg-LICENSE.txt
+libmpv-2.dll
+mpv-2.dll
 
 # Python
 __pycache__/

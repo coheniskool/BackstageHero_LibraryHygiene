@@ -2,3 +2,5 @@ tqdm>=4.66.5
 yt-dlp>=2024.11.4
 numpy>=1.21
 customtkinter>=5.2.0
+pillow>=9.0          # header logo / splash rendering
+python-mpv>=1.0.7   # embedded sync-editor preview; needs libmpv-2.dll alongside

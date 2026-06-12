@@ -1,19 +1,15 @@
 """
-Audio alignment for Clone Hero background videos.
+Works out how far into a downloaded video the song actually starts, so it can be
+lined up with the chart instead of guessing a fixed offset.
 
-Given a downloaded video and the chart's own audio stems, this works out how far
-into the video the song actually starts, so the video can be lined up with the
-chart automatically instead of relying on a fixed guess.
+Landmark fingerprinting: find peaks in each spectrogram, hash pairs of them, then
+look for a consistent time shift between the chart audio and the video audio.
+Matching peak patterns instead of the raw waveform means it still works when the
+YouTube rip is louder or mastered differently than the chart stems. Weak match
+(live version, remix, wrong song) and it returns nothing, so the caller falls
+back to the default.
 
-The method is landmark-based audio fingerprinting (the same idea Shazam uses):
-find robust peaks in each spectrogram, hash pairs of peaks into fingerprints,
-then look for a consistent time offset between the two recordings. Because it
-matches the *pattern* of peaks rather than the raw waveform, it survives the EQ,
-loudness, and master differences you get when the YouTube result is not the exact
-same file as the chart audio. When the match is weak (a live take, a remix, the
-wrong song entirely) it reports no result and the caller falls back to the default.
-
-Only numpy and ffmpeg are required.
+Needs numpy and ffmpeg.
 """
 
 import os
@@ -48,13 +44,11 @@ DT_MAX = 120            # Maximum frame gap (~2 s).
 
 HIST_BIN = 3            # Offset histogram bin width, in frames (~48 ms).
 
-# An alignment is accepted only when all three of these agree. They were
-# calibrated on real Clone Hero charts aligned against the matching YouTube
-# audio: a genuine same-recording match lands far above every threshold
-# (thousands of votes, concentration above 0.2), while a wrong song or a
-# different master sits near the noise floor (a handful of votes, concentration
-# below 0.01). The gap between the two is enormous, so the only job here is to
-# pick values that fall inside it.
+# All three have to pass before an alignment counts. Picked these by running
+# real charts against the matching YouTube audio: a true match blows past every
+# threshold (thousands of votes, concentration over 0.2), a wrong song barely
+# registers (a handful of votes, under 0.01). Huge gap between the two, so these
+# just need to land somewhere in the middle.
 MIN_MATCHES = 40        # Votes in the winning offset bin.
 MIN_SCORE = 50.0        # Winning bin height relative to the average bin.
 MIN_CONC = 0.05         # Share of all votes that land on the winning offset.
@@ -106,14 +100,19 @@ def _decode(inputs, sr, seconds):
     return samples if samples.size >= N_FFT else None
 
 
-def _chart_stems(folder, exclude=None):
+def chart_stems(folder, exclude=None):
     """A song folder's audio stems, minus preview/crowd and any excluded file.
 
-    The excluded path is the throwaway audio fetched for syncing, which lives in
-    the same folder and must not be mistaken for part of the chart."""
+    The fingerprinter and the GUI preview both call this so they always mix the
+    same set of files. `exclude` is the throwaway audio we fetch for syncing,
+    which sits in the same folder and isn't a real stem."""
     exclude = os.path.abspath(exclude) if exclude else None
     stems = []
-    for name in os.listdir(folder):
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return stems
+    for name in names:
         base, ext = os.path.splitext(name)
         if ext.lower() not in AUDIO_EXTS or base.lower() in EXCLUDE_STEMS:
             continue
@@ -122,6 +121,10 @@ def _chart_stems(folder, exclude=None):
             continue
         stems.append(path)
     return stems
+
+
+# old name, kept so existing callers don't break
+_chart_stems = chart_stems
 
 
 # Fingerprinting
@@ -135,9 +138,9 @@ def _spectrogram(x):
 def _peaks(spec):
     """Spectral peaks as (time_frame, freq_bin) arrays.
 
-    A point is kept if it is the maximum within its time/frequency rectangle and
-    rises above a per-frame magnitude cutoff. A max filter over a rectangle is
-    separable, so it is computed as a rolling max along each axis in turn.
+    Keep a point if it's the max in its time/freq rectangle and above a per-frame
+    cutoff. A rectangular max filter is separable, so do a rolling max down each
+    axis instead of one 2D pass.
     """
     padded = np.pad(spec, ((0, 0), (PEAK_FREQ_RADIUS, PEAK_FREQ_RADIUS)))
     fmax = sliding_window_view(padded, 2 * PEAK_FREQ_RADIUS + 1, axis=1).max(axis=-1)
@@ -155,8 +158,9 @@ def _peaks(spec):
 def _fingerprint(t, f):
     """Map each fingerprint hash to the anchor times that produced it.
 
-    Peaks arrive sorted by time, so paired targets are simply the next few peaks
-    within the allowed gap. Each hash packs the two frequency bins and the gap.
+    Peaks come in sorted by time, so the targets to pair with are just the next
+    few peaks inside the allowed gap. Each hash packs both frequency bins and the
+    gap between them.
     """
     table = {}
     n = len(t)
@@ -221,19 +225,16 @@ def _offset_seconds(ref_table, probe_table):
     return lead, votes, score, conc
 
 
-# Public entry point
-
 def compute_offset_ms(folder, probe_audio):
     """Work out video_start_time (ms) for one song folder.
 
-    `probe_audio` is the audio track of the chosen YouTube result (the saved
-    video.mp4 has no audio, so its audio is fetched separately for this). It is
-    aligned against the chart's own stems.
+    probe_audio is the audio of the chosen YouTube result (video.mp4 has no audio
+    so it's fetched separately), aligned against the chart's stems.
 
-    Returns (milliseconds, info_string) on success, or (None, reason_string) when
-    auto-sync is unavailable or the match is not trustworthy. The sign follows the
-    convention the original tool shipped: audio that starts L seconds into the
-    video gets video_start_time = -L*1000 (so a 3 s lead-in reproduces -3000).
+    Returns (milliseconds, info_string), or (None, reason) if sync isn't available
+    or the match can't be trusted. Sign matches what v1 used: audio starting L
+    seconds into the video gives video_start_time = -L*1000, so a 3s lead-in is
+    -3000.
     """
     if not _NUMPY:
         return None, 'numpy not available'

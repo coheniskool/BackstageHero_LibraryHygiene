@@ -4,12 +4,15 @@
 import os
 import sys
 import glob
+import logging
+import random
 import re
 import subprocess
+import tempfile
 import threading
 import queue
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import customtkinter as ctk
 import tkinter as tk
@@ -20,9 +23,13 @@ from VideoDownload import (
     quality_format, get_stored_resolution, set_ini_values,
     ffmpegAvailable, ffplayPath, audiosync, __version__,
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
+    SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution,
 )
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
 import resolver_client
+
+log = logging.getLogger('backstagehero')
 
 ctk.set_appearance_mode('dark')
 ctk.set_default_color_theme('blue')
@@ -32,6 +39,36 @@ def _asset_path(name):
     """Resolve a bundled asset path - works both frozen (PyInstaller) and from source."""
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, 'assets', name)
+
+
+def _load_mpv():
+    """Load the optional embedded player (libmpv via python-mpv).
+
+    Returns the mpv module if libmpv-2.dll is present and loads, else None.
+    The sync editor uses it for a live, in-window preview; if it's missing
+    the editor falls back to launching ffplay."""
+    try:
+        dirs = []
+        if getattr(sys, 'frozen', False):
+            dirs.append(getattr(sys, '_MEIPASS', ''))
+            dirs.append(os.path.dirname(sys.executable))
+        else:
+            dirs.append(os.path.dirname(os.path.abspath(__file__)))
+        for d in dirs:
+            if d and os.path.exists(os.path.join(d, 'libmpv-2.dll')):
+                try:
+                    os.add_dll_directory(d)
+                except Exception:
+                    pass
+                os.environ['PATH'] = d + os.pathsep + os.environ.get('PATH', '')
+                break
+        import mpv as _mpv
+        return _mpv
+    except Exception:
+        return None
+
+
+mpvlib = _load_mpv()
 
 _BG      = '#1e1e2e'
 _SURFACE = '#252535'
@@ -63,6 +100,26 @@ def _save_songs_path(path):
         pass
 
 
+import json as _json
+_SETTINGS_FILE = os.path.join(updater.data_dir(), 'settings.json')
+
+
+def _load_settings():
+    try:
+        with open(_SETTINGS_FILE, encoding='utf-8') as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_settings(data):
+    try:
+        with open(_SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            _json.dump(data, f)
+    except Exception:
+        pass
+
+
 def _validate_folder(path):
     """Returns (ok: bool, message: str)."""
     if not path or not os.path.isdir(path):
@@ -72,7 +129,7 @@ def _validate_folder(path):
     if os.path.exists(os.path.join(path, 'song.ini')):
         return False, (
             'That looks like an individual song folder, not your Songs library.\n\n'
-            'Please select the folder that contains all your song packs — '
+            'Please select the folder that contains all your song packs, '
             'not a folder inside one of them.')
 
     # Check for any song.ini anywhere inside
@@ -96,14 +153,28 @@ class Song:
     label    : str          # "Artist – Title" for display
     key      : str          # label.lower() for search
     has_video: bool
-    res      : str          # "720p" / "1080p" / "480p" / "—" / "…"
+    res      : str          # "720p" / "1080p" / "480p" / "-" / "..."
     checked  : bool = False
     status   : str  = ''    # live status text during a run
     stag     : str  = ''    # colour tag: 'done'|'error'|'busy'|'dim'|''
 
 
-def _scan_library(songs_folder):
-    """Return a list[Song] for the folder, sorted alphabetically."""
+def _open_in_file_manager(path):
+    """Open a folder in the OS file manager (Windows/macOS/Linux)."""
+    try:
+        if sys.platform == 'win32':
+            os.startfile(path)              # noqa: only exists on Windows
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', path])
+        else:
+            subprocess.Popen(['xdg-open', path])
+    except Exception:
+        log.warning('Could not open folder: %s', path)
+
+
+def _scan_library(songs_folder, progress=None):
+    """Return a list[Song] for the folder, sorted alphabetically.
+    progress(count) is called periodically so the UI can show a live tally."""
     songs = []
     for ini in glob.iglob(
             os.path.join(glob.escape(songs_folder), '**', 'song.ini'),
@@ -112,45 +183,50 @@ def _scan_library(songs_folder):
         artist, title = read_metadata(folder)
         label = build_query(artist, title) or os.path.basename(folder)
         has_vid = os.path.exists(os.path.join(folder, 'video.mp4'))
-        res = '—'
+        res = '-'
         if has_vid:
             stored = get_stored_resolution(folder)
-            res = stored if stored else '…'   # '…' = needs probing
+            res = stored if stored else '...'   # '...' = needs probing
         songs.append(Song(
             filename=ini, folder=folder,
             label=label, key=label.lower(),
             has_video=has_vid, res=res))
+        if progress and len(songs) % 50 == 0:
+            progress(len(songs))
     songs.sort(key=lambda s: s.key)
     return songs
 
 
 class SyncEditor(ctk.CTkToplevel):
     """Manual video-offset editor.
-    Adjusting the slider or nudge buttons restarts the preview automatically
-    after a short debounce so the user never needs to click a preview button."""
+
+    When libmpv is available the video plays embedded in this window and the
+    slider shifts the audio against it live, with no respawn. Otherwise it
+    falls back to launching ffplay for a one-shot preview."""
 
     _MS_MIN = -30_000
     _MS_MAX =  90_000
-    _DEBOUNCE_MS = 350   # wait this long after last change before relaunching ffplay
 
     def __init__(self, parent, song: Song, on_save=None):
         super().__init__(parent)
-        self._song         = song
-        self._on_save      = on_save
-        self._proc         = None   # running ffplay process
-        self._proc_aux     = None   # ffmpeg feeder process when piping audio
-        self._after_id     = None   # pending debounce after() id
+        self._song      = song
+        self._on_save   = on_save
+        self._player    = None    # mpv handle (embedded preview)
+        self._proc      = None    # ffplay process (fallback)
+        self._proc_aux  = None    # ffmpeg feeder (fallback)
+        self._tmp_mux   = None    # temp muxed video+audio file for the preview
+        self._embedded  = mpvlib is not None and ffmpegAvailable
 
-        # SW_SHOWNOACTIVATE: ffplay window opens without stealing keyboard/mouse focus
+        # SW_SHOWNOACTIVATE: ffplay (fallback) opens without stealing focus
         self._si = subprocess.STARTUPINFO()
         self._si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
-        self._si.wShowWindow = 4   # SW_SHOWNOACTIVATE
+        self._si.wShowWindow = 4
 
         self._ms    = tk.IntVar(value=self._read_offset())
         self._share = tk.BooleanVar(value=True)
 
         self.title('Sync Editor')
-        self.geometry('500x490')
+        self.geometry('640x760' if self._embedded else '500x470')
         self.resizable(False, False)
         self.configure(fg_color=_BG)
         self.grab_set()
@@ -165,6 +241,10 @@ class SyncEditor(ctk.CTkToplevel):
         self._build()
         self._refresh()
         self.after(50, self._center)
+        if self._embedded:
+            self.after(120, self._start_embedded)
+        elif ffplayPath:
+            self.after(200, self._launch_preview)
 
     def _build(self):
         # Header
@@ -175,10 +255,23 @@ class SyncEditor(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=14, weight='bold'),
                      text_color=_TEXT, anchor='w').pack(
             side='left', padx=18, fill='y')
-        res = self._song.res if self._song.res not in ('—', '…', '') else '?'
+        res = self._song.res if self._song.res not in ('-', '...', '') else '?'
         ctk.CTkLabel(hdr, text=res,
                      font=ctk.CTkFont(size=11),
                      text_color=_SUBTEXT).pack(side='right', padx=18)
+
+        # Embedded video surface (mpv renders into this frame)
+        self._video_frame = None
+        if self._embedded:
+            holder = ctk.CTkFrame(self, fg_color='#000000', corner_radius=8,
+                                  width=600, height=338)
+            holder.pack(padx=20, pady=(16, 0))
+            holder.pack_propagate(False)
+            # plain tk.Frame gives a stable native window id for mpv's wid
+            self._video_frame = tk.Frame(holder, bg='#000000',
+                                         width=600, height=338,
+                                         highlightthickness=0, bd=0)
+            self._video_frame.pack(fill='both', expand=True)
 
         # Offset readout card
         card = ctk.CTkFrame(self, fg_color='#252540', corner_radius=10)
@@ -189,7 +282,7 @@ class SyncEditor(ctk.CTkToplevel):
             top_row, text='',
             font=ctk.CTkFont(size=30, weight='bold'), text_color=_BLUE)
         self._ms_lbl.pack(side='left')
-        # Live indicator — only shown when ffplay is available
+        # live indicator, only when ffplay is around
         if ffplayPath:
             self._live_lbl = ctk.CTkLabel(
                 top_row, text='',
@@ -231,12 +324,35 @@ class SyncEditor(ctk.CTkToplevel):
                           command=lambda d=delta: self._nudge(d), **_b).pack(
                 side='left', padx=2)
 
-        # Hint line
-        hint = ('Preview updates automatically as you adjust.' if ffplayPath
-                else 'ffplay not bundled — adjust the offset and Save.')
-        ctk.CTkLabel(self, text=hint,
-                     font=ctk.CTkFont(size=10),
-                     text_color=_SUBTEXT).pack(pady=(8, 0))
+        # Transport row
+        prev_row = ctk.CTkFrame(self, fg_color='transparent')
+        prev_row.pack(fill='x', padx=20, pady=(10, 0))
+        if self._embedded:
+            self._play_btn = ctk.CTkButton(
+                prev_row, text='⏸  Pause', width=100, height=28,
+                fg_color='#2a2a3e', hover_color='#383858',
+                text_color=_TEXT, font=ctk.CTkFont(size=11),
+                command=self._toggle_play)
+            self._play_btn.pack(side='left')
+            ctk.CTkButton(
+                prev_row, text='↻  Restart', width=100, height=28,
+                fg_color='#2a2a3e', hover_color='#383858',
+                text_color=_TEXT, font=ctk.CTkFont(size=11),
+                command=self._restart_at_song).pack(side='left', padx=(8, 0))
+            ctk.CTkLabel(prev_row,
+                         text='Drag the slider, sync updates live as it plays.',
+                         font=ctk.CTkFont(size=10),
+                         text_color=_SUBTEXT).pack(side='right')
+        elif ffplayPath:
+            ctk.CTkButton(
+                prev_row, text='▶  Preview', width=110, height=28,
+                fg_color='#2a2a3e', hover_color='#383858',
+                text_color=_TEXT, font=ctk.CTkFont(size=11),
+                command=self._launch_preview).pack(side='left')
+        else:
+            ctk.CTkLabel(prev_row, text='Player not bundled. Adjust the offset and Save.',
+                         font=ctk.CTkFont(size=10),
+                         text_color=_SUBTEXT).pack(side='left')
 
         # Divider
         ctk.CTkFrame(self, fg_color=_BORDER, height=1).pack(
@@ -253,7 +369,7 @@ class SyncEditor(ctk.CTkToplevel):
                         hover_color='#7aaef8').pack(anchor='w')
         ctk.CTkLabel(shr,
                      text='Once enough users confirm the same offset it becomes\n'
-                          'the default for this chart — no fingerprinting needed.',
+                          'the default for this chart, no fingerprinting needed.',
                      font=ctk.CTkFont(size=10), text_color=_SUBTEXT,
                      justify='left', anchor='w').pack(anchor='w', pady=(4, 0))
 
@@ -302,107 +418,227 @@ class SyncEditor(ctk.CTkToplevel):
     def _on_slider(self, value):
         self._ms.set(int(round(value)))
         self._refresh()
-        self._schedule_preview()
+        self._apply_live_delay()
 
     def _nudge(self, delta):
         new = max(self._MS_MIN, min(self._MS_MAX, self._ms.get() + delta))
         self._ms.set(new)
         self._slider.set(new)
         self._refresh()
-        self._schedule_preview()
+        self._apply_live_delay()
 
-    def _schedule_preview(self):
-        """Debounce rapid changes — only relaunch ffplay once the user pauses."""
-        if not ffplayPath:
+    def _audio_delay(self):
+        """mpv audio-delay (seconds) for the current offset. A negative
+        video_start_time means the video has intro before the song, so the chart
+        audio comes in that much later, which is a positive delay."""
+        return -self._ms.get() / 1000.0
+
+    def _song_start_pos(self):
+        """Where playback / Restart begins: a couple seconds before the spot
+        where the song lines up with the video."""
+        return max(0.0, (-self._ms.get() / 1000.0) - 2.0)
+
+    def _find_stems(self):
+        """Every audio stem in the song folder. Clone Hero splits a song into
+        stems (song/guitar/bass/drums/vocals/...) and plays them all together; on
+        its own a single stem has gaps where the others carry the song, so the
+        preview mixes the lot or you'd hear it cut in and out. Same rule the
+        fingerprinter uses so the preview matches what gets analysed."""
+        if audiosync is not None:
+            return audiosync.chart_stems(self._song.folder)
+        # if audiosync didn't import, same extensions/exclusions by hand
+        folder = self._song.folder
+        stems = []
+        try:
+            for f in sorted(os.listdir(folder)):
+                base, ext = os.path.splitext(f.lower())
+                if ext in ('.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac') \
+                        and base not in ('preview', 'crowd'):
+                    stems.append(os.path.join(folder, f))
+        except Exception:
+            pass
+        return stems
+
+    # ---- embedded mpv preview --------------------------------------------
+
+    def _build_preview_source(self, video):
+        """Combine the silent video with all the chart's stems mixed down into one
+        temp file, so mpv just plays a single file with the full song. The mix is
+        re-encoded to PCM, the video is copied. No stems or no ffmpeg and it falls
+        back to the silent video."""
+        stems = self._find_stems()
+        if not (stems and ffmpegAvailable):
+            return video
+        try:
+            tmp = os.path.join(tempfile.gettempdir(),
+                               f'bh_preview_{os.getpid()}_{id(self) & 0xffffff}.mkv')
+            cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', video]
+            for s in stems:
+                cmd += ['-i', s]
+            n = len(stems)
+            if n == 1:
+                cmd += ['-map', '0:v:0', '-map', '1:a:0']
+            else:
+                # sum the stems. normalize=0 keeps their levels, so you get the
+                # original mix back instead of everything scaled down by count.
+                labels = ''.join(f'[{i + 1}:a]' for i in range(n))
+                cmd += ['-filter_complex',
+                        f'{labels}amix=inputs={n}:normalize=0:duration=longest[a]',
+                        '-map', '0:v:0', '-map', '[a]']
+            cmd += ['-c:v', 'copy', '-c:a', 'pcm_s16le', '-y', tmp]
+            subprocess.run(cmd, check=True, creationflags=NO_WINDOW,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                self._tmp_mux = tmp
+                return tmp
+        except Exception:
+            pass
+        return video
+
+    def _start_embedded(self):
+        video = os.path.join(self._song.folder, 'video.mp4')
+        if not (self._video_frame and os.path.exists(video)):
+            self._embedded = False
             return
-        if self._after_id is not None:
+        # mixing the stems takes a sec, so do it off the UI thread and start
+        # playback back on the main thread once the file's ready
+        threading.Thread(target=self._prepare_and_play,
+                         args=(video,), daemon=True).start()
+
+    def _prepare_and_play(self, video):
+        source = self._build_preview_source(video)
+        self.after(0, lambda: self._play_source(source))
+
+    def _play_source(self, source):
+        if not self._video_frame or not self._video_frame.winfo_exists():
+            return   # editor closed while preparing
+        try:
+            wid = int(self._video_frame.winfo_id())
+            _kw = dict(
+                wid=str(wid), vo='gpu', osc=False, keep_open='yes',
+                force_media_title=f'{self._song.label} (BackstageHero preview)',
+                log_handler=lambda *a: None)
+            _dbg = os.environ.get('BH_MPV_LOG')   # diagnostics: path to mpv log file
+            if _dbg:
+                _kw['log_file'] = _dbg
+                _kw['msg_level'] = 'all=v,ao=debug'
+            self._player = mpvlib.MPV(**_kw)
+            a = self._song_start_pos()
+            self._player.audio_delay = self._audio_delay()
+            self._player.loadfile(source, 'replace', start=str(a))
+            self.after(250, self._post_load)
+        except Exception:
+            self._teardown_player()
+            self._embedded = False
+
+    def _post_load(self):
+        """Make sure the preview is audible once the file is loaded. No looping:
+        the clip plays through so the video gets past its intro into real
+        footage, and Restart replays from the sync point on demand."""
+        p = self._player
+        if not p:
+            return
+        try:
+            p.mute = False
+            p.volume = 100
+        except Exception:
+            pass
+
+    def _apply_live_delay(self):
+        if self._player:
             try:
-                self.after_cancel(self._after_id)
+                self._player.audio_delay = self._audio_delay()
             except Exception:
                 pass
-        self._after_id = self.after(self._DEBOUNCE_MS, self._launch_preview)
 
-    def _find_preview_audio(self):
-        """Return a path to use as the audio track in the preview, or None.
-        Prefers video.sync.* (music-video audio downloaded during fingerprinting)
-        so the user can hear when the song kicks in inside the video.
-        Falls back to chart stems if the sync file is gone."""
-        folder = self._song.folder
-        for f in sorted(os.listdir(folder)):
-            if f.startswith('video.sync.'):
-                return os.path.join(folder, f)
-        for name in ('song.ogg', 'guitar.ogg', 'rhythm.ogg', 'bass.ogg', 'song.mp3'):
-            p = os.path.join(folder, name)
-            if os.path.exists(p):
-                return p
-        return None
+    def _toggle_play(self):
+        if not self._player:
+            return
+        try:
+            paused = not bool(self._player.pause)
+            self._player.pause = paused
+            self._play_btn.configure(text='▶  Play' if paused else '⏸  Pause')
+        except Exception:
+            pass
+
+    def _restart_at_song(self):
+        if not self._player:
+            return
+        try:
+            self._player.pause = False
+            self._play_btn.configure(text='⏸  Pause')
+            self._player.seek(self._song_start_pos(), reference='absolute')
+        except Exception:
+            pass
+
+    def _teardown_player(self):
+        if self._player:
+            try:
+                self._player.terminate()
+            except Exception:
+                pass
+            self._player = None
+        if self._tmp_mux:
+            try:
+                os.remove(self._tmp_mux)
+            except Exception:
+                pass
+            self._tmp_mux = None
+
+    # ---- ffplay fallback (no libmpv) -------------------------------------
 
     def _kill_preview(self):
-        """Terminate any running ffplay / ffmpeg preview processes."""
         for p in (self._proc, self._proc_aux):
             if p and p.poll() is None:
                 p.terminate()
         self._proc = self._proc_aux = None
 
     def _launch_preview(self):
-        self._after_id = None
         if not ffplayPath:
             return
         self._kill_preview()
-
-        ms      = self._ms.get()
-        v_seek  = max(0.0, -ms / 1000.0)  # how far into the video to start
-        a_seek  = max(0.0,  ms / 1000.0)  # how far into the audio to start
-        video   = os.path.join(self._song.folder, 'video.mp4')
+        ms     = self._ms.get()
+        v_seek = max(0.0, -ms / 1000.0)
+        a_seek = max(0.0,  ms / 1000.0)
+        video  = os.path.join(self._song.folder, 'video.mp4')
         if not os.path.exists(video):
             return
-
-        audio = self._find_preview_audio()
-
+        stems = self._find_stems()
         ffplay_base = [ffplayPath, '-hide_banner',
                        '-x', '640', '-y', '360', '-autoexit',
-                       '-window_title', f'Preview — {self._song.label}']
-
-        if audio and ffmpegAvailable:
-            # Pipe ffmpeg (video + audio merged) into ffplay so the user
-            # can hear when the music starts inside the video.
-            # video.sync.* and video.mp4 share the same seek point;
-            # chart stems use a_seek so the chart audio is at the right offset.
-            audio_seek = v_seek if os.path.basename(audio).startswith('video.sync.') else a_seek
+                       '-window_title', f'Preview: {self._song.label}']
+        if stems and ffmpegAvailable:
+            # Mix all stems (so the audio doesn't drop out on guitar-only
+            # sections) and copy the video, piped to ffplay.
+            cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                   '-ss', f'{v_seek:.3f}', '-i', video]
+            for s in stems:
+                cmd += ['-ss', f'{a_seek:.3f}', '-i', s]
+            n = len(stems)
+            if n == 1:
+                cmd += ['-map', '0:v', '-map', '1:a']
+            else:
+                labels = ''.join(f'[{i + 1}:a]' for i in range(n))
+                cmd += ['-filter_complex',
+                        f'{labels}amix=inputs={n}:normalize=0:duration=longest[a]',
+                        '-map', '0:v', '-map', '[a]']
+            cmd += ['-c:v', 'copy', '-shortest', '-f', 'nut', 'pipe:1']
             feeder = subprocess.Popen(
-                ['ffmpeg', '-hide_banner', '-loglevel', 'error',
-                 '-ss', f'{v_seek:.3f}',     '-i', video,
-                 '-ss', f'{audio_seek:.3f}', '-i', audio,
-                 '-map', '0:v', '-map', '1:a',
-                 '-shortest', '-f', 'nut', 'pipe:1'],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 creationflags=NO_WINDOW)
             self._proc = subprocess.Popen(
-                ffplay_base + ['-'],
-                stdin=feeder.stdout,
+                ffplay_base + ['-'], stdin=feeder.stdout,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=NO_WINDOW, startupinfo=self._si)
             feeder.stdout.close()
             self._proc_aux = feeder
         else:
-            # No audio available — play video-only, still without focus steal
             self._proc = subprocess.Popen(
                 ffplay_base + ['-ss', f'{v_seek:.3f}', video],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=NO_WINDOW, startupinfo=self._si)
-
         if self._live_lbl:
             self._live_lbl.configure(text='● live', text_color=_GREEN)
-        self._poll_live()
-
-    def _poll_live(self):
-        """Keep the live indicator accurate while ffplay is running."""
-        if not self._live_lbl or not self._proc:
-            return
-        if self._proc.poll() is None:
-            self.after(400, self._poll_live)
-        else:
-            self._live_lbl.configure(text='', text_color=_SUBTEXT)
 
     def _save(self):
         ms, share = self._ms.get(), self._share.get()
@@ -411,11 +647,7 @@ class SyncEditor(ctk.CTkToplevel):
             self._on_save(ms, share)
 
     def _close(self):
-        if self._after_id is not None:
-            try:
-                self.after_cancel(self._after_id)
-            except Exception:
-                pass
+        self._teardown_player()
         self._kill_preview()
         self.grab_release()
         self.destroy()
@@ -426,6 +658,94 @@ class SyncEditor(ctk.CTkToplevel):
         ph = self.master.winfo_y() + self.master.winfo_height() // 2
         w, h = self.winfo_width(), self.winfo_height()
         self.geometry(f'+{pw - w // 2}+{ph - h // 2}')
+
+
+class UpdateDialog(ctk.CTkToplevel):
+    """Small modal window shown while the app updates itself: status line and a
+    progress bar so the user always sees what the updater is doing."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title('Updating BackstageHero')
+        self.geometry('420x150')
+        self.resizable(False, False)
+        self.configure(fg_color=_BG)
+        self.transient(parent)
+        # no close button, the updater runs this to the end itself
+        self.protocol('WM_DELETE_WINDOW', lambda: None)
+        try:
+            ico = _asset_path('icon.ico')
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+
+        ctk.CTkLabel(self, text='Updating BackstageHero',
+                     font=ctk.CTkFont(size=15, weight='bold'),
+                     text_color=_TEXT).pack(padx=24, pady=(22, 4), anchor='w')
+        self._stat = ctk.CTkLabel(self, text='Preparing...',
+                                  font=ctk.CTkFont(size=12), text_color=_SUBTEXT)
+        self._stat.pack(padx=24, anchor='w')
+        self._bar = ctk.CTkProgressBar(self, width=372, height=14,
+                                       progress_color=_BLUE)
+        self._bar.set(0)
+        self._bar.pack(padx=24, pady=(12, 0))
+        self._bar.configure(mode='indeterminate')
+        self._bar.start()
+        self._detail = ctk.CTkLabel(self, text='',
+                                    font=ctk.CTkFont(size=10), text_color=_SUBTEXT)
+        self._detail.pack(padx=24, pady=(6, 0), anchor='w')
+
+        self.after(50, self._center)
+        self.grab_set()
+
+    def _center(self):
+        self.update_idletasks()
+        try:
+            pw = self.master.winfo_x() + self.master.winfo_width() // 2
+            ph = self.master.winfo_y() + self.master.winfo_height() // 2
+            w, h = self.winfo_width(), self.winfo_height()
+            self.geometry(f'+{pw - w // 2}+{ph - h // 2}')
+        except Exception:
+            pass
+
+    def _det(self):
+        # Stop any running indeterminate animation before showing a real value.
+        try:
+            self._bar.stop()
+        except Exception:
+            pass
+        self._bar.configure(mode='determinate')
+
+    def update_stage(self, stage, **info):
+        if not self.winfo_exists():
+            return
+        if stage == 'download':
+            got, total = info.get('got', 0), info.get('total', 0)
+            self._stat.configure(text='Downloading the new version...')
+            if total:
+                self._det()
+                self._bar.set(got / total)
+                self._detail.configure(
+                    text=f'{got / 1048576:.1f} MB of {total / 1048576:.1f} MB')
+        elif stage == 'verify':
+            self._bar.configure(mode='indeterminate'); self._bar.start()
+            self._stat.configure(text='Verifying the download...')
+            self._detail.configure(text='')
+        elif stage == 'install':
+            self._stat.configure(text='Installing...')
+        elif stage == 'restart':
+            self._det(); self._bar.set(1.0)
+            self._stat.configure(text='Done, restarting BackstageHero...')
+            self._detail.configure(text='')
+        elif stage == 'error':
+            self._det(); self._bar.set(0)
+            self._stat.configure(text='Update failed. Keeping the current version.',
+                                 text_color=_RED)
+            self._detail.configure(text=info.get('msg', ''))
+            self.protocol('WM_DELETE_WINDOW', self.destroy)
+            ctk.CTkButton(self, text='Close', width=80, command=self.destroy,
+                          fg_color='#313244', hover_color='#414160').pack(pady=(8, 0))
 
 
 class App(ctk.CTk):
@@ -449,6 +769,7 @@ class App(ctk.CTk):
         self._songs       : list[Song]       = []
         self._filtered    : list[Song]       = []
         self._iid_map     : dict[str, Song]  = {}
+        self._iid_of      : dict[int, str]   = {}   # id(Song) -> tree iid (O(1) row updates)
         self._sort_col    : str  = 'label'
         self._sort_asc    : bool = True
         self._filter_mode : str  = 'missing'
@@ -457,11 +778,19 @@ class App(ctk.CTk):
         self._stop_evt    = threading.Event()
         self._queue       : queue.Queue = queue.Queue()
         self._songs_folder: str  = ''
+        self._pending_update = None      # (version, asset, sha) deferred during a run
+        self._search_after = None        # debounce handle for the search box
+        self._settings    = _load_settings()
+        resolver_client.set_sharing(self._settings.get('share_matches', True))
         self._sync_ready  : bool = (
             ffmpegAvailable and audiosync is not None
             and audiosync.is_available())
 
         self._build_ui()
+        # Poll the queue from the start so update/ping results are handled even
+        # before a library is loaded.
+        self._polling = True
+        self.after(200, self._poll_queue)
         self.after(120, self._startup)
         self.after(500, self._start_update_check)
 
@@ -477,10 +806,20 @@ class App(ctk.CTk):
         hdr.grid_columnconfigure(1, weight=0)
         hdr.grid_columnconfigure(2, weight=1)
 
-        ctk.CTkLabel(hdr,
-                     text='BackstageHero',
-                     font=ctk.CTkFont(size=17, weight='bold'),
-                     text_color=_TEXT).grid(row=0, column=0, padx=(16, 6), pady=14)
+        logo_png = _asset_path('logo.png')
+        if os.path.exists(logo_png):
+            from PIL import Image as _PILImage
+            _img = _PILImage.open(logo_png)
+            _h = 30
+            _w = int(_img.width * _h / _img.height)
+            ctk.CTkLabel(hdr, text='',
+                         image=ctk.CTkImage(_img, size=(_w, _h))).grid(
+                row=0, column=0, padx=(16, 6), pady=11)
+        else:
+            ctk.CTkLabel(hdr,
+                         text='BackstageHero',
+                         font=ctk.CTkFont(size=17, weight='bold'),
+                         text_color=_TEXT).grid(row=0, column=0, padx=(16, 6), pady=14)
         ctk.CTkLabel(hdr,
                      text=f'v{__version__}',
                      font=ctk.CTkFont(size=11),
@@ -531,9 +870,9 @@ class App(ctk.CTk):
 
         # Search expands with the window, minimum 200px, no fixed width
         self._search_var = tk.StringVar()
-        self._search_var.trace_add('write', lambda *_: self._apply_filter())
+        self._search_var.trace_add('write', lambda *_: self._debounced_filter())
         search = ctk.CTkEntry(fbar, textvariable=self._search_var,
-                              placeholder_text='Search artist or title…',
+                              placeholder_text='Search artist or title...',
                               height=30)
         search.grid(row=0, column=4, padx=(4, 12), pady=10, sticky='ew')
         fbar.grid_columnconfigure(4, weight=2, minsize=200)
@@ -623,36 +962,40 @@ class App(ctk.CTk):
             command=self._clear_all, **_fbtn)
         self._clr_btn.grid(row=0, column=1, padx=4, pady=15)
 
-        self._quality_var = tk.StringVar(value='720p')
+        q = self._settings.get('quality', '720p')
+        self._quality_var = tk.StringVar(value=q if q in ('720p', '1080p') else '720p')
         ctk.CTkOptionMenu(
             foot, variable=self._quality_var,
             values=['720p', '1080p'], width=88, height=34,
+            command=lambda *_: self._persist_setting('quality', self._quality_var.get()),
             font=_font).grid(row=0, column=2, padx=4, pady=15)
 
         self._start_btn = ctk.CTkButton(
-            foot, text='▶  Start', width=135, font=_font_bold,
+            foot, text='▶  Search & Download', width=175, font=_font_bold,
             command=self._start_download, **_fbtn)
         self._start_btn.grid(row=0, column=3, padx=4, pady=15)
 
         self._resync_btn = ctk.CTkButton(
-            foot, text='↺  Re-sync', width=115, font=_font,
+            foot, text='↺  Auto-sync', width=120, font=_font,
             fg_color='#313244', hover_color='#414160', text_color=_TEXT,
             command=self._start_resync, **_fbtn)
         self._resync_btn.grid(row=0, column=4, padx=4, pady=15)
-
-        self._sync_btn = ctk.CTkButton(
-            foot, text='↔  Sync', width=90, font=_font,
-            fg_color='transparent', border_width=1,
-            border_color=_BORDER, hover_color='#2a2a42',
-            text_color=_MAUVE,
-            state='disabled', command=self._sync_selected, **_fbtn)
-        self._sync_btn.grid(row=0, column=5, padx=4, pady=15)
 
         self._stop_btn = ctk.CTkButton(
             foot, text='■  Stop', width=90, font=_font,
             fg_color='#4a1a2a', hover_color='#6a2a3e', text_color=_RED,
             state='disabled', command=self._stop, **_fbtn)
-        self._stop_btn.grid(row=0, column=6, padx=4, pady=15)
+        self._stop_btn.grid(row=0, column=5, padx=4, pady=15)
+
+        # Opt-in/out of contributing confirmed matches back to the community pool.
+        self._share_var = tk.BooleanVar(
+            value=self._settings.get('share_matches', True))
+        share_cb = ctk.CTkCheckBox(
+            foot, text='Share matches', variable=self._share_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18,
+            command=self._on_share_toggle)
+        share_cb.grid(row=0, column=6, padx=(12, 4), pady=15)
 
         # Progress + status (right side of footer)
         prog_frame = ctk.CTkFrame(foot, fg_color='transparent')
@@ -670,6 +1013,15 @@ class App(ctk.CTk):
         self._status_lbl.pack()
 
         self._update_buttons()
+
+    def _persist_setting(self, key, value):
+        self._settings[key] = value
+        _save_settings(self._settings)
+
+    def _on_share_toggle(self):
+        on = bool(self._share_var.get())
+        resolver_client.set_sharing(on)
+        self._persist_setting('share_matches', on)
 
     def _startup(self):
         saved = _load_songs_path()
@@ -695,7 +1047,7 @@ class App(ctk.CTk):
             cur_ver   = _vd.__version__
             ytdlp_ver = getattr(_vd.yt_dlp.version, '__version__', '0')
 
-            resolver_client.ping(sharing=resolver_client.enabled(),
+            resolver_client.ping(sharing=resolver_client.sharing_enabled(),
                                  app_version=cur_ver)
 
             info = updater.check_app_update(cur_ver)
@@ -709,12 +1061,33 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+    def _offer_update(self, latest, asset, sha):
+        if messagebox.askyesno(
+                'Update available',
+                f'v{latest} is available. Install now?\n\n'
+                'The app will restart automatically.'):
+            self._do_app_update(asset, sha)
+
+    def _flush_pending_update(self):
+        """Show a deferred update prompt once a run has finished."""
+        if self._pending_update and not self._running:
+            latest, asset, sha = self._pending_update
+            self._pending_update = None
+            self._offer_update(latest, asset, sha)
+
     def _do_app_update(self, asset, sha):
-        """Called on the main thread after user confirms. Runs download on a thread."""
+        """Called on the main thread after user confirms. Shows a progress
+        window and runs the download/install on a background thread."""
+        dlg = UpdateDialog(self)
+
+        def on_status(stage, **info):
+            # runs on the worker thread, bounce it back onto the UI thread
+            self.after(0, lambda: dlg.update_stage(stage, **info))
+
         def _worker():
-            ok = updater.apply_app_update(asset, sha)
+            ok = updater.apply_app_update(asset, sha, status_cb=on_status)
             if ok:
-                self.after(0, self.destroy)
+                self.after(600, self.destroy)   # let "Restarting..." show briefly
         threading.Thread(target=_worker, daemon=True).start()
 
     def _pick_folder(self, first_run=False):
@@ -743,54 +1116,56 @@ class App(ctk.CTk):
 
     def _load_library(self, path):
         self._songs_folder = path
-        display = path if len(path) < 58 else '…' + path[-55:]
+        display = path if len(path) < 58 else '...' + path[-55:]
         self._folder_lbl.configure(text=f'Songs:  {display}')
-        self._status_lbl.configure(text='Scanning library…')
-        self.update_idletasks()
+        self._status_lbl.configure(text='Scanning your library...')
 
-        self._songs = _scan_library(path)
+        # Make sure the queue is being polled before the scan thread posts to it.
+        if not self._polling:
+            self._polling = True
+            self.after(200, self._poll_queue)
+
+        # Scan off the UI thread so the window stays responsive on big libraries.
+        def _worker():
+            songs = _scan_library(
+                path, progress=lambda c: self._queue.put(('scan_progress', c)))
+            self._queue.put(('library_scanned', songs))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_library_scanned(self, songs):
+        self._songs = songs
         self._apply_filter()
-        n = len(self._songs)
-        unprobed = [s for s in self._songs if s.has_video and s.res == '…']
-
+        n = len(songs)
+        unprobed = [s for s in songs if s.has_video and s.res == '...']
         if unprobed and ffmpegAvailable:
             self._status_lbl.configure(
-                text=f'{n} songs found — reading resolutions…')
+                text=f'{n} songs found, reading resolutions...')
             threading.Thread(target=self._probe_resolutions,
                              args=(unprobed, n), daemon=True).start()
         else:
             self._status_lbl.configure(
                 text=f'{n} song{"s" if n != 1 else ""} found')
-
         self._update_buttons()
-        if not self._polling:
-            self._polling = True
-            self.after(200, self._poll_queue)
 
     def _probe_resolutions(self, songs, total_songs):
-        """Background thread: probe and store resolution for unprobed videos."""
-        for i, s in enumerate(songs):
-            if self._stop_evt.is_set():
-                break
-            video = os.path.join(s.folder, 'video.mp4')
-            try:
-                r = subprocess.run(
-                    ['ffmpeg', '-hide_banner', '-i', video],
-                    capture_output=True, text=True, timeout=10,
-                    creationflags=NO_WINDOW)
-                video_line = next((l for l in r.stderr.splitlines() if 'Video:' in l), '')
-                m = re.search(r'(\d{3,4})x(\d{3,4})', video_line or r.stderr)
-                if m:
-                    s.res = f'{int(m.group(2))}p'
-                    set_ini_values(s.folder, {'backstagehero_res': s.res})
-                else:
+        """Background thread: probe resolutions for unprobed videos, a few in
+        parallel (ffmpeg is the bottleneck, so this is ~Nx faster on first scan)."""
+        done = 0
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(probe_resolution, s.folder): s for s in songs}
+            for fut in as_completed(futures):
+                if self._stop_evt.is_set():
+                    break
+                s = futures[fut]
+                try:
+                    s.res = fut.result() or '?'
+                except Exception:
                     s.res = '?'
-            except Exception:
-                s.res = '?'
-            remaining = len(songs) - i - 1
-            self._queue.put(('res_update', s,
-                             f'{total_songs} songs found — reading resolutions ({remaining} left)…'
-                             if remaining else f'{total_songs} songs found'))
+                done += 1
+                remaining = len(songs) - done
+                self._queue.put(('res_update', s,
+                                 f'{total_songs} songs found, reading resolutions ({remaining} left)...'
+                                 if remaining else f'{total_songs} songs found'))
 
     def _set_filter(self, mode):
         self._filter_mode = mode
@@ -804,7 +1179,18 @@ class App(ctk.CTk):
         self._btn_all.configure(    **(_active if mode == 'all'     else _inactive))
         self._apply_filter()
 
+    def _debounced_filter(self):
+        """Coalesce rapid keystrokes so a big library isn't re-filtered on every
+        character."""
+        if self._search_after is not None:
+            try:
+                self.after_cancel(self._search_after)
+            except Exception:
+                pass
+        self._search_after = self.after(180, self._apply_filter)
+
     def _apply_filter(self):
+        self._search_after = None
         term = self._search_var.get().lower()
         mode = self._filter_mode
         out  = []
@@ -840,9 +1226,10 @@ class App(ctk.CTk):
     def _refresh_tree(self):
         self._tree.delete(*self._tree.get_children())
         self._iid_map.clear()
+        self._iid_of.clear()
         for i, s in enumerate(self._filtered):
             chk         = '  ☑' if s.checked else '  ☐'
-            res_disp    = s.res or '—'
+            res_disp    = s.res or '-'
             status_text = s.status
             if not status_text:
                 status_text = '✔' if s.has_video else '✗'
@@ -853,24 +1240,25 @@ class App(ctk.CTk):
                                     values=(chk, s.label, res_disp, status_text),
                                     tags=tags)
             self._iid_map[iid] = s
+            self._iid_of[id(s)] = iid
         self._update_buttons()
 
     def _update_row(self, s: Song):
-        """Refresh the single visible row that corresponds to Song s."""
-        for iid, song in self._iid_map.items():
-            if song is s:
-                chk         = '  ☑' if s.checked else '  ☐'
-                res_disp    = s.res or '—'
-                status_text = s.status or ('✔' if s.has_video else '✗')
-                stag        = s.stag or ('dim' if s.has_video else 'error')
-                existing    = list(self._tree.item(iid, 'tags'))
-                row_tag     = next((t for t in existing
-                                    if t in ('row_even', 'row_odd')), 'row_odd')
-                tags = (row_tag,) + ((stag,) if stag else ())
-                self._tree.item(iid,
-                                values=(chk, s.label, res_disp, status_text),
-                                tags=tags)
-                return
+        """Refresh the single visible row for Song s (O(1) lookup)."""
+        iid = self._iid_of.get(id(s))
+        if not iid:
+            return   # not currently visible under the active filter
+        chk         = '  ☑' if s.checked else '  ☐'
+        res_disp    = s.res or '-'
+        status_text = s.status or ('✔' if s.has_video else '✗')
+        stag        = s.stag or ('dim' if s.has_video else 'error')
+        existing    = list(self._tree.item(iid, 'tags'))
+        row_tag     = next((t for t in existing
+                            if t in ('row_even', 'row_odd')), 'row_odd')
+        tags = (row_tag,) + ((stag,) if stag else ())
+        self._tree.item(iid,
+                        values=(chk, s.label, res_disp, status_text),
+                        tags=tags)
 
     def _on_tree_click(self, event):
         region = self._tree.identify_region(event.x, event.y)
@@ -892,7 +1280,7 @@ class App(ctk.CTk):
         self._refresh_tree()
 
     def _select_all_visible(self):
-        """Select All / Deselect All button — applies to the current filter view."""
+        """Select/Deselect all, just the songs in the current filter view."""
         all_on = bool(self._filtered) and all(s.checked for s in self._filtered)
         for s in self._filtered:
             s.checked = not all_on
@@ -919,16 +1307,11 @@ class App(ctk.CTk):
                              command=lambda: self._open_sync_editor(s))
             menu.add_separator()
         menu.add_command(label='Open folder',
-                         command=lambda: os.startfile(s.folder))
+                         command=lambda: _open_in_file_manager(s.folder))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
-
-    def _sync_selected(self):
-        targets = [s for s in self._songs if s.checked and s.has_video]
-        if len(targets) == 1:
-            self._open_sync_editor(targets[0])
 
     def _open_sync_editor(self, song: Song):
         def on_save(ms: int, share: bool):
@@ -957,16 +1340,11 @@ class App(ctk.CTk):
         can_start  = n > 0 and not self._running
         can_resync = len(has_vid) > 0 and not self._running and self._sync_ready
 
-        sync_targets = [s for s in self._songs if s.checked and s.has_video]
-        can_sync = len(sync_targets) == 1 and not self._running
-
         self._start_btn.configure(
-            text=f'▶  Start ({n})' if n else '▶  Start',
+            text=f'▶  Search & Download ({n})' if n else '▶  Search & Download',
             state='normal' if can_start else 'disabled')
         self._resync_btn.configure(
             state='normal' if can_resync else 'disabled')
-        self._sync_btn.configure(
-            state='normal' if can_sync else 'disabled')
         self._stop_btn.configure(
             state='normal' if self._running else 'disabled')
 
@@ -974,19 +1352,68 @@ class App(ctk.CTk):
         self._sel_btn.configure(
             text='Deselect all' if all_vis_on else 'Select all')
 
+    _BIG_BATCH = 25   # confirm before kicking off a run this large
+
     def _start_download(self):
-        self._run(resync=False)
+        if self._running:
+            return
+        checked = [s for s in self._songs if s.checked]
+        if not checked:
+            return
+        missing  = [s for s in checked if not s.has_video]
+        existing = [s for s in checked if s.has_video]
+
+        if missing:
+            # usual case: just fill the gaps, leave the done ones alone
+            work, replace = missing, False
+            if existing:
+                for s in existing:
+                    s.status = '✔  Has video'
+                    s.stag   = 'dim'
+                    self._update_row(s)
+                self._status_lbl.configure(
+                    text=f'{len(existing)} already have video, skipping; '
+                         f'downloading {len(missing)} missing')
+        else:
+            # they only picked songs that already have a video, so Start would do
+            # nothing. probably means they want them re-fetched, so ask first.
+            ne = len(existing)
+            if not messagebox.askyesno(
+                    'Re-download videos?',
+                    f'All {ne} selected song{"s" if ne != 1 else ""} already '
+                    f'have a video.\n\nRe-download from YouTube and replace them?'):
+                self._status_lbl.configure(
+                    text='Nothing to download, selection already has videos')
+                return
+            work, replace = existing, True
+
+        if not self._confirm_batch(work, 'download'):
+            return
+        self._launch(work, replace=replace, resync=False)
 
     def _start_resync(self):
-        self._run(resync=True)
-
-    def _run(self, resync):
-        targets = [s for s in self._songs if s.checked]
-        if resync:
-            targets = [s for s in targets if s.has_video]
-        if not targets:
+        if self._running:
             return
+        work = [s for s in self._songs if s.checked and s.has_video]
+        if not work:
+            return
+        if not self._confirm_batch(work, 'auto-sync'):
+            return
+        self._launch(work, replace=False, resync=True)
 
+    def _confirm_batch(self, work, verb):
+        """Guard against an accidental huge run. Returns False to abort."""
+        if len(work) <= self._BIG_BATCH:
+            return True
+        return messagebox.askyesno(
+            'Large batch',
+            f'About to {verb} {len(work)} songs. This can take a while'
+            + (' and use a lot of bandwidth and disk space' if verb == 'download' else '')
+            + '.\n\nContinue?')
+
+    def _launch(self, targets, replace, resync):
+        if self._running or not targets:
+            return
         quality = quality_format(1080 if self._quality_var.get() == '1080p' else 720)
 
         self._running = True
@@ -1001,31 +1428,65 @@ class App(ctk.CTk):
 
         threading.Thread(
             target=self._dl_thread,
-            args=(targets, quality, resync),
+            args=(targets, quality, replace, resync),
             daemon=True).start()
 
-    def _dl_thread(self, targets, quality, resync):
+    def _dl_thread(self, targets, quality, replace, resync):
         total = len(targets)
+        done = skipped = errors = 0
+        # adaptive pacing: pause between songs that hit YouTube, scaled by how
+        # the run is going. clean streaks creep the delay down, getting throttled
+        # doubles it. skipped songs make no requests at all so they get no pause,
+        # which is what makes re-runs over a mostly-done library fast.
+        pace = 1.0
+        clean_streak = 0
+        prev_hit_network = False
         for i, s in enumerate(targets):
             if self._stop_evt.is_set():
-                self._queue.put(('stopped', i, total))
+                self._queue.put(('stopped', i, total, done, skipped, errors))
+                return
+
+            if prev_hit_network and self._stop_evt.wait(
+                    random.uniform(SONG_DELAY_MIN, SONG_DELAY_MAX) * pace):
+                self._queue.put(('stopped', i, total, done, skipped, errors))
                 return
 
             self._queue.put(('song_start', s, i, total))
             errored = []
+            events  = []
             result  = run_song_with_backoff(
                 s.folder, s.label, quality,
                 self._sync_ready,
-                replace=True, resync=resync,
-                errored=errored)
+                replace=replace, resync=resync,
+                errored=errored, stop_evt=self._stop_evt, events=events)
+
+            prev_hit_network = result != 'skipped'
+            if events:
+                # got pushed back this song, slow right down for a while
+                pace = min(pace * 2.0, 6.0)
+                clean_streak = 0
+            elif prev_hit_network:
+                clean_streak += 1
+                if clean_streak >= 8:
+                    # going fine, ease off the brake a notch
+                    pace = max(pace * 0.7, 0.5)
+                    clean_streak = 0
 
             if result == 'stop':
                 self._queue.put(('rate_limited', s, i, total))
                 return
+            if result == 'stopped':
+                self._queue.put(('stopped', i, total, done, skipped, errors))
+                return
 
-            if errored:
-                self._queue.put(('song_error', s, i, total))
+            if result == 'skipped':
+                skipped += 1
+                self._queue.put(('song_skipped', s, i, total))
+            elif errored:
+                errors += 1
+                self._queue.put(('song_error', s, i, total, errored[-1]))
             else:
+                done += 1
                 # process_download already probed and stored the resolution in song.ini
                 if not resync:
                     stored = get_stored_resolution(s.folder)
@@ -1033,11 +1494,23 @@ class App(ctk.CTk):
                         s.res = stored
                 self._queue.put(('song_done', s, i, total))
 
-        self._queue.put(('finished', total))
+        self._queue.put(('finished', total, done, skipped, errors))
+
+    @staticmethod
+    def _run_summary(done, skipped, errors):
+        parts = []
+        if done:    parts.append(f'{done} downloaded')
+        if skipped: parts.append(f'{skipped} already had video')
+        if errors:  parts.append(f'{errors} failed (details in log)')
+        return ', '.join(parts) if parts else 'nothing to do'
 
     def _stop(self):
+        if not self._running:
+            return
         self._stop_evt.set()
-        self._status_lbl.configure(text='Stopping after current song…')
+        # Reflect the press immediately so an impatient user isn't left guessing.
+        self._stop_btn.configure(state='disabled')
+        self._status_lbl.configure(text='Stopping after current song...')
 
     def _poll_queue(self):
         try:
@@ -1052,7 +1525,7 @@ class App(ctk.CTk):
 
         if kind == 'song_start':
             _, s, i, total = msg
-            s.status = '⟳  Downloading…'
+            s.status = '⟳  Downloading...'
             s.stag   = 'busy'
             self._update_row(s)
             self._progress.set(i / total)
@@ -1067,9 +1540,20 @@ class App(ctk.CTk):
             self._update_row(s)
             self._progress.set((i + 1) / total)
 
-        elif kind == 'song_error':
+        elif kind == 'song_skipped':
             _, s, i, total = msg
-            s.status = '✗  Error'
+            s.status    = '✔  Already had video'
+            s.stag      = 'dim'
+            s.has_video = True
+            self._update_row(s)
+            self._progress.set((i + 1) / total)
+
+        elif kind == 'song_error':
+            _, s, i, total, detail = msg
+            short = (detail or '').strip().splitlines()[0] if detail else ''
+            if len(short) > 40:
+                short = short[:38] + '...'
+            s.status = f'✗  {short}' if short else '✗  Error'
             s.stag   = 'error'
             self._update_row(s)
             self._progress.set((i + 1) / total)
@@ -1081,28 +1565,33 @@ class App(ctk.CTk):
             self._update_row(s)
             self._running = False
             self._update_buttons()
-            self._status_lbl.configure(text='Rate limited — wait and try again')
+            self._status_lbl.configure(text='Rate limited, wait and try again')
             messagebox.showwarning(
                 'YouTube rate limit',
                 'YouTube is asking to confirm you\'re not a bot.\n\n'
                 'Your IP is being rate-limited. Wait a little while and '
-                'try again — everything already downloaded is safe.')
+                'try again. Everything already downloaded is safe.')
+            self._flush_pending_update()
 
         elif kind == 'stopped':
+            _, i, total, done, skipped, errors = msg
             self._running = False
             self._update_buttons()
-            self._status_lbl.configure(text='Stopped')
+            self._status_lbl.configure(
+                text='Stopped. ' + self._run_summary(done, skipped, errors))
+            self._apply_filter()
+            self._flush_pending_update()
 
         elif kind == 'finished':
-            total = msg[1]
+            _, total, done, skipped, errors = msg
             self._running = False
             self._progress.set(1.0)
-            n = total
             self._status_lbl.configure(
-                text=f'Done — {n} song{"s" if n != 1 else ""} processed')
+                text='Done. ' + self._run_summary(done, skipped, errors))
             self._update_buttons()
             # Re-apply filter so has_video status reflects new downloads
             self._apply_filter()
+            self._flush_pending_update()
 
         elif kind == 'res_update':
             _, s, status_text = msg
@@ -1112,16 +1601,23 @@ class App(ctk.CTk):
 
         elif kind == 'app_update_available':
             _, latest, asset, sha = msg
-            if messagebox.askyesno(
-                    'Update available',
-                    f'v{latest} is available. Install now?\n\n'
-                    'The app will restart automatically.'):
-                self._do_app_update(asset, sha)
+            # don't restart in the middle of a run, wait until it's idle
+            if self._running:
+                self._pending_update = (latest, asset, sha)
+            else:
+                self._offer_update(latest, asset, sha)
+
+        elif kind == 'scan_progress':
+            self._status_lbl.configure(
+                text=f'Scanning your library... {msg[1]} songs')
+
+        elif kind == 'library_scanned':
+            self._on_library_scanned(msg[1])
 
         elif kind == 'ytdlp_updated':
             _, ver = msg
             self._status_lbl.configure(
-                text=f'Downloader updated ({ver}) — active next launch')
+                text=f'Downloader updated ({ver}), active next launch')
 
     def destroy(self):
         self._stop_evt.set()
@@ -1138,9 +1634,15 @@ def run():
     except Exception:
         pass
 
-    updater._cleanup_old_exe()   # fast, no network — always safe at startup
+    updater._cleanup_old_exe()   # fast, no network, fine to call at startup
 
     app = App()
+    app.update()                 # draw the window before dropping the splash
+    try:
+        import pyi_splash        # hand off from the bootloader splash to the window
+        pyi_splash.close()
+    except Exception:
+        pass
     app.mainloop()
 
 

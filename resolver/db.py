@@ -2,12 +2,15 @@
 # A mapping goes from 'pending' to 'approved' once QUORUM different clients report
 # the same chart->video pairing. Maintainer can override from the dashboard.
 
+import hashlib
 import os
 import sqlite3
 import statistics
 import time
 
-# Distinct clients that must agree on a (chart, video) before it auto-approves.
+# how many different sources have to agree on a (chart, video) before it goes
+# live. a "source" is a hashed reporter IP, not the client_id the app makes up,
+# so one person can't fake a quorum by generating a pile of UUIDs.
 QUORUM = 3
 
 _SCHEMA = """
@@ -15,6 +18,7 @@ CREATE TABLE IF NOT EXISTS votes (
     chart_hash TEXT NOT NULL,
     video_id   TEXT NOT NULL,
     client_id  TEXT NOT NULL,
+    ip_hash    TEXT NOT NULL DEFAULT '',
     start_ms   INTEGER NOT NULL,
     confidence REAL,
     ts         INTEGER NOT NULL,
@@ -65,17 +69,32 @@ def init_db(path):
     conn = connect(path)
     try:
         conn.executescript(_SCHEMA)
+        # Migrate older DBs that predate the ip_hash column.
+        cols = [r['name'] for r in conn.execute('PRAGMA table_info(votes)')]
+        if 'ip_hash' not in cols:
+            conn.execute("ALTER TABLE votes ADD COLUMN ip_hash TEXT NOT NULL DEFAULT ''")
         conn.commit()
     finally:
         conn.close()
 
 
+def _ip_hash(ip, client_id):
+    """Key for one vote source. Hash the IP so we never store the raw address.
+    No IP (e.g. behind something that strips it), fall back to the client_id so
+    it just counts per-client like it used to instead of all collapsing to one."""
+    if ip:
+        return 'ip:' + hashlib.sha256(ip.encode('utf-8')).hexdigest()[:16]
+    return 'cid:' + (client_id or '')
+
+
 def _refresh_mapping(conn, chart_hash, video_id, now):
     """Recompute one mapping's aggregates and (unless locked) its status."""
     rows = conn.execute(
-        'SELECT start_ms FROM votes WHERE chart_hash=? AND video_id=?',
+        'SELECT start_ms, ip_hash FROM votes WHERE chart_hash=? AND video_id=?',
         (chart_hash, video_id)).fetchall()
-    votes = len(rows)
+    # Quorum counts distinct sources (hashed IPs), not raw rows, so several
+    # client UUIDs from one machine count once.
+    votes = len({r['ip_hash'] for r in rows})
     median_ms = int(statistics.median([r['start_ms'] for r in rows])) if rows else None
 
     existing = conn.execute(
@@ -112,16 +131,18 @@ def _refresh_mapping(conn, chart_hash, video_id, now):
 
 
 def record_vote(conn, chart_hash, video_id, start_ms, client_id, confidence,
-                artist='', title=''):
+                artist='', title='', ip=''):
     """Record one client's vote and recompute consensus. Returns the mapping's
     status afterwards ('approved' | 'pending' | 'rejected')."""
     now = int(time.time())
+    iph = _ip_hash(ip, client_id)
     conn.execute(
-        """INSERT INTO votes (chart_hash, video_id, client_id, start_ms, confidence, ts)
-           VALUES (?,?,?,?,?,?)
+        """INSERT INTO votes (chart_hash, video_id, client_id, ip_hash, start_ms, confidence, ts)
+           VALUES (?,?,?,?,?,?,?)
            ON CONFLICT(chart_hash, video_id, client_id) DO UPDATE SET
-             start_ms=excluded.start_ms, confidence=excluded.confidence, ts=excluded.ts""",
-        (chart_hash, video_id, client_id, int(start_ms), float(confidence), now))
+             ip_hash=excluded.ip_hash, start_ms=excluded.start_ms,
+             confidence=excluded.confidence, ts=excluded.ts""",
+        (chart_hash, video_id, client_id, iph, int(start_ms), float(confidence), now))
 
     conn.execute(
         """INSERT INTO charts (chart_hash, artist, title, last_seen) VALUES (?,?,?,?)

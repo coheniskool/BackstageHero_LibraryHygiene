@@ -1,5 +1,7 @@
 import configparser
 import glob
+import logging
+import logging.handlers
 import os
 import random
 import re
@@ -12,12 +14,39 @@ import time
 import updater
 updater.prefer_cached_ytdlp()
 
+
+def _setup_logging():
+    """Rotating log file in the data dir. The packaged exe is --noconsole so
+    print() goes nowhere; this is the only way to see what broke. From source it
+    also prints to the console."""
+    lg = logging.getLogger('backstagehero')
+    if lg.handlers:
+        return lg
+    lg.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S')
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            os.path.join(updater.data_dir(), 'log.txt'),
+            maxBytes=512 * 1024, backupCount=2, encoding='utf-8')
+        fh.setFormatter(fmt)
+        lg.addHandler(fh)
+    except Exception:
+        pass
+    if not getattr(sys, 'frozen', False):
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        lg.addHandler(sh)
+    return lg
+
+
+log = _setup_logging()
+
 import yt_dlp
 from tqdm import tqdm
 
 import resolver_client
 
-__version__ = '2.0.4'
+__version__ = '2.1.0'
 
 try:
     import audiosync
@@ -250,7 +279,8 @@ def _base_opts():
 
 
 def search_candidates(query, n=SEARCH_RESULTS):
-    """Return a list of (url, title) for the top results, most-relevant first."""
+    """Top results as (url, title, duration_seconds) tuples, most-relevant first.
+    Duration comes free with the flat search and may be None."""
     opts = _base_opts()
     opts['extract_flat'] = True
     try:
@@ -265,17 +295,22 @@ def search_candidates(query, n=SEARCH_RESULTS):
     for entry in entries:
         if entry and entry.get('id'):
             url = f"https://www.youtube.com/watch?v={entry['id']}"
-            candidates.append((url, entry.get('title', 'Unknown')))
+            candidates.append((url, entry.get('title', 'Unknown'),
+                               entry.get('duration')))
     if not candidates:
         raise Exception('No search results found for: ' + query)
     return candidates
 
 
 def fetch_audio(folder, url):
-    """Download audio-only for fingerprinting. Returns the file path, or None on failure."""
+    """Download audio-only for fingerprinting. Returns the file path, or None on failure.
+
+    Grabs a low-bitrate stream on purpose: the fingerprinter analyses at 8 kHz
+    mono, so a ~50-70kbps opus carries everything it can use at a fraction of
+    the bytes (and requests) of bestaudio. Quality floor first, then whatever."""
     cleanup_temp_files(folder)
     opts = _base_opts()
-    opts.update({'format': 'bestaudio/best',
+    opts.update({'format': 'bestaudio[abr<=80]/worstaudio/bestaudio/best',
                  'outtmpl': os.path.join(folder, 'video.sync.%(ext)s')})
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -286,6 +321,29 @@ def fetch_audio(folder, url):
         return None
     matches = glob.glob(os.path.join(folder, 'video.sync.*'))
     return matches[0] if matches else None
+
+
+def _chart_duration(folder):
+    """Length of the chart audio in seconds (longest stem), or None. One local
+    ffmpeg call, used to throw out search results that can't be the right song."""
+    if not ffmpegAvailable or audiosync is None:
+        return None
+    stems = audiosync.chart_stems(folder)
+    if not stems:
+        return None
+    # song.ogg is the safest bet for full length, otherwise the biggest file
+    pick = next((s for s in stems if os.path.basename(s).lower().startswith('song.')),
+                None) or max(stems, key=os.path.getsize)
+    try:
+        r = subprocess.run(['ffmpeg', '-hide_banner', '-i', pick],
+                           capture_output=True, text=True, timeout=10,
+                           creationflags=NO_WINDOW)
+        m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr)
+        if m:
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        pass
+    return None
 
 
 def download_video(folder, url, quality):
@@ -324,6 +382,7 @@ def download_video(folder, url, quality):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=NO_WINDOW, check=True)
     except Exception as e:
+        log.warning('Remux failed (%s); keeping raw download', e)
         print('  Could not remux (using raw download instead). Error: ' + str(e))
         if os.path.exists(tmp):
             try:
@@ -341,10 +400,32 @@ def select_video(folder, candidates, sync_ready):
     """Pick the right candidate. With sync available, fingerprints each one against
     the chart audio until we get a confident match. Returns (url, title, offset_ms, matched)."""
     if not sync_ready:
-        url, title = candidates[0]
+        url, title = candidates[0][0], candidates[0][1]
         return url, title, DEFAULT_START_TIME, False
 
-    for url, title in candidates[:GATE_CANDIDATES]:
+    # no stems in this folder = nothing to fingerprint against, so don't waste
+    # audio downloads finding that out the hard way
+    if audiosync is None or not audiosync.chart_stems(folder):
+        url, title = candidates[0][0], candidates[0][1]
+        return url, title, DEFAULT_START_TIME, False
+
+    # rank by plausible length before spending downloads. the song has to fit
+    # inside the video, plus some intro/outro, so a 30s short or a 20min live
+    # set can't be it. unknown durations aren't punished. doesn't exclude
+    # anything outright, just tries the believable ones first.
+    chart_dur = _chart_duration(folder)
+    if chart_dur:
+        def rank(item):
+            i, (_, _, dur) = item
+            if dur is None:
+                return (0, i)
+            plausible = (chart_dur - 25) <= dur <= (chart_dur + 150)
+            return (0 if plausible else 1, i)
+        ordered = [c for _, c in sorted(enumerate(candidates), key=rank)]
+    else:
+        ordered = list(candidates)
+
+    for url, title, _ in ordered[:GATE_CANDIDATES]:
         audio = fetch_audio(folder, url)
         try:
             if not audio:
@@ -362,14 +443,14 @@ def select_video(folder, candidates, sync_ready):
             return url, title, ms, True
 
     # nothing matched - use top result with default offset
-    url, title = candidates[0]
+    url, title = candidates[0][0], candidates[0][1]
     print('  No confident match - using top result with default offset')
     return url, title, DEFAULT_START_TIME, False
 
 
 def download_with_fallback(folder, primary_url, candidates, quality):
     """Try the primary URL, fall back through other candidates if it fails."""
-    urls = [primary_url] + [u for u, _ in candidates if u != primary_url]
+    urls = [primary_url] + [c[0] for c in candidates if c[0] != primary_url]
     last_err = None
     for url in urls:
         try:
@@ -379,12 +460,19 @@ def download_with_fallback(folder, primary_url, candidates, quality):
             raise
         except Exception as e:
             last_err = e
+            log.warning('Download failed for %s (%s); trying next result', url, e)
             print('  Download failed (' + str(e) + '); trying next result')
             cleanup_temp_files(folder)
     raise last_err if last_err else Exception('No downloadable candidate')
 
 
 def process_download(folder, song_name, quality, sync_ready, replace):
+    # already got one? leave it alone unless we're told to replace. stops a
+    # re-run (or a batch with already-done songs) from hammering YouTube for
+    # nothing.
+    if not replace and os.path.exists(os.path.join(folder, 'video.mp4')):
+        return 'skipped'
+
     artist, title = read_metadata(folder)
     ch = resolver_client.chart_hash(folder) if resolver_client.enabled() else None
 
@@ -400,14 +488,16 @@ def process_download(folder, song_name, quality, sync_ready, replace):
                 return
             offset = hit.get('start_ms')
             offset = DEFAULT_START_TIME if offset is None else offset
-            if set_ini_values(folder, {'video_start_time': str(offset),
-                                       'backstagehero_source': hit['video_id']}):
-                _probe_and_store_resolution(folder)
-                print('  Song ready (community offset). Next song...')
+            if not set_ini_values(folder, {'video_start_time': str(offset),
+                                            'backstagehero_source': hit['video_id']}):
+                raise Exception('song.ini missing [song] section')
+            _probe_and_store_resolution(folder)
+            print('  Song ready (community offset). Next song...')
             return
         except BotDetected:
             raise
         except Exception as e:
+            log.warning('Community video failed for %s (%s); searching instead', song_name, e)
             print('  Community video could not be downloaded (' + str(e) + '); searching instead')
             cleanup_temp_files(folder)
 
@@ -425,6 +515,13 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     if is_converted(folder):
         print('  Phase Shift converter file detected - video kept, timing left as-is')
         return
+
+    # offset was measured against `url`. if a fallback candidate downloaded
+    # instead, that offset is for a different video, so drop it and don't report
+    # it (otherwise we feed the community a bogus match).
+    if matched and used_url != url:
+        log.info('Fallback used a different video for %s; dropping fingerprint offset', song_name)
+        offset, matched = DEFAULT_START_TIME, False
 
     vid = video_id_of(used_url)
     values = {'video_start_time': str(offset), 'backstagehero_source': vid}
@@ -450,7 +547,7 @@ def process_resync(folder, song_name, sync_ready):
 
     artist, title = read_metadata(folder)
 
-    source = _parse_song_ini_raw(folder)
+    source = get_stored_source(folder)
 
     if source:
         url = f'https://www.youtube.com/watch?v={source}'
@@ -477,13 +574,8 @@ def process_resync(folder, song_name, sync_ready):
         print('  No confident match - timing left unchanged')
 
 
-def get_stored_source(folder):
-    """Return the backstagehero_source video ID stored in song.ini, or None."""
-    return _parse_song_ini_raw(folder)
-
-
-def _parse_song_ini_raw(folder):
-    """Return the stored backstagehero_source video id, if any."""
+def _read_ini_value(folder, key):
+    """Return a single [song] value from song.ini (stripped), or None."""
     path = os.path.join(folder, 'song.ini')
     if not os.path.exists(path):
         return None
@@ -494,34 +586,29 @@ def _parse_song_ini_raw(folder):
         return None
     for sec in cp.sections():
         if sec.lower() == 'song':
-            val = cp.get(sec, 'backstagehero_source', fallback='').strip()
-            return val or None
+            return cp.get(sec, key, fallback='').strip() or None
     return None
+
+
+def get_stored_source(folder):
+    """The backstagehero_source video ID stored in song.ini, or None."""
+    return _read_ini_value(folder, 'backstagehero_source')
 
 
 def get_stored_resolution(folder):
-    """Return the stored backstagehero_res value (e.g. '720p'), or None."""
-    path = os.path.join(folder, 'song.ini')
-    if not os.path.exists(path):
-        return None
-    try:
-        cp = configparser.ConfigParser(strict=False, interpolation=None)
-        cp.read_string(_read_text(path))
-        for sec in cp.sections():
-            if sec.lower() == 'song':
-                return cp.get(sec, 'backstagehero_res', fallback='').strip() or None
-    except Exception:
-        pass
-    return None
+    """The stored backstagehero_res value (e.g. '720p'), or None."""
+    return _read_ini_value(folder, 'backstagehero_res')
 
 
-def _probe_and_store_resolution(folder):
-    """Read the resolution from video.mp4 and cache it in song.ini."""
+def probe_resolution(folder):
+    """Read video.mp4's height via ffmpeg, cache it in song.ini, and return it
+    (e.g. '720p'), '?' if it couldn't be read, or None if there's nothing to
+    probe. Shared by the download flow and the GUI's library scan."""
     if not ffmpegAvailable:
-        return
+        return None
     video = os.path.join(folder, 'video.mp4')
     if not os.path.exists(video):
-        return
+        return None
     try:
         r = subprocess.run(
             ['ffmpeg', '-hide_banner', '-i', video],
@@ -532,9 +619,16 @@ def _probe_and_store_resolution(folder):
         video_line = next((l for l in r.stderr.splitlines() if 'Video:' in l), '')
         m = re.search(r'(\d{3,4})x(\d{3,4})', video_line or r.stderr)
         if m:
-            set_ini_values(folder, {'backstagehero_res': f'{int(m.group(2))}p'})
+            res = f'{int(m.group(2))}p'
+            set_ini_values(folder, {'backstagehero_res': res})
+            return res
     except Exception:
-        pass
+        log.debug('Resolution probe failed for %s', folder, exc_info=True)
+    return '?'
+
+
+# Back-compat name used by the download flow (return value ignored there).
+_probe_and_store_resolution = probe_resolution
 
 
 def parse_selection(sel, maxn):
@@ -762,32 +856,48 @@ def main():
         input('All downloads complete. Checked a total of ' + str(total) + ' songs. Press Enter to exit.')
 
 
-def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resync, errored):
-    """Process one song, retrying with increasing waits if YouTube throttles us."""
+def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resync,
+                          errored, stop_evt=None, events=None):
+    """Process one song, retrying with longer waits each time YouTube throttles us.
+
+    Pass stop_evt (a threading.Event) and the backoff wait becomes cancellable,
+    so the GUI's Stop doesn't sit there for minutes. Returns 'stopped' then.
+    Pass a list as events and it gets 'throttled' appended whenever YouTube
+    pushes back, so the caller can pace itself accordingly."""
     for attempt in range(len(BOT_BACKOFF_SECONDS) + 1):
         try:
             if resync:
                 process_resync(folder, song_name, sync_ready)
             else:
-                process_download(folder, song_name, quality, sync_ready, replace)
+                if process_download(folder, song_name, quality, sync_ready,
+                                    replace) == 'skipped':
+                    return 'skipped'
             return 'ok'
         except KeyboardInterrupt:
             raise
         except BotDetected:
             cleanup_temp_files(folder)
+            if events is not None:
+                events.append('throttled')
             if attempt >= len(BOT_BACKOFF_SECONDS):
                 print('\nYouTube is still asking to "confirm you\'re not a bot" after several')
                 print('waits. Your IP is being rate-limited. Stopping now - wait a while and')
                 print('re-run; everything already downloaded is skipped automatically.')
+                log.warning('Rate-limited and gave up on %s', song_name)
                 return 'stop'
             wait = BOT_BACKOFF_SECONDS[attempt]
             print('\nYouTube rate-limit hit. Waiting ' + str(wait) + 's before retrying this song...')
-            time.sleep(wait)
+            # cancellable wait, so Stop doesn't leave you waiting minutes
+            if stop_evt is not None and stop_evt.wait(wait):
+                return 'stopped'
+            if stop_evt is None:
+                time.sleep(wait)
         except Exception as e:
+            log.exception('Error on song: %s', song_name)
             print('  ' + str(e))
             print('Error on song: ' + song_name + '. Skipping')
             cleanup_temp_files(folder)
-            errored.append(song_name)
+            errored.append(str(e) or song_name)
             return 'ok'
     return 'ok'
 
@@ -795,8 +905,13 @@ def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resyn
 if __name__ == '__main__':
     if getattr(sys, 'frozen', False):
         # frozen exe - launch the GUI
+        try:
+            import pyi_splash   # only there in the splash-enabled onefile build
+            pyi_splash.update_text('Loading interface...')
+        except Exception:
+            pass
         import gui
         gui.run()
     else:
-        # Running from source — terminal mode for developers.
+        # running from source, use the terminal version
         main()
