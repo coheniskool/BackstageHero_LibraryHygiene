@@ -16,9 +16,9 @@
 
 ![BackstageHero](assets/screenshot.png)
 
-Clone Hero plays a `video.mp4` from a song's folder as the background while you play. Getting one for every song by hand is a slog. This searches YouTube, downloads a match, and works out the timing so the song starts when the video's audio does.
+If a song folder has a `video.mp4` in it, Clone Hero plays it behind the chart. Doing that by hand across a whole library takes forever. This searches YouTube for the ones that are missing it, downloads a match, and lines the video up so it starts with the song.
 
-Point it at your Songs folder and it handles everything that's missing a video.
+Point it at your Songs folder and it fills in whatever doesn't have a video yet.
 
 ## Install
 
@@ -28,24 +28,23 @@ Songs that already have a video are skipped, so re-running after you add charts 
 
 ## New in v2
 
-- A GUI, instead of typing answers into a console. Lists your library, lets you search and filter by which songs have videos, and shows each one's resolution.
-- Automatic timing. It fingerprints the video's audio against the chart audio to find where the song starts, rather than putting the same fixed offset on everything.
-- A manual sync editor for the songs the fingerprinter can't place. Right-click a song, drag the offset, watch the preview update as you go.
-- Shared offsets. Tick the share box and your timing gets sent up; once a few people land on the same value for a chart it becomes the default, so the next person downloading it gets it right with no work.
-- One exe with ffmpeg bundled. v1 made you install ffmpeg separately.
-- Self-updating, and it keeps yt-dlp current too (yt-dlp needs updating often to keep working against YouTube).
+- proper GUI instead of the old console prompts. you can see the whole library, filter by what's missing a video, and check resolutions
+- it works out the timing itself now, by matching the video's audio against the chart audio instead of dropping the same offset on everything
+- manual offset editor for the ones it gets wrong. right click a song, drag the slider, the preview follows
+- optional sharing: turn it on and once a few people land on the same offset for a chart, that becomes the default for anyone else who downloads it
+- updates itself, and keeps yt-dlp updated too (it has to, YouTube breaks it every few weeks)
 
 ## How the timing works
 
-Every music video has a different amount of intro before the song kicks in, so a single fixed offset is never right for all of them. After it picks a video it pulls the audio and fingerprints it against the chart's stems to find where they line up. It matches on the pattern of peaks rather than the raw waveform, so a louder or differently-mastered YouTube rip still matches. Confident match, it writes the measured offset to `video_start_time`. Not confident (live version, remix, wrong song), it leaves the default rather than commit to a bad guess.
+Every music video has a different amount of intro before the song starts, so you can't use one offset for everything. Once it's picked a video it grabs the audio and matches it against the chart's stems to find where they line up. It compares the pattern of peaks rather than the raw audio, so a louder or differently mastered YouTube version still matches. If it's sure, it writes the offset into `video_start_time`. If it isn't (live version, remix, just the wrong video) it leaves the default and you fix that one by hand.
 
-Official videos sort themselves out this way. Community packs are the awkward ones: trimmed intros, custom audio, charts with no audio to match against. The manual editor is there for those, and anything you set can be shared the same way.
+Official music videos usually just work. The ones that need a manual pass are custom charts with edited intros, replaced audio, or no audio in the chart to match against at all. Whatever you set in the editor can be shared too.
 
 ## Why it still works
 
 Most YouTube downloaders use the web player API, which now wants bot-challenge tokens that rotate constantly. This goes through the TV embedded and Android client APIs instead, which don't need those tokens. It also keeps yt-dlp updated on its own, so when YouTube breaks something and yt-dlp patches it, the fix shows up within a day or so, no new release needed.
 
-Push a big library hard enough and YouTube can still rate-limit your IP. When that happens it backs off and retries on its own; if it does give up, you re-run later and it continues from where it stopped.
+On a big run YouTube will start throttling. It paces itself to stay under that and eases off automatically when it gets pushback, so most runs just ride it out. A hard IP block is on YouTube's end and waiting it out is the only fix there, but nothing gets lost or redone when you come back to it, since anything that already has a video is skipped.
 
 ## From source
 
