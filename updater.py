@@ -28,6 +28,8 @@ _UA = 'BackstageHero-Updater'
 _YTDLP_CHECK_INTERVAL = 20 * 3600  # ~daily
 _META_TIMEOUT = 5    # short timeout for metadata fetches so a bad connection doesn't hang
 _DL_TIMEOUT   = 120  # socket timeout for binary downloads (exe / wheel)
+_META_MAX     = 5 << 20    # metadata responses have no business being bigger than this
+_DL_MAX       = 500 << 20  # hard ceiling on any single download
 
 
 def _frozen():
@@ -56,7 +58,7 @@ def _get_json(url, timeout=_META_TIMEOUT):
     req = urllib.request.Request(url, headers={'User-Agent': _UA,
                                                'Accept': 'application/json'})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8', 'replace'))
+        return json.loads(resp.read(_META_MAX).decode('utf-8', 'replace'))
 
 
 def prefer_cached_ytdlp():
@@ -76,12 +78,14 @@ def prefer_cached_ytdlp():
 
 
 def _wheel_url_and_version():
-    """(download_url, version) for the latest yt-dlp wheel on PyPI, or None."""
+    """(download_url, version, sha256) for the latest yt-dlp wheel on PyPI, or None.
+    PyPI publishes the digest in the same response, so downloads get verified."""
     info = _get_json(_PYPI_YTDLP)
     version = info['info']['version']
     for entry in info.get('urls', []):
         if entry.get('packagetype') == 'bdist_wheel':
-            return entry['url'], version
+            sha = (entry.get('digests') or {}).get('sha256') or ''
+            return entry['url'], version, sha.lower()
     return None
 
 
@@ -118,14 +122,20 @@ def maybe_update_ytdlp(current_version):
         found = _wheel_url_and_version()
         if not found:
             return None
-        url, latest = found
+        url, latest, sha = found
         if _ver_tuple(latest) <= _ver_tuple(current_version):
+            return None
+        if not sha:
+            log.warning('PyPI gave no digest for the yt-dlp wheel; skipping update')
             return None
 
         work = tempfile.mkdtemp(prefix='bh_ytdlp_')
         try:
             wheel = os.path.join(work, 'ytdlp.whl')
             _download(url, wheel)
+            if _sha256_of(wheel) != sha:
+                log.warning('yt-dlp wheel failed its digest check; skipping update')
+                return None
             staging = os.path.join(work, 'extract')
             os.makedirs(staging)
             with zipfile.ZipFile(wheel) as zf:
@@ -158,6 +168,8 @@ def _download(url, dest, progress_cb=None):
                 break
             out.write(chunk)
             got += len(chunk)
+            if got > _DL_MAX:
+                raise IOError('download exceeded the size limit')
             if progress_cb:
                 progress_cb(got, total)
 
@@ -248,15 +260,22 @@ def _apply_app_update(asset_url, expected_sha, status_cb=None):
     work = tempfile.mkdtemp(prefix='bh_app_')
     new = os.path.join(work, EXE_ASSET_NAME)
     try:
+        # no checksum, no install. every release ships a .sha256 sidecar, so
+        # if it's missing the release page is broken or someone is messing
+        # with it - either way not something to run.
+        if not expected_sha:
+            emit('error', msg='No checksum published for this update.')
+            print('  Update has no checksum to verify against - keeping the current version.')
+            return False
+
         emit('download', got=0, total=0)
         _download(asset_url, new,
                   progress_cb=lambda got, total: emit('download', got=got, total=total))
-        if expected_sha:
-            emit('verify')
-            if _sha256_of(new) != expected_sha:
-                emit('error', msg='Downloaded file failed its integrity check.')
-                print('  Update checksum did not match - keeping the current version.')
-                return False
+        emit('verify')
+        if _sha256_of(new) != expected_sha:
+            emit('error', msg='Downloaded file failed its integrity check.')
+            print('  Update checksum did not match - keeping the current version.')
+            return False
 
         emit('install')
         old = cur + '.old'
@@ -300,8 +319,13 @@ def check_app_update(current_version):
         asset = _find_release_asset(release, EXE_ASSET_NAME)
         if not asset:
             return None
+        sha = _expected_sha256(release)
+        if not sha:
+            # nothing to verify the download against - don't even offer it
+            log.warning('Release %s has no checksum; not offering the update', tag)
+            return None
         latest = re.sub(r'^\D*', '', tag) or tag
-        return latest, asset, _expected_sha256(release)
+        return latest, asset, sha
     except Exception:
         log.warning('App update check failed', exc_info=True)
         return None

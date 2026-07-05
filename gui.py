@@ -23,7 +23,7 @@ from VideoDownload import (
     quality_format, get_stored_resolution, set_ini_values,
     ffmpegAvailable, ffplayPath, audiosync, __version__,
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
-    SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution,
+    SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution, scan_song,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
@@ -180,12 +180,11 @@ def _scan_library(songs_folder, progress=None):
             os.path.join(glob.escape(songs_folder), '**', 'song.ini'),
             recursive=True):
         folder = os.path.dirname(ini)
-        artist, title = read_metadata(folder)
+        artist, title, stored = scan_song(folder)
         label = build_query(artist, title) or os.path.basename(folder)
         has_vid = os.path.exists(os.path.join(folder, 'video.mp4'))
         res = '-'
         if has_vid:
-            stored = get_stored_resolution(folder)
             res = stored if stored else '...'   # '...' = needs probing
         songs.append(Song(
             filename=ini, folder=folder,

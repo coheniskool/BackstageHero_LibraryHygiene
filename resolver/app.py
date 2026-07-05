@@ -4,9 +4,11 @@
 # GET  /healthz        -> liveness
 # /admin/*             -> curator endpoints (Cloudflare Access + bearer token)
 
+import hmac
 import json
 import os
 import re
+import time
 import urllib.request
 import urllib.parse
 
@@ -93,8 +95,27 @@ def _require_admin(authorization: str = Header(default='')):
     check is skipped (Access alone guards it); if one is set it must match."""
     if not ADMIN_TOKEN:
         return
-    if authorization != f'Bearer {ADMIN_TOKEN}':
+    if not hmac.compare_digest(authorization, f'Bearer {ADMIN_TOKEN}'):
         raise HTTPException(status_code=401, detail='admin token required')
+
+
+# Per-IP daily cap on the write endpoints. Consensus already dedups by IP so
+# stuffing can't fake a quorum, but nothing stopped a script from growing the
+# votes table forever. A day of honest use is a few hundred reports at most.
+_WRITE_CAP = int(os.environ.get('BACKSTAGEHERO_DAILY_WRITE_CAP', '1000'))
+_write_counts = {'day': 0, 'ips': {}}
+
+
+def _check_write_cap(request):
+    day = int(time.time() // 86400)
+    if _write_counts['day'] != day:
+        _write_counts['day'] = day
+        _write_counts['ips'] = {}
+    ip = _client_ip(request)
+    count = _write_counts['ips'].get(ip, 0) + 1
+    _write_counts['ips'][ip] = count
+    if count > _WRITE_CAP:
+        raise HTTPException(status_code=429, detail='daily limit reached')
 
 
 @app.get('/healthz')
@@ -134,6 +155,7 @@ class PingIn(BaseModel):
 def ping(body: PingIn, request: Request, conn=Depends(_conn)):
     if not body.client_id:
         raise HTTPException(status_code=400, detail='client_id required')
+    _check_write_cap(request)
     db.record_ping(conn, body.client_id, body.sharing, body.app_version)
     return {'ok': True}
 
@@ -144,6 +166,7 @@ def report(body: ReportIn, request: Request, conn=Depends(_conn)):
         raise HTTPException(status_code=400, detail='client_id required')
     _require_hash(body.hash)
     _require_video_id(body.video_id)
+    _check_write_cap(request)
     status = db.record_vote(
         conn, body.hash, body.video_id, body.start_ms, body.client_id,
         max(0.0, min(1.0, body.confidence)), body.artist, body.title,

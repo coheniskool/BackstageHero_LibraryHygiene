@@ -174,9 +174,13 @@ subprocess.run(
         '--onefile',                      # single portable exe
         '--noconfirm',                    # overwrite previous build without asking
         '--noconsole',                    # GUI app - no terminal window
-        '--collect-all', 'yt_dlp',        # bundle all yt-dlp extractors (dynamic imports)
-        '--collect-all', 'customtkinter', # bundle customtkinter themes and assets
-        '--collect-all', 'numpy',         # required by audiosync for fingerprint sync
+        # collect-submodules gets yt-dlp's dynamically imported extractors
+        # without dragging in package data the way collect-all does. numpy
+        # needs nothing extra - PyInstaller's own hook handles its binaries,
+        # and collect-all was stuffing headers and test machinery into the exe
+        # that got unpacked on every launch.
+        '--collect-submodules', 'yt_dlp',
+        '--collect-all', 'customtkinter', # themes/assets are real runtime data
         '--hidden-import', 'gui',         # GUI module (conditional import)
         '--hidden-import', 'audiosync',   # fingerprint sync module
         '--hidden-import', 'mpv',         # python-mpv (loaded dynamically in gui)

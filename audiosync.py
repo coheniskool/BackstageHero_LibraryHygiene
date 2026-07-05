@@ -53,6 +53,17 @@ MIN_MATCHES = 40        # Votes in the winning offset bin.
 MIN_SCORE = 50.0        # Winning bin height relative to the average bin.
 MIN_CONC = 0.05         # Share of all votes that land on the winning offset.
 
+# A looped song section lines up equally well one loop apart, which makes the
+# offset a coin flip. If any bin away from the winner gets within this factor
+# of the winning bin, the alignment is ambiguous and we pass on it.
+AMBIGUITY_RATIO = 2.5
+
+# Different cuts of the same song (added intermission, extended edit) align
+# perfectly at the start and then jump. The early and late halves of the match
+# are checked separately; if they land more than this many bins apart the
+# video is a different edit and syncing the start would drift later on.
+DRIFT_BINS = 4          # ~200 ms
+
 # Reject offsets outside a plausible window for a music-video lead-in.
 MIN_LEAD_SECONDS = -30.0
 MAX_LEAD_SECONDS = 90.0
@@ -190,18 +201,20 @@ def _offset_seconds(ref_table, probe_table):
     in the vote histogram; everything else is spread thin. Returns
     (lead_seconds, votes, score, conc) or None when no spike clears the gates.
     """
-    deltas = []
+    tps, deltas = [], []
     for h, probe_times in probe_table.items():
         ref_times = ref_table.get(h)
         if not ref_times:
             continue
         for tp in probe_times:
             for tr in ref_times:
+                tps.append(tp)
                 deltas.append(tp - tr)   # audio time minus chart time = lead-in
 
     if len(deltas) < MIN_MATCHES:
         return None
 
+    tps = np.asarray(tps, dtype=np.int64)
     deltas = np.asarray(deltas, dtype=np.float64)
     bins = np.round(deltas / HIST_BIN).astype(np.int64)
     values, counts = np.unique(bins, return_counts=True)
@@ -218,11 +231,64 @@ def _offset_seconds(ref_table, probe_table):
     if votes < MIN_MATCHES or score < MIN_SCORE or conc < MIN_CONC:
         return None
 
+    # Second-spike check: if a rival offset away from the winner gets anywhere
+    # close, the song probably repeats itself and either offset is a guess.
+    rival_mask = np.abs(values - values[top]) > 1
+    if rival_mask.any():
+        rival = int(counts[rival_mask].max())
+        if rival * AMBIGUITY_RATIO > votes:
+            return None
+
+    # Drift check: judge the early and late halves of the matched span on
+    # their own. A same-cut video puts both halves on the winning offset; a
+    # different edit shows a second consistent offset later in the song, and
+    # a start-only sync would visibly drift there.
+    lo, hi = int(tps[near].min()), int(tps[near].max())
+    mid = (lo + hi) / 2
+    for half in (tps < mid, tps >= mid):
+        hbins = bins[half]
+        if hbins.size < MIN_MATCHES:
+            continue    # too little signal in this half to judge either way
+        hvals, hcounts = np.unique(hbins, return_counts=True)
+        hwin = int(hvals[hcounts.argmax()])
+        if int(hcounts.max()) >= MIN_MATCHES and abs(hwin - int(values[top])) > DRIFT_BINS:
+            return None
+
     # Refine using the exact deltas in and next to the winning bin.
     lead = float(deltas[near].mean()) * HOP / SAMPLE_RATE
     if not (MIN_LEAD_SECONDS <= lead <= MAX_LEAD_SECONDS):
         return None
     return lead, votes, score, conc
+
+
+# One-entry cache of the chart-side fingerprint table. select_video probes
+# several candidates against the same chart back to back and the stems don't
+# change between probes, so the chart only needs decoding and fingerprinting
+# once per song instead of once per candidate.
+_ref_cache = {'key': None, 'table': None}
+
+
+def _chart_table(folder, exclude):
+    """Fingerprint table for the chart stems, cached across candidate probes."""
+    stems = _chart_stems(folder, exclude=exclude)
+    if not stems:
+        return None, 'no chart audio found'
+    try:
+        key = (folder, tuple((s, os.path.getmtime(s), os.path.getsize(s))
+                             for s in stems))
+    except OSError:
+        key = None
+    if key is not None and _ref_cache['key'] == key:
+        return _ref_cache['table'], None
+    chart = _decode(stems, SAMPLE_RATE, ANALYZE_SECONDS)
+    if chart is None:
+        return None, 'could not decode audio'
+    table = _fingerprint(*_peaks(_spectrogram(chart)))
+    if not table:
+        return None, 'not enough audio detail'
+    if key is not None:
+        _ref_cache['key'], _ref_cache['table'] = key, table
+    return table, None
 
 
 def compute_offset_ms(folder, probe_audio):
@@ -231,36 +297,37 @@ def compute_offset_ms(folder, probe_audio):
     probe_audio is the audio of the chosen YouTube result (video.mp4 has no audio
     so it's fetched separately), aligned against the chart's stems.
 
-    Returns (milliseconds, info_string), or (None, reason) if sync isn't available
-    or the match can't be trusted. Sign matches what v1 used: audio starting L
-    seconds into the video gives video_start_time = -L*1000, so a 3s lead-in is
-    -3000.
+    Returns (milliseconds, info_string, confidence 0..1), or (None, reason, 0.0)
+    if sync isn't available or the match can't be trusted. Sign matches what v1
+    used: audio starting L seconds into the video gives video_start_time =
+    -L*1000, so a 3s lead-in is -3000.
     """
     if not _NUMPY:
-        return None, 'numpy not available'
+        return None, 'numpy not available', 0.0
 
     if not probe_audio or not os.path.exists(probe_audio):
-        return None, 'no audio to sync'
+        return None, 'no audio to sync', 0.0
 
-    stems = _chart_stems(folder, exclude=probe_audio)
-    if not stems:
-        return None, 'no chart audio found'
+    ref_table, err = _chart_table(folder, probe_audio)
+    if ref_table is None:
+        return None, err, 0.0
 
-    chart = _decode(stems, SAMPLE_RATE, ANALYZE_SECONDS)
     probe = _decode([probe_audio], SAMPLE_RATE, ANALYZE_SECONDS)
-    if chart is None or probe is None:
-        return None, 'could not decode audio'
+    if probe is None:
+        return None, 'could not decode audio', 0.0
 
-    ref_table = _fingerprint(*_peaks(_spectrogram(chart)))
     probe_table = _fingerprint(*_peaks(_spectrogram(probe)))
-    if not ref_table or not probe_table:
-        return None, 'not enough audio detail'
+    if not probe_table:
+        return None, 'not enough audio detail', 0.0
 
     result = _offset_seconds(ref_table, probe_table)
     if result is None:
-        return None, 'no confident match'
+        return None, 'no confident match', 0.0
 
     lead, votes, score, conc = result
     ms = -int(round(lead * 1000))
     info = f'lead-in {lead:.2f}s, {votes} matches, {score:.0f}x confidence'
-    return ms, info
+    # concentration is the strongest single quality signal; a solid match sits
+    # around 0.2-0.5, the gate floor is 0.05. Scale so a good match reports ~1.
+    conf = min(1.0, conc / 0.25)
+    return ms, info, conf

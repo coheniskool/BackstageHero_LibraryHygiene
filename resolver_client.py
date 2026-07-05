@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import urllib.parse
 import urllib.request
 import uuid
@@ -84,6 +85,12 @@ def _client_id():
         return 'anon'
 
 
+# what a YouTube video id looks like. everything the server hands back goes
+# through this before it touches a URL or song.ini - the server validates on
+# write too, but the client shouldn't have to trust that.
+_VIDEO_ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+
+
 def resolve(ch):
     """Look up the community-confirmed video for this chart. Returns the mapping dict or None."""
     if not RESOLVER_BASE or not ch:
@@ -92,9 +99,19 @@ def resolve(ch):
         url = RESOLVER_BASE + '/resolve?hash=' + urllib.parse.quote(ch)
         req = urllib.request.Request(url, headers={'User-Agent': _UA})
         with urllib.request.urlopen(req, timeout=_RESOLVE_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode('utf-8', 'replace'))
-        if data.get('status') == 'approved' and data.get('video_id'):
-            return data
+            data = json.loads(resp.read(1 << 20).decode('utf-8', 'replace'))
+        if data.get('status') != 'approved':
+            return None
+        if not _VIDEO_ID_RE.match(str(data.get('video_id') or '')):
+            log.warning('resolver returned a malformed video id; ignoring')
+            return None
+        start = data.get('start_ms')
+        if start is not None:
+            start = int(start)
+            if not -3_600_000 <= start <= 3_600_000:
+                return None
+            data['start_ms'] = start
+        return data
     except Exception:
         log.debug('resolve() failed', exc_info=True)
     return None

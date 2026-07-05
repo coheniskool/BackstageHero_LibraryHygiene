@@ -46,7 +46,7 @@ from tqdm import tqdm
 
 import resolver_client
 
-__version__ = '2.1.1'
+__version__ = '2.2.0'
 
 try:
     import audiosync
@@ -144,22 +144,6 @@ def _read_text(path):
         return f.read()
 
 
-def _parse_song_ini(path):
-    """Returns (artist, title) from a song.ini, or (None, None) on failure."""
-    try:
-        text = _read_text(path)
-        cp = configparser.ConfigParser(strict=False, interpolation=None)
-        cp.read_string(text)
-    except Exception:
-        return None, None
-    for sec in cp.sections():
-        if sec.lower() == 'song':
-            artist = (cp.get(sec, 'artist', fallback='') or '').strip()
-            title = (cp.get(sec, 'name', fallback='') or '').strip()
-            return (artist or None), (title or None)
-    return None, None
-
-
 def _parse_chart(path):
     """Returns (artist, title) from a notes.chart [Song] block."""
     try:
@@ -182,17 +166,36 @@ def _parse_chart(path):
 def read_metadata(folder):
     """Get artist/title for a song folder.
     Checks song.ini first, falls back to notes.chart, then the folder name."""
+    artist, title, _ = scan_song(folder)
+    return artist, title
+
+
+def scan_song(folder):
+    """(artist, title, stored_res) for a song folder in a single song.ini parse.
+    The library scan calls this once per song, so the file is only opened once
+    instead of once for the metadata and again for the resolution."""
+    res = None
     ini = os.path.join(folder, 'song.ini')
     if os.path.exists(ini):
-        artist, title = _parse_song_ini(ini)
-        if title:
-            return artist, title
+        try:
+            cp = configparser.ConfigParser(strict=False, interpolation=None)
+            cp.read_string(_read_text(ini))
+            for sec in cp.sections():
+                if sec.lower() == 'song':
+                    artist = (cp.get(sec, 'artist', fallback='') or '').strip()
+                    title = (cp.get(sec, 'name', fallback='') or '').strip()
+                    res = cp.get(sec, 'backstagehero_res', fallback='').strip() or None
+                    if title:
+                        return (artist or None), title, res
+                    break
+        except Exception:
+            pass
     chart = os.path.join(folder, 'notes.chart')
     if os.path.exists(chart):
         artist, title = _parse_chart(chart)
         if title:
-            return artist, title
-    return None, os.path.basename(folder)
+            return artist, title, res
+    return None, os.path.basename(folder), res
 
 
 def build_query(artist, title):
@@ -303,21 +306,23 @@ def search_candidates(query, n=SEARCH_RESULTS):
 
 
 def fetch_audio(folder, url):
-    """Download audio-only for fingerprinting. Returns (path, max_video_height),
-    or (None, 0) on failure.
+    """Download audio-only for fingerprinting. Returns (path, max_video_height,
+    info_dict), or (None, 0, None) on failure.
 
     Grabs a low-bitrate stream on purpose: the fingerprinter analyses at 8 kHz
     mono, so a ~50-70kbps opus carries everything it can use at a fraction of
     the bytes (and requests) of bestaudio. Quality floor first, then whatever.
 
-    The max video height comes free out of the same extraction (the info dict
-    lists every format), so select_video can prefer a higher-res source without
-    a second request."""
+    The max video height and the full info dict come free out of the same
+    extraction: the height lets select_video prefer a higher-res source, and
+    the info dict (with every format URL in it) lets download_video skip a
+    second extraction of the same video."""
     cleanup_temp_files(folder)
     opts = _base_opts()
     opts.update({'format': 'bestaudio[abr<=80]/worstaudio/bestaudio/best',
                  'outtmpl': os.path.join(folder, 'video.sync.%(ext)s')})
     max_h = 0
+    info = None
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -328,9 +333,9 @@ def fetch_audio(folder, url):
     except Exception as e:
         if is_bot_error(e):
             raise BotDetected(str(e))
-        return None, 0
+        return None, 0, None
     matches = glob.glob(os.path.join(folder, 'video.sync.*'))
-    return (matches[0] if matches else None), max_h
+    return (matches[0] if matches else None), max_h, info
 
 
 def _chart_duration(folder):
@@ -356,8 +361,15 @@ def _chart_duration(folder):
     return None
 
 
-def download_video(folder, url, quality):
-    """Download video to a temp file, then rename to video.mp4 once complete."""
+def download_video(folder, url, quality, info=None):
+    """Download video to a temp file, then rename to video.mp4 once complete.
+
+    If `info` is the info dict from an earlier extraction of the same URL
+    (select_video already pulled one to fingerprint the audio), the format
+    URLs in it are reused instead of asking YouTube to extract the video all
+    over again - one less round of API requests per song, which is exactly
+    what the rate limiter punishes. Falls back to a fresh extraction if the
+    reuse fails for any reason."""
     cleanup_temp_files(folder)
     dl = os.path.join(folder, 'video.download.mp4')
     opts = _base_opts()
@@ -370,7 +382,20 @@ def download_video(folder, url, quality):
     })
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+            done = False
+            if info:
+                try:
+                    # drop the audio run's selections, keep the format list
+                    clean = {k: v for k, v in info.items()
+                             if not k.startswith('requested')}
+                    ydl.process_ie_result(clean, download=True)
+                    done = True
+                except Exception:
+                    log.info('Cached extraction reuse failed; extracting fresh',
+                             exc_info=True)
+                    cleanup_temp_files(folder)
+            if not done:
+                ydl.download([url])
     except Exception as e:
         if is_bot_error(e):
             raise BotDetected(str(e))
@@ -408,7 +433,9 @@ def download_video(folder, url, quality):
 
 def select_video(folder, candidates, sync_ready, target_h=0):
     """Pick the right candidate. With sync available, fingerprints each one against
-    the chart audio until we get a confident match. Returns (url, title, offset_ms, matched).
+    the chart audio until we get a confident match.
+    Returns (url, title, offset_ms, matched, confidence, info_dict) - info_dict
+    is the winner's cached extraction so the download can reuse it, or None.
 
     target_h is the resolution the user asked for. Among the candidates that
     match the song, a match that actually has that resolution wins; if the first
@@ -417,13 +444,13 @@ def select_video(folder, candidates, sync_ready, target_h=0):
     good first hit costs nothing extra."""
     if not sync_ready:
         url, title = candidates[0][0], candidates[0][1]
-        return url, title, DEFAULT_START_TIME, False
+        return url, title, DEFAULT_START_TIME, False, 0.0, None
 
     # no stems in this folder = nothing to fingerprint against, so don't waste
     # audio downloads finding that out the hard way
     if audiosync is None or not audiosync.chart_stems(folder):
         url, title = candidates[0][0], candidates[0][1]
-        return url, title, DEFAULT_START_TIME, False
+        return url, title, DEFAULT_START_TIME, False, 0.0, None
 
     # rank by plausible length before spending downloads. the song has to fit
     # inside the video, plus some intro/outro, so a 30s short or a 20min live
@@ -441,13 +468,13 @@ def select_video(folder, candidates, sync_ready, target_h=0):
     else:
         ordered = list(candidates)
 
-    best = None   # (url, title, ms, height) - best matching song seen so far
+    best = None   # (url, title, ms, height, conf, vinfo) - best match so far
     for url, title, _ in ordered[:GATE_CANDIDATES]:
-        audio, max_h = fetch_audio(folder, url)
+        audio, max_h, vinfo = fetch_audio(folder, url)
         try:
             if not audio:
                 continue
-            ms, info = audiosync.compute_offset_ms(folder, audio)
+            ms, info, conf = audiosync.compute_offset_ms(folder, audio)
         except BotDetected:
             raise
         except Exception as e:
@@ -459,30 +486,32 @@ def select_video(folder, candidates, sync_ready, target_h=0):
             continue
         if max_h >= target_h:
             print(f'  Matched: {title}  ({info}, {max_h or "?"}p)')
-            return url, title, ms, True
+            return url, title, ms, True, conf, vinfo
         # right song but below the resolution we want - remember the best one
         # and keep looking for something higher
         if best is None or max_h > best[3]:
-            best = (url, title, ms, max_h)
+            best = (url, title, ms, max_h, conf, vinfo)
         print(f'  Matched {title} but only {max_h}p, looking for higher')
 
     if best is not None:
         print(f'  Using best available match ({best[3]}p)')
-        return best[0], best[1], best[2], True
+        return best[0], best[1], best[2], True, best[4], best[5]
 
     # nothing matched - use top result with default offset
     url, title = candidates[0][0], candidates[0][1]
     print('  No confident match - using top result with default offset')
-    return url, title, DEFAULT_START_TIME, False
+    return url, title, DEFAULT_START_TIME, False, 0.0, None
 
 
-def download_with_fallback(folder, primary_url, candidates, quality):
-    """Try the primary URL, fall back through other candidates if it fails."""
+def download_with_fallback(folder, primary_url, candidates, quality, info=None):
+    """Try the primary URL, fall back through other candidates if it fails.
+    `info` is the primary's cached extraction, if we have one."""
     urls = [primary_url] + [c[0] for c in candidates if c[0] != primary_url]
     last_err = None
     for url in urls:
         try:
-            download_video(folder, url, quality)
+            download_video(folder, url, quality,
+                           info=info if url == primary_url else None)
             return url
         except BotDetected:
             raise
@@ -538,11 +567,12 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     # that actually has it
     m = re.search(r'height<=(\d+)', quality)
     target_h = int(m.group(1)) if m else 0
-    url, vid_title, offset, matched = select_video(folder, candidates, sync_ready, target_h)
+    url, vid_title, offset, matched, conf, vinfo = select_video(
+        folder, candidates, sync_ready, target_h)
     print('Downloading: ' + vid_title)
 
     # old video stays until new one is fully downloaded, so nothing is left half-done
-    used_url = download_with_fallback(folder, url, candidates, quality)
+    used_url = download_with_fallback(folder, url, candidates, quality, info=vinfo)
 
     if is_converted(folder):
         print('  Phase Shift converter file detected - video kept, timing left as-is')
@@ -565,9 +595,11 @@ def process_download(folder, song_name, quality, sync_ready, replace):
         print('  Could not update song.ini (no [song] section?). Video kept.')
         raise Exception('song.ini missing [song] section')
 
-    # only report confident fingerprint matches - no point voting on guesses
+    # only report confident fingerprint matches - no point voting on guesses.
+    # the measured confidence goes with it so strong matches carry more weight
+    # in the pool than borderline ones.
     if matched:
-        resolver_client.report(ch, vid, offset, 1.0, artist, title)
+        resolver_client.report(ch, vid, offset, conf or 1.0, artist, title)
 
 
 def process_resync(folder, song_name, sync_ready):
@@ -584,10 +616,10 @@ def process_resync(folder, song_name, sync_ready):
     if source:
         url = f'https://www.youtube.com/watch?v={source}'
         print('\nRe-syncing: ' + build_query(artist, title) + '  (known source)')
-        audio, _ = fetch_audio(folder, url)
+        audio, _, _ = fetch_audio(folder, url)
         try:
-            ms, info = (audiosync.compute_offset_ms(folder, audio)
-                        if audio else (None, 'no audio'))
+            ms, info, _ = (audiosync.compute_offset_ms(folder, audio)
+                           if audio else (None, 'no audio', 0.0))
         finally:
             cleanup_temp_files(folder)
         if ms is not None and set_ini_values(folder, {'video_start_time': str(ms)}):
@@ -599,7 +631,7 @@ def process_resync(folder, song_name, sync_ready):
     query = build_query(artist, title)
     print('\nRe-syncing: ' + query)
     candidates = search_candidates(query)
-    _, vid_title, offset, matched = select_video(folder, candidates, sync_ready)
+    _, vid_title, offset, matched, _, _ = select_video(folder, candidates, sync_ready)
     if matched and set_ini_values(folder, {'video_start_time': str(offset)}):
         print('  Re-synced against: ' + vid_title)
     else:
