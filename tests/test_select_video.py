@@ -80,6 +80,64 @@ def test_select_video_no_chart_duration_falls_back_to_raw_top_result_unchanged(t
     assert matched is False
 
 
+def _no_confirm_env(monkeypatch, chart_dur):
+    monkeypatch.setattr(vd, 'audiosync', type('_A', (), {
+        'chart_stems': staticmethod(lambda folder: ['song.ogg']),
+        'compute_offset_ms': staticmethod(_never_confirms),
+    }))
+    monkeypatch.setattr(vd, '_chart_duration', lambda folder: chart_dur)
+    monkeypatch.setattr(vd, 'fetch_audio', lambda folder, url: ('fake_audio_path', 720, None))
+    monkeypatch.setattr(vd, 'cleanup_temp_files', lambda folder: None)
+
+
+def test_a_confirmed_fitting_candidate_outranks_a_duration_unknown_one(tmp_path, monkeypatch):
+    """The ranking hole: unknown-duration and confirmed-fitting used to share
+    the top tier, with ties broken on search order. So a result yt-dlp gave no
+    duration for could take ordered[0] ahead of one positively verified to fit
+    -- and then sail through the floor on its behalf."""
+    _no_confirm_env(monkeypatch, chart_dur=200)
+
+    candidates = [
+        ('https://youtube.com/watch?v=unknown', 'No duration reported', None),   # first in search order
+        ('https://youtube.com/watch?v=fits', 'Right length', 200),
+    ]
+
+    url, _, _, matched, _, _ = vd.select_video(str(tmp_path), candidates, sync_ready=True)
+
+    assert url == 'https://youtube.com/watch?v=fits'
+    assert matched is False
+
+
+def test_a_duration_unknown_candidate_still_beats_one_known_not_to_fit(tmp_path, monkeypatch):
+    """Unknown is demoted below confirmed, NOT lumped in with rejected --
+    absence of duration data is not evidence of a mismatch."""
+    _no_confirm_env(monkeypatch, chart_dur=200)
+
+    candidates = [
+        ('https://youtube.com/watch?v=tooshort', 'Way too short', 5),
+        ('https://youtube.com/watch?v=unknown', 'No duration reported', None),
+    ]
+
+    url, _, _, _, _, _ = vd.select_video(str(tmp_path), candidates, sync_ready=True)
+
+    assert url == 'https://youtube.com/watch?v=unknown'
+
+
+def test_a_duration_unknown_candidate_is_still_allowed_through_the_floor(tmp_path, monkeypatch):
+    """Deliberate limit, pinned so it isn't tightened by accident: with no
+    duration data there is no evidence to refuse on, so the floor lets it
+    through. Narrowing this would refuse downloads for every search result
+    yt-dlp happens not to report a duration for. The static-art detector in
+    process_download covers the album-art subcase downstream."""
+    _no_confirm_env(monkeypatch, chart_dur=200)
+
+    candidates = [('https://youtube.com/watch?v=unknown', 'No duration reported', None)]
+
+    url, _, _, _, _, _ = vd.select_video(str(tmp_path), candidates, sync_ready=True)
+
+    assert url == 'https://youtube.com/watch?v=unknown'
+
+
 def test_process_download_skips_cleanly_when_select_video_finds_nothing_plausible(tmp_path, monkeypatch):
     (tmp_path / 'song.ini').write_text('[song]\nname = Test\nartist = Someone\n', encoding='utf-8')
 

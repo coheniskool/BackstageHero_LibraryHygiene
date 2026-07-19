@@ -507,9 +507,22 @@ def select_video(folder, candidates, sync_ready, target_h=0):
         def is_plausible(dur):
             return dur is None or (chart_dur - 25) <= dur <= (chart_dur + 150)
 
+        # Three tiers, not two. An unknown duration still isn't punished --
+        # it stays eligible, and the floor below still lets it through, since
+        # "no duration data" is no evidence of a mismatch. But it must not
+        # outrank a candidate we have positively confirmed fits: with two
+        # tiers, unknown and confirmed-fitting shared tier 0 and ties broke on
+        # search order, so a duration-less result could take ordered[0] ahead
+        # of a verified one and sail past the floor on its behalf.
         def rank(item):
             i, (_, _, dur) = item
-            return (0 if is_plausible(dur) else 1, i)
+            if dur is None:
+                tier = 1                     # unknown: eligible, but never preferred
+            elif is_plausible(dur):
+                tier = 0                     # confirmed to fit this chart
+            else:
+                tier = 2                     # known not to fit
+            return (tier, i)
         ordered = [c for _, c in sorted(enumerate(candidates), key=rank)]
     else:
         is_plausible = None
@@ -701,11 +714,24 @@ def process_resync(folder, song_name, sync_ready):
     network requests. Falls back to the stored YouTube source, then a fresh
     search, exactly as before, for a local video that's missing, corrupted,
     or genuinely no longer fingerprint-matches.
+
+    Returns 'skipped' for a song this pass deliberately left alone.
     """
     if not sync_ready:
         return
     if is_converted(folder):
         return
+
+    # a hand-set offset outranks anything automatic. the sync editor writes
+    # SYNC_MANUAL for exactly this check -- without it, "Auto-sync" over a
+    # checked library silently re-breaks the songs the user already fixed by
+    # hand, which are by definition the ones audiosync got wrong the first
+    # time. To re-sync one of these on purpose, clear the offset in the sync
+    # editor; a deliberate re-download (replace=True) still overwrites it,
+    # since a new video makes the old hand-set offset meaningless anyway.
+    if _read_ini_value(folder, 'backstagehero_sync') == SYNC_MANUAL:
+        print('  Manually synced - leaving as-is')
+        return 'skipped'
 
     artist, title = read_metadata(folder)
 
@@ -737,13 +763,23 @@ def process_resync(folder, song_name, sync_ready):
             return
         print('  Known source no longer matches - falling back to search')
 
+    # Last resort: search for a candidate that matches the chart. Note what this
+    # can and cannot tell us -- we only get here because the video actually on
+    # disk did NOT fingerprint-match. A fresh candidate matching the chart says
+    # nothing about the local file's timing, so its offset must not be written
+    # over the local video's: that would store a measurement of a video the user
+    # doesn't have, and (worse) stamp it SYNC_MEASURED, manufacturing exactly the
+    # false "this one is trustworthy" signal the provenance marker exists to
+    # prevent. Report the mismatch and leave the timing alone; fixing it needs a
+    # re-download, which is Search & Download's job, not Auto-sync's.
     query = build_query(artist, title)
     print('\nRe-syncing: ' + query)
     candidates = search_candidates(query)
-    _, vid_title, offset, matched, _, _ = select_video(folder, candidates, sync_ready)
-    if matched and set_ini_values(folder, {'video_start_time': str(offset),
-                                           'backstagehero_sync': SYNC_MEASURED}):
-        print('  Re-synced against: ' + vid_title)
+    _, vid_title, _, matched, _, _ = select_video(folder, candidates, sync_ready)
+    if matched:
+        print('  The video on disk no longer matches this chart (a different '
+              'upload does: ' + vid_title + ').')
+        print('  Timing left unchanged - re-download the song to fix it.')
     else:
         print('  No confident match - timing left unchanged')
 
@@ -1041,7 +1077,8 @@ def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resyn
     for attempt in range(len(BOT_BACKOFF_SECONDS) + 1):
         try:
             if resync:
-                process_resync(folder, song_name, sync_ready)
+                if process_resync(folder, song_name, sync_ready) == 'skipped':
+                    return 'skipped'
             else:
                 if process_download(folder, song_name, quality, sync_ready,
                                     replace) == 'skipped':

@@ -806,10 +806,16 @@ class LibraryToolsDialog(ctk.CTkToplevel):
     same per-folder chart_rename_status, so overlapping runs could race.
     """
 
-    def __init__(self, parent, songs_folder, on_close=None):
+    def __init__(self, parent, songs_folder, on_close=None, on_run_state=None):
         super().__init__(parent)
         self._songs_folder = songs_folder
         self._on_close = on_close
+        # Told when a tool starts and stops, so the main window can stay
+        # locked for the worker's real lifetime rather than the dialog's --
+        # closing this window does not stop the thread (there is no Stop
+        # button to offer, and killing a scan mid-rename would be worse than
+        # letting it finish).
+        self._on_run_state = on_run_state
         self._running_key = None
         self._dry_run_vars = {}
         self._status_labels = {}
@@ -900,10 +906,28 @@ class LibraryToolsDialog(ctk.CTkToplevel):
             return
         dry_run = self._dry_run_vars[key].get()
         self._running_key = key
+        self._dry_run_of_current = dry_run
+        self._notify_run_state(True)
         for btn in self._run_buttons.values():
             btn.configure(state='disabled')
         self._status_labels[key].configure(text='Running...', text_color=_BLUE)
         threading.Thread(target=self._worker, args=(key, dry_run), daemon=True).start()
+
+    def _notify_run_state(self, running):
+        """Tell the main window a worker started or stopped.
+
+        Called straight from the worker thread, deliberately NOT marshalled
+        through self.after(): this dialog may already be destroyed by the time
+        a scan ends, and that is precisely when the main window most needs the
+        news. The receiver owns its own thread-safety (it sets a plain flag
+        first, then schedules its own UI refresh) -- see App._set_tool_running.
+        """
+        if self._on_run_state is None:
+            return
+        try:
+            self._on_run_state(running)
+        except Exception:
+            log.exception('Failed to report library-tool run state (running=%s)', running)
 
     def _worker(self, key, dry_run):
         try:
@@ -925,6 +949,10 @@ class LibraryToolsDialog(ctk.CTkToplevel):
             log.exception('Library tool %s failed', key)
             text = f'Error: {e}'
             color = _RED
+        # unlock the main window on the parent's loop, which is still alive
+        # whether or not this dialog is -- must happen before the _finish
+        # attempt below, since that one legitimately fails on a closed dialog
+        self._notify_run_state(False)
         try:
             # the dialog may have been closed while the scan was running --
             # scheduling on a destroyed Toplevel raises, so this is a no-op
@@ -968,9 +996,27 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         self._status_labels[key].configure(text=text, text_color=color)
 
     def _close(self):
+        # Closing does not stop the worker. Say so plainly: the thread keeps
+        # renaming and relocating files, and the previous version released the
+        # modal grab silently -- leaving the user free to press Start and race
+        # a download against a scan still mutating the same folders.
+        if self._running_key is not None:
+            tool = next((label for k, label, _ in _LIBRARY_TOOLS
+                         if k == self._running_key), self._running_key)
+            verb = 'previewing' if getattr(self, '_dry_run_of_current', True) else 'changing files in'
+            if not messagebox.askokcancel(
+                    'Scan still running',
+                    f'"{tool}" is still {verb} your library.\n\n'
+                    'Closing this window will not stop it. The scan finishes on its own, '
+                    'and the main window stays locked until it does.\n\nClose anyway?',
+                    parent=self):
+                return
         self.grab_release()
         self.destroy()
-        if self._on_close:
+        # Skip the caller's library reload while a scan is still running -- it
+        # would read a folder tree being rewritten underneath it. The run-state
+        # callback reloads once the worker actually finishes.
+        if self._on_close and self._running_key is None:
             self._on_close()
 
     def _center(self):
@@ -1007,6 +1053,12 @@ class App(ctk.CTk):
         self._sort_asc    : bool = True
         self._filter_mode : str  = 'missing'
         self._running     : bool = False
+        self._resync_run  : bool = False   # is the active run Auto-sync, not download?
+        # A Library Tools worker can outlive its dialog, so this tracks the
+        # THREAD, not the window. Without it, closing that dialog mid-scan
+        # freed the user to start a download into the same folders a rename
+        # sweep was still working through.
+        self._tool_running: bool = False
         self._polling     : bool = False
         self._stop_evt    = threading.Event()
         self._queue       : queue.Queue = queue.Queue()
@@ -1577,18 +1629,52 @@ class App(ctk.CTk):
         if self._running:
             messagebox.showinfo('Busy', 'Wait for the current download/sync run to finish first.')
             return
+        if self._tool_running:
+            # a worker from a previously-closed dialog is still going; a second
+            # dialog would happily start a second tool over the same library
+            messagebox.showinfo(
+                'Busy', 'A library scan is still running. Wait for it to finish first.')
+            return
         if not self._songs_folder:
             messagebox.showinfo('No folder selected', 'Pick your Songs folder first.')
             return
         LibraryToolsDialog(self, self._songs_folder,
-                            on_close=lambda: self._load_library(self._songs_folder))
+                            on_close=lambda: self._load_library(self._songs_folder),
+                            on_run_state=self._set_tool_running)
+
+    def _set_tool_running(self, running):
+        """Called FROM THE WORKER THREAD when a Library Tools scan starts/stops.
+
+        The flag assignment is what actually guards the library, so it happens
+        here and now -- a bare attribute write, atomic under the GIL, with no
+        Tk involved. Only the UI refresh is marshalled onto the main loop, and
+        if that scheduling fails the guard is still correct: worst case the
+        buttons look stale, rather than the window staying locked forever with
+        no way back.
+        """
+        self._tool_running = running
+        try:
+            self.after(0, lambda: self._on_tool_state_changed(running))
+        except Exception:
+            log.exception('Could not schedule UI refresh after tool state change')
+
+    def _on_tool_state_changed(self, running):
+        self._update_buttons()
+        if not running and self._songs_folder:
+            # the scan has genuinely finished, so reloading reads a settled
+            # tree. Covers the case where the dialog was closed mid-run and its
+            # own on_close reload was deliberately skipped for that reason.
+            self._load_library(self._songs_folder)
 
     def _update_buttons(self):
         checked    = [s for s in self._songs if s.checked]
         n          = len(checked)
         has_vid    = [s for s in checked if s.has_video]
-        can_start  = n > 0 and not self._running
-        can_resync = len(has_vid) > 0 and not self._running and self._sync_ready
+        # _tool_running blocks both: a Library Tools scan and a download run
+        # are two independent mutation paths over one library
+        can_start  = n > 0 and not self._running and not self._tool_running
+        can_resync = (len(has_vid) > 0 and not self._running
+                      and not self._tool_running and self._sync_ready)
 
         self._start_btn.configure(
             text=f'▶  Search & Download ({n})' if n else '▶  Search & Download',
@@ -1667,6 +1753,10 @@ class App(ctk.CTk):
         quality = quality_format(1080 if self._quality_var.get() == '1080p' else 720)
 
         self._running = True
+        # what "skipped" means differs by run type: a download run skips songs
+        # that already have a video, a resync run skips ones the user synced by
+        # hand. Set before the worker starts and only read on the main thread.
+        self._resync_run = resync
         self._stop_evt.clear()
         self._progress.set(0)
         self._update_buttons()
@@ -1746,11 +1836,13 @@ class App(ctk.CTk):
 
         self._queue.put(('finished', total, done, skipped, errors))
 
-    @staticmethod
-    def _run_summary(done, skipped, errors):
+    def _run_summary(self, done, skipped, errors):
         parts = []
-        if done:    parts.append(f'{done} downloaded')
-        if skipped: parts.append(f'{skipped} already had video')
+        if done:
+            parts.append(f'{done} re-synced' if self._resync_run else f'{done} downloaded')
+        if skipped:
+            parts.append(f'{skipped} manually synced, left alone' if self._resync_run
+                         else f'{skipped} already had video')
         if errors:  parts.append(f'{errors} failed (details in log)')
         return ', '.join(parts) if parts else 'nothing to do'
 
@@ -1792,7 +1884,8 @@ class App(ctk.CTk):
 
         elif kind == 'song_skipped':
             _, s, i, total = msg
-            s.status    = '✔  Already had video'
+            s.status    = ('✔  Manually synced' if self._resync_run
+                           else '✔  Already had video')
             s.stag      = 'dim'
             s.has_video = True
             self._update_row(s)

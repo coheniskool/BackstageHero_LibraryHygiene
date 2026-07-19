@@ -10,6 +10,7 @@
 # real, live endpoint for an artist/title lookup is a POST to
 # /search/advanced with a structured body.
 
+import json
 import logging
 
 import requests
@@ -18,6 +19,8 @@ log = logging.getLogger('backstagehero')
 
 CHORUS_API_BASE_URL = 'https://api.enchor.us'
 CHORUS_REQUEST_TIMEOUT_SECONDS = 15
+# Matches resolver_client's cap. A single search result is a few KB.
+MAX_RESPONSE_BYTES = 1 << 20
 
 
 def _blank_text_filter():
@@ -68,13 +71,34 @@ def search_by_artist_title(artist, title):
     try:
         response = requests.post(
             f'{CHORUS_API_BASE_URL}/search/advanced', json=body, timeout=CHORUS_REQUEST_TIMEOUT_SECONDS,
+            stream=True,
         )
         response.raise_for_status()
-        data = response.json()
-        results = data.get('data')
-        if not results:
+
+        # Cap the body before parsing it. timeout= bounds socket silence, not
+        # total size, so without this a huge (or endless) response is read
+        # straight into memory. resolver_client.resolve() already caps at the
+        # same 1 MiB; a single search result is a few KB.
+        raw = response.raw.read(MAX_RESPONSE_BYTES + 1, decode_content=True)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            log.error('Chorus response exceeded %d bytes; ignoring', MAX_RESPONSE_BYTES)
             return None
-        return results[0]
+        data = json.loads(raw.decode('utf-8', 'replace'))
+
+        # Validate the shape rather than just its truthiness. This function
+        # promises "a result dict or None", and every caller relies on that by
+        # calling .get() on what comes back. A response whose 'data' is a bare
+        # string is truthy and indexable, so the old check returned data[0] --
+        # a single CHARACTER -- and the AttributeError landed in the caller's
+        # per-song loop, outside this try, taking the whole library scan with
+        # it. Doesn't need a hostile server; a schema change is enough.
+        if not isinstance(data, dict):
+            return None
+        results = data.get('data')
+        if not isinstance(results, list) or not results:
+            return None
+        first = results[0]
+        return first if isinstance(first, dict) else None
     except Exception as e:
         log.error(f'Chorus lookup error for artist={artist!r} title={title!r}: {e}')
         return None

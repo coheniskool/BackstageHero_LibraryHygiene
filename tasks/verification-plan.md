@@ -208,6 +208,120 @@ whole sweep there.
 
 ---
 
+## Phase 2.5 -- Remediate Phase 2 findings *(blocking; before Phase 3)*
+
+Five parallel Phase 2 reviews landed 2026-07-19. Two findings converged independently
+(2b and 2e both found the `SYNC_MANUAL` gap from different angles -- code-reading vs.
+test-coverage-mapping -- which is why it's ranked first). Everything in **Blocks** below
+trips blocker rule 3 (Station-3-or-adjacent finding, no fix, no test in a green suite).
+Fix in the order listed; re-run the full suite after each item, not just at the end, so a
+regression is attributable to the item that caused it.
+
+### Blocks the commit
+
+| # | Finding | File(s) | Model | Why this model |
+|---|---|---|---|---|
+| 1 | `SYNC_MANUAL` written, never read -- an automatic resync sweep silently overwrites a user's hand-fixed offset | `VideoDownload.py` (`process_resync`, `process_download`, wherever `backstagehero_sync` is written) | **Opus 4.8, max effort** | Station 3-adjacent: destroys a user's manual correction with no warning. Confirmed by two independent reviewers -- highest-confidence finding in the pass. |
+| 2 | 2a-1: nested library -- non-recursive `chart_rename` scan disagrees with `VideoDownload`'s recursive scan; a folder with no `.ini` (e.g. a pack subfolder) gets relocated whole | `chart_rename.py` (`:579`), `library_common.py`, `dedupe_report.py` | **Opus 4.8, max effort** | Proven to empty a `Songs/<Artist>/<Song>/` layout on first run. Real data loss, not a bug report. |
+| 3 | 2a-2: non-cp1252 song name crashes the scan *after* the move has already happened; fires during dry-run too, so a truncated report reads as clean | `chart_rename.py` (`:588`), `gui.py` (`:19`, `open(os.devnull, 'w')`) | **Opus 4.8** | Silent truncation of a safety report is exactly the failure mode the dry-run gate exists to prevent. |
+| 4 | 2a-3: no rollback -- one locked/in-use file mid-rename leaves the folder half-renamed, scan aborts | `chart_rename.py` (`apply_stem_renames`), `library_common.py` (`move_to_review`) | **Opus 4.8** | Ordinary trigger on Windows (AV scan, Explorer preview lock). Needs either a two-phase rename (stage, then commit) or a recorded-and-resumable partial state. |
+| 5 | 2a-4: song-role duration guard fails open on missing/unparseable `song_length` or an ffprobe failure -- rename proceeds with the safety check silently skipped | `chart_rename.py` (duration guard) | **Sonnet 5**, escalate to Opus if the fix touches the rename decision itself | Mechanical once the intended behavior is named: mirror the `.mid` path's existing fail-safe convention (`:145`) -- missing signal means "cannot verify," not "assume fine." |
+| 6 | 2b-2: resync's search-fallback path fingerprints a *new* candidate but never replaces `video.mp4`, then stamps the offset `measured` -- manufactures the exact false-`measured` signal Phase 4c is built to catch | `VideoDownload.py` (`process_resync`, `:743-745`) | **Opus 4.8, max effort** | Needs a decision, not just a patch (see below), and the failure mode is adversarial to Phase 4c's own verification method. |
+| 7 | 2c: `_close()` doesn't check `_running_key` -- closing the dialog mid-run on a real (non-dry-run) tool orphans the worker thread while releasing the modal grab, and the main window's Start button isn't blocked from racing a second mutation path over the same library | `gui.py` (`LibraryToolsDialog._close`, `_run_tool`) | **Sonnet 5** | Conventional Tk fix (block close / disable Start) once the race is named; same station as the existing `App._running` guard it needs to extend. |
+
+**Finding 6 needs a decision before it's a patch**: either (a) write `guess` instead of
+`measured` whenever the fallback path re-searched rather than reused the on-disk video, or
+(b) actually re-download the matched candidate so `measured` stays true to what's on disk.
+**Recommendation: (a)** -- it's the smaller change, it doesn't add a download to a resync
+pass, and it matches the marker's original intent (a fallback guess is not a measurement).
+Flag this recommendation to the user before implementing in case they want (b) instead.
+
+### Fix now (not blocking, but land before Phase 3)
+
+| # | Finding | File(s) | Model |
+|---|---|---|---|
+| 8 | 2b-3: `is_plausible(None) == True` lets a duration-unknown wrong-song candidate outrank a duration-matched one at `ordered[0]` | `VideoDownload.py` (`is_plausible`, `:508`) | Sonnet 5 |
+| 9 | 2d M-1: `chorus_client` checks truthiness, not shape -- a schema change throws `AttributeError` uncaught, aborting a whole-library run | `chorus_client.py` (`:76`) | Haiku 4.5 |
+| 10 | 2d M-2: `response.json()` unbounded, unlike `resolver_client`'s 1 MiB cap | `chorus_client.py` (`:69`) | Haiku 4.5 |
+
+### Test obligations (per 2e's own rule: a fix with no test that fails on revert is unverified)
+
+- [ ] `test_sync_provenance.py`: manual marker survives an automatic resync pass (covers #1).
+- [ ] New nested-library fixture (the "Rock Pack" shape from 2a): confirm no subtree outside
+      a leaf song folder is ever relocated (covers #2).
+- [ ] Unicode song-name fixture (`♥` or CJK title): scan completes, dry-run report is
+      complete, not truncated (covers #3).
+- [ ] Simulated locked-file-mid-rename: folder ends in a defined, documented state, not a
+      silent partial rename (covers #4).
+- [ ] Missing/unparseable `song_length` and an ffprobe failure: rename does *not* proceed
+      (covers #5).
+- [ ] `process_resync` fallback-search path: asserts marker is `guess`, not `measured`, when
+      the on-disk video is unchanged (covers #6).
+- [ ] Extend `verify_gui_tool.py`'s pattern (or a new `test_gui.py`) to close the dialog
+      mid-run on a non-dry-run tool and assert the worker is blocked from a second concurrent
+      mutation path (covers #7).
+- [ ] `chorus_client` malformed-shape and oversized-response fixtures (covers #9, #10).
+
+**Gate**: full suite green, all eight test obligations above pass, and each of #1-#7 has a
+test that **fails if reverted** -- prove this by temporarily reverting the fix and confirming
+red, per 2e's own standard. Only then proceed to Phase 3.
+
+### Outcome (2026-07-19) -- all ten landed, suite 235 -> 264
+
+Every fix was reverted individually and its tests confirmed red before being restored. Three
+things are worth carrying into Phase 3 rather than leaving buried in the diff:
+
+**Two review findings were partially rejected on the evidence.** Recording them because
+Phase 3's job is to attack claims, and these are claims:
+
+- **#5 (duration guard).** 2a called the fail-open behavior a bug in all three "can't check"
+  cases, citing the `.mid` path as precedent. Two existing tests encoded it as deliberate,
+  and the full fail-closed fix broke the marquee Kryptonite integration test. 2a missed an
+  asymmetry: in `verify_chart_content_match`'s `.mid` branch the duration IS the only
+  evidence (a `.mid` carries no name/artist text), whereas in `apply_stem_renames` the real
+  protection is "exactly one candidate for this role" and duration is secondary. Final line:
+  *no reference value* (missing/unparseable `song_length`) stays fail-open; *reference value
+  present but ffprobe couldn't check it* now fails closed. A test pins the asymmetry so it
+  isn't "fixed" by mistake later.
+- **#9 (chorus_client).** 2d's mechanism was wrong -- the body is already inside
+  `except Exception`, so `.get()` on a list is caught. The real escape is a `'data'` that is
+  a truthy **string**: `results[0]` returned a single character, and the caller's `.get()` on
+  it raised *outside* the try. Finding real, diagnosis corrected.
+
+**#6 was decided by the user**, not by the plan's recommendation. Closer reading showed the
+fallback path only runs when the video ON DISK failed to match, so writing a fresh
+candidate's offset describes a file the user doesn't have. Chosen: leave the timing
+unchanged and tell the user to re-download. (The plan had suggested writing `guess`.)
+
+**Two bugs were found in the fixes/tests themselves, both by the revert discipline** -- worth
+noting because a green suite would have hidden both:
+
+- The first unicode test **passed without the fix**. Its fixture songs were all `confirmed_ok`,
+  and that path never prints a folder name. Rewritten against `needs_review` folders, which
+  do -- now reproduces a genuine `UnicodeEncodeError` on revert.
+- #7's first implementation posted the unlock via `after()` inside a bare `except: pass`.
+  Diagnosing a test failure showed `after()` raises `RuntimeError: main thread is not in main
+  loop` from a worker thread when no mainloop is running -- so a failed schedule would have
+  left the main window **locked forever, silently**. Restructured: the guard flag is a plain
+  atomic write from the worker thread, and only the UI refresh goes through `after()`.
+  (The test harness needed a real `mainloop()`, not `update()` polling -- the same trap
+  Phase A hit, now documented in the helper.)
+
+**Empirical check beyond the suite**: a real nested library on disk (`Songs/Rock Pack/<song>/`
+plus `Songs/Nirvana/<song>/`, a cp1252-hostile unicode folder, and an unrecognisable folder)
+was scanned dry then for real. Dry run produced a **zero-line filesystem diff** on a cp1252
+console; the real run left both packs and the junk folder untouched, relocated only the
+genuinely broken folder, and put the review folder as a **sibling** of the library. Counts
+identical between dry and real runs.
+
+**Still open, carried to Phase 3 / follow-up**: `dedupe_report`, `video_repair`,
+`metadata_enrichment` and `static_art` still use the flat one-level `iterdir()` scan. They are
+not data-loss risks the way `chart_rename` was (they don't relocate unrecognised folders), but
+on a nested library they silently process **nothing**. `library_common.iter_song_folders()`
+now exists for them; switching them over is a follow-up, not part of this phase.
+
+---
+
 ## Phase 3 -- Adversarial pass on the claimed fixes
 
 **Model: Opus 4.8. Agent: `devils-advocate` (or the `opponents-view` skill).**

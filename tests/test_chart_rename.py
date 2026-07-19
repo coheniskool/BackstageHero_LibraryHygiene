@@ -621,3 +621,211 @@ def test_scan_and_fix_chart_library_processes_all_folders_and_skips_underscored(
     assert (tmp_path / 'Library_needs_review' / 'Bad Song').exists()
     assert list((home / '_needs_review').iterdir()) == []
     assert counts == {'confirmed_ok': 1, 'needs_review': 1}
+
+
+# --- nested libraries -----------------------------------------------------
+#
+# The app finds songs with a recursive **/song.ini glob, so Songs/<Pack>/<Song>/
+# is normal. The scan used to walk exactly one level, which meant every PACK
+# folder looked like a song folder with no .ini -- and the whole pack, every
+# valid song inside it, was relocated to review as one line of output.
+
+def _valid_song(folder, name):
+    folder.mkdir(parents=True)
+    (folder / 'song.ini').write_text(
+        f'[song]\nname = {name}\nartist = 3 Doors Down\n', encoding='utf-8')
+    (folder / 'notes.chart').write_text(
+        f'[Song]\n{{\n  Name = "{name}"\n  Artist = "3 Doors Down"\n}}\n', encoding='utf-8')
+
+
+def test_scan_never_relocates_a_pack_folder_that_holds_valid_songs(tmp_path):
+    """The data-loss case: a pack folder is a container, not a broken song."""
+    home = tmp_path / 'Library'
+    home.mkdir()
+    pack = home / 'Rock Pack'
+    _valid_song(pack / 'Kryptonite', 'Kryptonite')
+    _valid_song(pack / 'Loser', 'Loser')
+
+    counts = cr.scan_and_fix_chart_library(home)
+
+    assert pack.exists(), 'relocated a pack folder holding valid songs'
+    assert (pack / 'Kryptonite' / 'song.ini').exists()
+    assert (pack / 'Loser' / 'song.ini').exists()
+    assert not (tmp_path / 'Library_needs_review').exists()
+    assert counts == {'confirmed_ok': 2}          # both songs seen, pack not counted
+
+
+def test_scan_reaches_songs_nested_several_levels_deep(tmp_path):
+    home = tmp_path / 'Library'
+    home.mkdir()
+    _valid_song(home / 'Packs' / '2005' / 'Rock' / 'Kryptonite', 'Kryptonite')
+
+    counts = cr.scan_and_fix_chart_library(home)
+
+    assert counts == {'confirmed_ok': 1}
+
+
+def test_scan_leaves_an_unrecognisable_folder_alone_rather_than_relocating_it(tmp_path):
+    """A folder that is neither a song nor a container of songs holds no
+    evidence either way. Only the tools' explicit checks should be able to
+    send something to review -- never the directory walk itself."""
+    home = tmp_path / 'Library'
+    home.mkdir()
+    _valid_song(home / 'Kryptonite', 'Kryptonite')
+    junk = home / 'cover art backups'
+    junk.mkdir()
+    (junk / 'notes.txt').write_text('nothing song-shaped in here', encoding='utf-8')
+
+    counts = cr.scan_and_fix_chart_library(home)
+
+    assert junk.exists()
+    assert (junk / 'notes.txt').exists()
+    assert counts == {'confirmed_ok': 1}
+
+
+def test_a_song_folders_own_subfolder_is_not_scanned_as_a_song(tmp_path):
+    """A song folder is never descended into -- otherwise a stray subfolder
+    inside one would be judged as if it were a song in its own right."""
+    home = tmp_path / 'Library'
+    home.mkdir()
+    song = home / 'Kryptonite'
+    _valid_song(song, 'Kryptonite')
+    (song / 'extra').mkdir()
+
+    counts = cr.scan_and_fix_chart_library(home)
+
+    assert (song / 'extra').exists()
+    assert counts == {'confirmed_ok': 1}
+
+
+# --- a song title cp1252 can't encode must not kill the scan --------------
+
+def test_unicode_song_name_does_not_truncate_the_scan(tmp_path, monkeypatch):
+    """Reproduces the real failure by giving the scan a cp1252 stdout, as a
+    Windows console has. The crash landed AFTER the folder had been moved and
+    stopped every remaining folder from being processed -- and it fired during
+    dry runs too, so a report cut short by it read as a clean one."""
+    import io
+    import sys
+
+    home = tmp_path / 'Library'
+    home.mkdir()
+    # needs_review folders, because that is the path that prints the folder
+    # name -- a confirmed_ok song never echoes its own name and so never hit
+    # the crash. Sorted order puts both unicode names before 'zz', so a crash
+    # on either one would leave the last folder unprocessed.
+    for name in ('Kryptonite ♥', '東京ソング', 'zz plain ascii'):
+        folder = home / name
+        folder.mkdir()
+        (folder / 'song.ini').write_text('[song]\nname = x\n', encoding='utf-8')  # no chart file
+
+    stream = io.TextIOWrapper(io.BytesIO(), encoding='cp1252', errors='strict')
+    monkeypatch.setattr(sys, 'stdout', stream)
+
+    counts = cr.scan_and_fix_chart_library(home, dry_run=True)
+
+    assert counts == {'needs_review': 3}, 'scan stopped early on a non-cp1252 name'
+    # dry run, so nothing moved despite all three being flagged
+    assert not (tmp_path / 'Library_needs_review').exists()
+
+
+# --- partial-rename rollback ----------------------------------------------
+
+def test_a_failed_rename_rolls_back_the_ones_that_already_landed(tmp_path):
+    """An ordinary Windows file lock (antivirus, an open Explorer preview) is
+    enough to fail one rename mid-plan. Half a plan leaves a folder Clone Hero
+    can't load, and the exception used to abort the whole library scan."""
+    (tmp_path / 'crowd_101.ogg').write_bytes(b'x')
+    (tmp_path / 'drums_102.ogg').write_bytes(b'x')
+    (tmp_path / 'vocals_103.ogg').write_bytes(b'x')
+
+    real_rename = cr.Path.rename
+    calls = []
+
+    def flaky_rename(self, target):
+        calls.append(self.name)
+        if len(calls) == 2:                       # second rename hits a lock
+            raise OSError(32, 'The process cannot access the file')
+        return real_rename(self, target)
+
+    cr.Path.rename = flaky_rename
+    try:
+        result = cr.apply_stem_renames(tmp_path, {})
+    finally:
+        cr.Path.rename = real_rename
+
+    assert result['status'] == 'needs_review'
+    assert 'rename failed' in result['detail']
+    # every original name is back -- no half-renamed folder left behind
+    assert (tmp_path / 'crowd_101.ogg').exists()
+    assert (tmp_path / 'drums_102.ogg').exists()
+    assert (tmp_path / 'vocals_103.ogg').exists()
+    assert not (tmp_path / 'crowd.ogg').exists()
+
+
+def test_a_failed_rename_says_so_when_it_cannot_roll_back(tmp_path):
+    """Rollback is itself a file operation and can fail. The caller must be
+    told which of the two states the folder is in, not left to assume."""
+    (tmp_path / 'crowd_101.ogg').write_bytes(b'x')
+    (tmp_path / 'drums_102.ogg').write_bytes(b'x')
+
+    real_rename = cr.Path.rename
+    calls = []
+
+    def one_way_rename(self, target):
+        calls.append(self.name)
+        if len(calls) == 1:
+            return real_rename(self, target)      # first one lands
+        raise OSError(32, 'locked')               # and neither the next nor the undo
+
+    cr.Path.rename = one_way_rename
+    try:
+        result = cr.apply_stem_renames(tmp_path, {})
+    finally:
+        cr.Path.rename = real_rename
+
+    assert result['status'] == 'needs_review'
+    assert 'could not undo' in result['detail']
+    assert 'fix by hand' in result['detail']
+
+
+def test_dry_run_never_renames_even_with_a_full_plan(tmp_path):
+    (tmp_path / 'crowd_101.ogg').write_bytes(b'x')
+    (tmp_path / 'vocals_103.ogg').write_bytes(b'x')
+
+    result = cr.apply_stem_renames(tmp_path, {}, dry_run=True)
+
+    assert result['status'] == 'ok'
+    assert (tmp_path / 'crowd_101.ogg').exists()
+    assert not (tmp_path / 'crowd.ogg').exists()
+
+
+# --- the 'song'-stem duration check -----------------------------------------
+
+def test_song_stem_blocked_when_ffprobe_cannot_check_a_song_length_we_have(tmp_path, monkeypatch):
+    """Distinct from the no-song_length case just below: here a reference value
+    EXISTS and the check against it failed to run. Verification attempted and
+    failed is not verification unavailable, and a 'song' stem ffprobe cannot
+    decode is itself grounds for suspicion."""
+    (tmp_path / 'song_1877.ogg').write_bytes(b'not decodable audio')
+    monkeypatch.setattr(cr.library_common, 'probe_audio_duration_ms', lambda p: None)
+
+    result = cr.apply_stem_renames(tmp_path, {'song_length': str(180 * 1000)})
+
+    assert result['status'] == 'needs_review'
+    assert 'could not read' in result['detail']
+    assert (tmp_path / 'song_1877.ogg').exists()          # never renamed
+    assert not (tmp_path / 'song.ogg').exists()
+
+
+def test_ffprobe_failure_does_not_block_when_there_is_no_song_length(tmp_path, monkeypatch):
+    """The deliberate asymmetry, pinned so it isn't 'fixed' by mistake: with no
+    reference value there is nothing to verify against, so the role falls back
+    on the check that actually protects it -- exactly one candidate."""
+    (tmp_path / 'song_1877.ogg').write_bytes(b'x')
+    monkeypatch.setattr(cr.library_common, 'probe_audio_duration_ms', lambda p: None)
+
+    result = cr.apply_stem_renames(tmp_path, {})
+
+    assert result['status'] == 'ok'
+    assert (tmp_path / 'song.ogg').exists()

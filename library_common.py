@@ -11,7 +11,29 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+
+def make_console_encoding_safe():
+    """Make print() incapable of killing a library scan.
+
+    Windows consoles (and pythonw's devnull sink) default to cp1252, which
+    cannot encode a song title containing a heart, an umlaut in the wrong
+    codepage, or any CJK text. Printing one raised UnicodeEncodeError from
+    inside the scan loop -- after the folder had already been moved, and with
+    every remaining folder left unprocessed. Worse, it fired during dry runs
+    too, so a report truncated by the crash read as a clean bill of health.
+
+    Idempotent and safe to call from any entry point; streams that don't
+    support reconfigure (pytest's capture, a frozen build's null sink) are
+    left alone rather than replaced.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
 
 # --- File discovery -------------------------------------------------------
 #
@@ -26,6 +48,73 @@ from pathlib import Path
 # predecessor) using the other three -- the standalone video-repair scan
 # still needs to find and judge those.
 VIDEO_NAMES = ('video.mp4', 'video.avi', 'video.webm', 'video.ogv')
+
+
+# --- Song-folder discovery ------------------------------------------------
+#
+# What counts as a song folder, and why this isn't simply "has song.ini".
+#
+# The app itself finds songs with a recursive **/song.ini glob (see
+# gui._scan_library and gui._validate_folder, which tells the user to pick
+# "the folder that contains all your song packs"). So a nested library --
+# Songs/<Pack>/<Song>/, or deeper -- is the normal case, not an edge case.
+#
+# The hygiene tools originally walked exactly one level with iterdir() and
+# treated every immediate child as a song folder. On a nested library that
+# silently disagreed with the app: each PACK folder looked like a song folder
+# with no .ini, so a tool that relocates unrecognised folders would move the
+# whole pack -- every valid song inside it -- into _needs_review, reported as
+# one innocuous line. Pointed at a Songs/<Artist>/<Song>/ layout, the first
+# run emptied the library.
+#
+# "Has song.ini" is too strict a test to fix it with, because repairing an
+# ID-suffixed song_2400.ini is precisely what chart_rename exists to do and
+# that folder still has to be found. So: a folder is a SONG folder if it
+# directly holds any of the file types a song is made of; a folder that holds
+# none of them but does contain song folders is a CONTAINER to descend into;
+# and a folder that is neither is left alone entirely. Unrecognised is not
+# the same as broken, and only the tools' own explicit checks -- never the
+# directory walk -- should be able to send a folder to review.
+
+SONG_FOLDER_MARKER_EXTENSIONS = ('.ini', '.chart', '.mid', '.midi', '.sng')
+
+
+def looks_like_song_folder(folder):
+    """True if this directory holds song content itself, rather than holding
+    other song folders. Deliberately generous: an ID-suffixed song_2400.ini
+    or a bare notes.chart counts, since those broken states are exactly what
+    the hygiene tools are for."""
+    try:
+        for path in Path(folder).iterdir():
+            if path.is_file() and path.suffix.lower() in SONG_FOLDER_MARKER_EXTENSIONS:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def iter_song_folders(home_folder, skip_prefixes=('_',)):
+    """Yield every song folder under home_folder, at any depth, sorted.
+
+    Mirrors the recursive discovery the app uses, so the hygiene tools and the
+    downloader agree on what a song is. Folders whose names start with any of
+    skip_prefixes (the review folders these tools create) are never entered,
+    nor are symlinked directories -- a symlink pointing back up the tree would
+    otherwise recurse forever. A song folder is never descended into either: a
+    song does not contain other songs, and its stems must not be mistaken for
+    a nested library.
+    """
+    try:
+        entries = sorted(p for p in Path(home_folder).iterdir() if p.is_dir())
+    except OSError:
+        return
+    for folder in entries:
+        if folder.name.startswith(skip_prefixes) or folder.is_symlink():
+            continue
+        if looks_like_song_folder(folder):
+            yield folder
+        else:
+            yield from iter_song_folders(folder, skip_prefixes)
 
 
 def find_song_audio(song_dir):

@@ -238,6 +238,32 @@ def scan_song_folder_audio_stems(song_dir):
 STEM_DURATION_TOLERANCE_MS = MID_DURATION_TOLERANCE_MS
 
 
+def _apply_renames_atomically(plan):
+    """Apply (source, target) renames, undoing them all if any one fails.
+
+    Returns (completed, None) on success, or (completed, (path, error,
+    unwound)) on failure, where `unwound` says whether every rename that had
+    already landed was successfully put back. Rolling back is itself a file
+    operation and can fail (the same lock that blocked the rename can block
+    the undo), so the caller is told which of the two states it's in rather
+    than being left to assume.
+    """
+    done = []
+    for path, target in plan:
+        try:
+            path.rename(target)
+        except OSError as exc:
+            unwound = True
+            for moved_from, moved_to in reversed(done):
+                try:
+                    moved_to.rename(moved_from)
+                except OSError:
+                    unwound = False
+            return done, (path, exc, unwound)
+        done.append((path, target))
+    return done, None
+
+
 def apply_stem_renames(song_dir, ini_fields, dry_run=False):
     """Rename every unambiguous ID-suffixed audio stem to its literal name.
 
@@ -283,16 +309,41 @@ def apply_stem_renames(song_dir, ini_fields, dry_run=False):
             continue  # already literal, nothing to do for this role
 
         if role == 'song':
-            expected_raw = ini_fields.get('song_length')
+            # Two different "can't check" cases here, and they are NOT the same:
+            #
+            #   no song_length / unparseable -> no reference value exists, so
+            #       there is nothing to check against. Fall through: this role
+            #       already passed the check that actually protects it (exactly
+            #       one candidate), and treating a missing ini field as grounds
+            #       to relocate would sweep out large numbers of otherwise-fine
+            #       folders. Deliberate -- see the test named for it.
+            #
+            #   song_length present but ffprobe can't read the file -> we have
+            #       a reference value, tried to verify against it, and failed.
+            #       That is verification attempted-and-failed, not verification
+            #       unavailable, and a 'song' stem ffprobe cannot decode is
+            #       itself a reason for suspicion. Block. (This one used to
+            #       fall through with the rest, so the presence of a real check
+            #       silently bought nothing whenever the probe errored.)
+            #
+            # Contrast verify_chart_content_match()'s .mid branch, which fails
+            # closed on all three: there the duration IS the only evidence,
+            # because a .mid carries no name/artist text to compare instead.
             expected_ms = None
+            expected_raw = ini_fields.get('song_length')
             if expected_raw:
                 try:
                     expected_ms = int(str(expected_raw).strip())
                 except ValueError:
-                    expected_ms = None  # unparseable -- fall through, don't block over a bad ini field
+                    expected_ms = None  # unparseable -- no usable reference value
             if expected_ms is not None:
                 actual_ms = library_common.probe_audio_duration_ms(path)
-                if actual_ms is not None and abs(actual_ms - expected_ms) > STEM_DURATION_TOLERANCE_MS:
+                if actual_ms is None:
+                    blocked.append(
+                        f'{path.name}: song_length says {expected_ms}ms but ffprobe could '
+                        f'not read the file to check it')
+                    continue
+                if abs(actual_ms - expected_ms) > STEM_DURATION_TOLERANCE_MS:
                     blocked.append(
                         f'{path.name}: duration {actual_ms}ms differs from song_length '
                         f'{expected_ms}ms by {abs(actual_ms - expected_ms)}ms')
@@ -304,9 +355,21 @@ def apply_stem_renames(song_dir, ini_fields, dry_run=False):
             continue
         plan.append((path, target))
 
-    if not dry_run:
-        for path, target in plan:
-            path.rename(target)
+    if not dry_run and plan:
+        done, failure = _apply_renames_atomically(plan)
+        if failure is not None:
+            # Half a rename plan is worse than none of it: Clone Hero needs the
+            # whole set to load the song, and a partially-renamed folder looks
+            # settled to the next run. An ordinary Windows file lock (antivirus
+            # mid-scan, an open Explorer preview) is enough to trigger this, so
+            # undo what landed and report rather than propagating -- an
+            # exception here aborted the entire library scan.
+            failed_path, error, unwound = failure
+            detail = f'{failed_path.name}: rename failed ({error})'
+            if not unwound:
+                detail += (f'; could not undo {len(done)} earlier rename(s) in this '
+                           f'folder -- it is left partially renamed, fix by hand')
+            return {'status': 'needs_review', 'detail': detail}
 
     parts = []
     if plan:
@@ -571,6 +634,7 @@ def scan_and_fix_chart_library(home_folder, dry_run=False):
     (e.g. the GUI) can build its own summary without re-parsing printed
     output.
     """
+    library_common.make_console_encoding_safe()
     print('=' * 70)
     print('SCANNING CHART FILE NAMING' + (' (DRY RUN)' if dry_run else ''))
     print('=' * 70)
@@ -578,22 +642,30 @@ def scan_and_fix_chart_library(home_folder, dry_run=False):
     counts = {}
     needs_review = []
 
-    for folder in sorted(Path(home_folder).iterdir()):
-        if not folder.is_dir() or folder.name.startswith('_'):
-            continue
+    # Recursive discovery, matching the app's own **/song.ini scan. Walking a
+    # single level treated each PACK folder of a nested library as a song
+    # folder with no .ini and relocated the whole pack -- see the discovery
+    # note in library_common.
+    for folder in library_common.iter_song_folders(home_folder):
+        # nested libraries make bare folder.name ambiguous (two packs can both
+        # contain "Intro"), so report the path relative to the library root
+        try:
+            label = str(folder.relative_to(home_folder))
+        except ValueError:
+            label = folder.name
 
         result = process_song_folder_for_chart_rename(folder, home_folder, dry_run=dry_run)
         counts[result['status']] = counts.get(result['status'], 0) + 1
 
         if result['status'] == 'needs_review':
-            needs_review.append((folder.name, result['detail']))
-            print(f"  NEEDS REVIEW: {folder.name}: {result['detail']}")
+            needs_review.append((label, result['detail']))
+            print(f"  NEEDS REVIEW: {label}: {result['detail']}")
         elif result['status'] == 'confirmed_ok' and ' -> ' in result['detail']:
             # ' -> ' only appears in process_chart_folder_names()'s detail
             # when an actual rename happened -- an already-literal folder's
             # detail is just the filenames (no arrow) and shouldn't be
             # logged as if something were renamed
-            print(f"  Renamed: {folder.name}: {result['detail']}")
+            print(f"  Renamed: {label}: {result['detail']}")
 
     print()
     print(
