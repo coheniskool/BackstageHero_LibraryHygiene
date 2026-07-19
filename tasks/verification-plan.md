@@ -557,6 +557,42 @@ that the duration floor behaves.
       scans now report songs from inside packs. Before Phase 2.5 a flat scan found **zero**
       songs there, and `chart_rename` would have relocated whole packs.
 
+### Phase 4 results so far (2026-07-19)
+
+**Nothing destructive has run.** The app log contains no move, rename, removal or
+conversion for the whole session -- dry runs only, real library untouched.
+
+**4b, static-art detector, validated on real data for the first time.** All 434 videos in
+`M:\_Organized\Songs` probed read-only (`probe_static_video` directly; the conversion
+function was never called, not even with `dry_run=True`):
+
+| | count | measured cell delta |
+|---|---|---|
+| would convert | 97 | **0 .. 4** |
+| would keep | 337 | **50 .. 255** |
+| threshold | | **14** |
+
+**Nothing at all scored between 5 and 49.** The populations are sharply bimodal with a wide
+empty gap, so the threshold could sit anywhere in 5..49 and classify this library
+identically. That is a far stronger result than the synthetic fixtures gave, and it
+retroactively confirms the Phase 3 change from 24 -> 14 was safe in both directions.
+Worst case on the convert side is `Quiet Company - How Do You Do It` at cell delta 4, still
+3.5x clear of the line. Full per-song report:
+`C:\Users\aaron\AppData\Local\Temp\static_art_dryrun_report.csv`.
+
+97 of 434 videos (22%) are static album art -- the disk saving this feature exists for.
+
+**Two real bugs found by the real library that no fixture would have produced:**
+
+- `_Weird Al_ Yankovic - White & Nerdy` is a genuine song whose folder starts with `_`
+  (the quotes in the artist name became underscores). Discovery skipped any `_`-prefixed
+  folder, so it was invisible to every hygiene tool, silently. Fixed in `abcc554`;
+  discovery now matches review folders by name. 5245 song folders now found.
+- The predecessor's `_NeedsReview` folder and a `Has video: no` row sitting next to a
+  visible `video.webm`. Fixed in `0a70016`.
+
+**Still outstanding**: 4c, the in-game sync playtest. Nothing else can substitute for it.
+
 ### What to send back
 Logs over screenshots, as above. The useful bundle is:
 `launch_log.txt`, `%LOCALAPPDATA%\BackstageHero\log.txt`, the before/after tree diff,

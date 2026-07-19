@@ -110,6 +110,19 @@ STATIC_LOOSE_DISTANCE = 10
 # small logo bug, an 8px blinking dot at 1080p) still scores below 14 and will
 # convert. Detecting that reliably needs a finer measure than a 32x32 grid, and
 # the README says so rather than promising otherwise.
+#
+# Validated on real data (2026-07-19), which the numbers above were not: all
+# 434 videos in a real 5,130-song library were probed read-only. The result is
+# sharply bimodal with a wide empty gap, not a judgement call near a line:
+#
+#     would convert   97 videos   cell delta   0 ..   4
+#     would keep     337 videos   cell delta  50 .. 255
+#     nothing whatsoever scored between 5 and 49
+#
+# So the threshold could sit anywhere in 5..49 and classify this library
+# identically; 14 is comfortably inside that gap, 3.5x above the worst video it
+# converts and 3.5x below the tamest it keeps. Real static album-art uploads
+# genuinely are near-perfectly still, and real footage genuinely is not.
 STATIC_GRID = 32
 STATIC_MAX_CELL_DELTA = 14
 
