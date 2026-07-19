@@ -4,7 +4,12 @@ rem attempting the real launch, since the exact same absolute-path
 rem pythonw.exe binary works when tested from the dev session but fails
 rem with ModuleNotFoundError when double-clicked for real -- something
 rem about the environment itself differs, not the interpreter or the path.
-cd /d "C:\Users\aaron\Claude and Projects\Projects\BackstageHero_LibraryHygiene"
+rem %~dp0 is the folder this .bat lives in. It used to be a hardcoded absolute
+rem path to the main checkout, which meant a copy sitting in a git worktree
+rem silently launched the OTHER checkout's code -- so testing a branch by
+rem double-clicking its own launcher actually tested main. Relative keeps the
+rem launcher honest about which code it is starting.
+cd /d "%~dp0"
 
 echo ==== launch at %DATE% %TIME% ==== > launch_log.txt
 echo --- env vars --- >> launch_log.txt

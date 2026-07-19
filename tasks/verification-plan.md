@@ -443,13 +443,42 @@ list, and let `chart_rename` reach both nested songs afterwards. A second run re
 output is the evidence to reason over. Diagnosing a real-library failure from log text is
 high-stakes inference, not pattern matching.
 
+> **Read this before starting -- updated 2026-07-19.** Two things about the code under test
+> changed since this phase was written, and one of them would have invalidated the whole
+> session:
+>
+> 1. **All the work is on `claude/backstage-hero-library-hygiene-1d83f9`. `main` is still at
+>    upstream `5b69ae5` and contains none of it.** Run Phase 4 from the worktree, or merge
+>    first -- but do not assume double-clicking something in the main folder is testing this.
+> 2. **`Launch BackstageHero.bat` used to `cd` to a hardcoded absolute path** (the main
+>    checkout) before running `gui.py`, so the copy inside the worktree launched *main's*
+>    code. Now fixed to `cd /d "%~dp0"`, i.e. whatever folder the launcher itself is in.
+>    **4a is only meaningful with that fix in place** -- otherwise it re-tests upstream.
+> 3. Since this phase was written the tool count went four -> six, `static_art`'s threshold
+>    was re-derived (24 -> 14) and has never run against real videos, and the library now
+>    exports a CSV that makes most of 4c's PowerShell obsolete.
+
+### 4-zero. Migrate the stranded review folders *(do this FIRST)*
+Phase 3 confirmed by execution what 4d was written to find out: songs in the old nested
+`Songs/_needs_review/` are invisible to every repair scan but fully live to the app's song
+list, auto-download and Clone Hero. 4d's premise is therefore already answered -- the folder
+is stranded, and there is now a tool for it.
+
+- [ ] Library Tools -> **Move old review folders out of the library**, **dry run first**.
+      Read what it says it would move. Then run it for real.
+- [ ] Confirm `Songs_needs_review/` now sits **beside** the library, and that
+      `Songs/_needs_review/` is gone.
+- [ ] Confirm the manifest exists: `Songs_needs_review_manifest.jsonl`.
+
 ### 4a. Launcher works from a real double-click
-Regression check on the `pythonw` stdout=None fix.
+Regression check on the `pythonw` stdout=None fix -- which was **rewritten since this plan
+was written** (it now lives in `library_common.ensure_stdio_not_none()`, called from both
+entry points), so this is a check on new code, not a re-run of an old pass.
 ```
-:: Double-click "Launch BackstageHero.bat" from Explorer -- NOT from a terminal.
-:: (A nested shell invocation inherits valid stdio and will not reproduce the bug.)
-:: Then, in PowerShell:
-Get-Content "C:\Users\aaron\Claude and Projects\Projects\BackstageHero_LibraryHygiene\launch_log.txt"
+:: Double-click the "Launch BackstageHero.bat" INSIDE THE WORKTREE, from Explorer --
+:: NOT from a terminal. (A nested shell invocation inherits valid stdio and will not
+:: reproduce the bug.) Then, in PowerShell:
+Get-Content "<WORKTREE>\launch_log.txt"
 ```
 **Expect**: a `==== launch at ... ====` header and **no traceback**, no `exited with code 1`
 until you close the window yourself.
@@ -459,49 +488,80 @@ until you close the window yourself.
 > Do **not** point these at `M:\_Organized` until the dry run has been read and approved.
 > Use a copied subset (as with the Kryptonite folder) or a small test library.
 
+- [ ] Capture the tree **before**:
+      ```powershell
+      Get-ChildItem -Recurse "<COPY>" | Select-Object -Expand FullName | Sort-Object > before.txt
+      ```
 - [ ] `python dedupe_report.py --library-path "<COPY>" --dry-run` -> capture full stdout to a file.
-- [ ] Chart-rename has **no CLI** -- run it from the GUI's Library Tools dialog with dry-run
-      enabled, then read `%LOCALAPPDATA%\BackstageHero\log.txt`.
-- [ ] **Before/after `git`-style diff of the folder tree**: capture
-      `Get-ChildItem -Recurse "<COPY>" | Select-Object FullName` before and after, and diff.
-      A dry run must produce a **zero-line diff** -- this is the empirical proof of 2a's
-      dry-run audit.
+- [ ] Run each of the **six** GUI tools with **dry run left ON** (it is the default):
+      Repair videos, Fix chart names, Enrich metadata, Find duplicates,
+      **Find static album-art videos**, Move old review folders.
+      Then read `%LOCALAPPDATA%\BackstageHero\log.txt`.
+- [ ] Re-capture the tree and diff. A dry run must produce a **zero-line diff**:
+      ```powershell
+      Get-ChildItem -Recurse "<COPY>" | Select-Object -Expand FullName | Sort-Object > after.txt
+      Compare-Object (Get-Content before.txt) (Get-Content after.txt)
+      ```
+      Expect **no output at all** except `backstagehero_library.csv`, which the app writes on
+      every scan by design. Anything else appearing here is a blocker.
+- [ ] **Pay particular attention to "Find static album-art videos".** Its threshold was
+      re-derived from measurement in Phase 3 (24 -> 14) and has **never run against real
+      YouTube downloads** -- only against synthetic ffmpeg fixtures. Read its dry-run list
+      carefully: every song it proposes to convert should be one you agree is just a still
+      cover. Anything on that list with real motion is the single most important finding this
+      phase can produce, and it means **do not run it for real**.
 - [ ] Only then, apply for real on the copy and re-diff. Confirm review folders land as a
       **sibling** (`<name>_needs_review`), never nested inside the scanned root.
 
 ### 4c. Offset verification -- the in-game playtest *(Checkpoint 3, still unchecked)*
 This has never been trustworthy without the game, same discipline as the predecessor project.
 
-- [ ] Pick **at least 3** songs the app auto-synced this run, including one that was
-      fingerprint-confirmed and one that fell back.
-- [ ] Read the written offsets without opening the game:
-      ```powershell
-      Get-ChildItem -Recurse -Filter song.ini "<LIBRARY>" |
-        Select-String -Pattern "video_start_time|song_length|name=" |
-        Out-File offsets_check.txt
-      ```
-- [ ] **Flag every `backstagehero_sync = guess`** -- those songs were never actually matched
-      (the Snow case); they are running on `DEFAULT_START_TIME`, not a measurement. Grep the
-      marker, *not* the `-3000` value: a real measurement can legitimately land on `-3000`,
-      which is precisely why the marker exists.
-      ```powershell
-      Select-String -Path (Get-ChildItem -Recurse -Filter song.ini "<LIBRARY>").FullName `
-        -Pattern "backstagehero_sync\s*=\s*guess" | Out-File guesses.txt
-      ```
-      Expect songs listed here to be the *only* ones out of sync in 4c. If a song marked
-      `measured` is visibly out of sync in-game, that is a genuine audiosync bug and the most
-      valuable finding this whole plan can produce -- report it with the song name.
-- [ ] Load each song in Clone Hero and confirm the video is genuinely in sync. Report
-      *perceived* drift direction and rough magnitude for any that are off -- sign errors are
-      the classic failure here, and `tests/test_audiosync_sign.py` only covers the synthetic case.
+**The PowerShell that used to live here is obsolete.** The app now writes
+`backstagehero_library.csv` into the Songs folder on every scan, with an **Offset source**
+column -- exactly the data those greps were reconstructing. Open it in Excel and sort on
+that column instead.
 
-### 4d. Real-library smoke on the two unreplayed fixes
-- [ ] Re-run chart-rename against the **real Kryptonite folder** still sitting in the OLD
-      nested `_needs_review` location -- confirm the sibling-folder fix handles pre-existing
-      nested state, or confirm it's stranded (per Phase 3).
+- [ ] Open `<LIBRARY>\backstagehero_library.csv`, sort by **Offset source**.
+      - `measured` -- audiosync fingerprint-matched this exact video.
+      - `community` -- offset came from the resolver pool.
+      - `guess`  -- **never matched at all**; running on `DEFAULT_START_TIME` (the Snow case).
+      - `manual` -- you set it by hand; the resync sweep now leaves these alone.
+- [ ] Pick **at least 3** songs to play, deliberately mixed: one `measured`, one `guess`, and
+      one `manual` if you have one.
+- [ ] Load each in Clone Hero and confirm the video is genuinely in sync. Report *perceived*
+      drift direction and rough magnitude for any that are off -- sign errors are the classic
+      failure here, and `tests/test_audiosync_sign.py` only covers the synthetic case.
+- [ ] **The result that matters most**: a song marked `measured` that is visibly out of sync
+      is a genuine audiosync bug and the most valuable finding this whole plan can produce.
+      Report it with the song name. A `guess` being out of sync is expected, not a bug --
+      that marker exists precisely so the two can be told apart.
+- [ ] While you are in there, try the two new controls on a song you know is wrong:
+      right-click -> **Adjust sync offset** (confirm it now goes past -30s, and that typing an
+      exact value works), and right-click -> **Dump this video** on anything that turns out to
+      be the wrong song entirely. After dumping, re-run a download for that song and confirm
+      from `log.txt` that it does **not** come back with the same upload
+      (`Skipping N previously dumped result(s)`).
+
+### 4d. Real-library smoke on the unreplayed fixes
+The original first item here -- "confirm the sibling-folder fix handles pre-existing nested
+state, or confirm it's stranded" -- **was answered in Phase 3 by execution: it is stranded.**
+4-zero above is the fix. What remains is confirming the migration worked on real data and
+that the duration floor behaves.
+
+- [ ] After 4-zero, re-run **Fix chart names** and confirm the migrated Kryptonite folder is
+      now *reachable* (it should appear in the scan counts, where before it was invisible).
 - [ ] Run one full download cycle on 2-3 songs with no video and confirm from `log.txt` that
       the duration floor either attaches a plausible video or attaches **nothing** -- never an
       unrelated one. (This is the Green Day/Kryptonite failure mode.)
+- [ ] Nested-library check, if any part of your library is `Songs/<Pack>/<Song>/`: confirm the
+      scans now report songs from inside packs. Before Phase 2.5 a flat scan found **zero**
+      songs there, and `chart_rename` would have relocated whole packs.
+
+### What to send back
+Logs over screenshots, as above. The useful bundle is:
+`launch_log.txt`, `%LOCALAPPDATA%\BackstageHero\log.txt`, the before/after tree diff,
+`backstagehero_library.csv`, and the dedupe dry-run stdout -- plus, in your own words, which
+songs were out of sync in-game and what their **Offset source** column said.
 
 ---
 
