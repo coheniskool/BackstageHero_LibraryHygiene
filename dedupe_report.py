@@ -132,10 +132,21 @@ def confirm_group(candidate_group):
     different underlying recordings.
 
     Returns a list of confirmed folders, or [] if fewer than two folders in
-    the group are confirmed to match each other, if fingerprinting is
+    the group are confirmed to match each other, if fingerprint comparison is
     unavailable, or if any fingerprint call fails -- never raises.
+
+    acoustid.compare_fingerprints() hard-requires the native Chromaprint
+    library (acoustid.have_chromaprint) -- a separate binary from fpcalc that
+    this project's documented fpcalc-only install never provides, so calling
+    it raises ModuleNotFoundError unconditionally in that (normal) state.
+    That's checked once up front rather than per-pair, so the report says
+    plainly that comparison is unavailable instead of printing what looks
+    like a one-off per-folder fingerprint error. (Separately: even with
+    have_chromaprint available, this project hasn't yet validated that the
+    comparison is reliable on Clone Hero chart audio -- see tasks/todo.md --
+    so this only actually runs in a future state where that's been done.)
     """
-    if acoustid is None:
+    if acoustid is None or not getattr(acoustid, 'have_chromaprint', False):
         return []
 
     fingerprints = []
@@ -308,6 +319,11 @@ def generate_dedupe_report(home_folder, dry_run=False):
     if acoustid is None:
         print('WARNING: audio fingerprinting is unavailable (see dependency warning above) -- '
               'no group can be confirmed.')
+    elif not getattr(acoustid, 'have_chromaprint', False):
+        print('WARNING: audio fingerprint COMPARISON is unavailable -- acoustid.compare_fingerprints() '
+              'needs the native Chromaprint library (a separate binary from fpcalc), which this install '
+              "does not have. No group can be confirmed until that's resolved -- candidate groups below "
+              'are reported for your own manual review only; nothing gets moved.')
     print()
 
     resolved = 0

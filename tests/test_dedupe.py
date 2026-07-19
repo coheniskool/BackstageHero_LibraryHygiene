@@ -13,6 +13,8 @@ def _make_song(root, name, ini_text='[song]\nname = Test\nartist = Test Artist\n
 
 
 class _FakeAcoustidMatching:
+    have_chromaprint = True
+
     @staticmethod
     def fingerprint_file(path):
         return (180, 'FAKEPRINT')
@@ -67,6 +69,34 @@ def test_confirm_group_returns_empty_when_acoustid_unavailable(tmp_path, monkeyp
     assert dr.confirm_group([a]) == []
 
 
+def test_confirm_group_returns_empty_when_chromaprint_native_lib_unavailable(tmp_path, monkeypatch):
+    """Regression: acoustid.compare_fingerprints() raises unconditionally when
+    acoustid.have_chromaprint is False -- the normal state for this project's
+    documented fpcalc-only install (fpcalc has no bearing on have_chromaprint;
+    that needs a separate native Chromaprint library). confirm_group() must
+    check this up front and bail out cleanly rather than let every per-pair
+    comparison call raise and get silently swallowed one at a time."""
+    class _FakeAcoustidNoNativeLib:
+        have_chromaprint = False
+
+        @staticmethod
+        def fingerprint_file(path):
+            return (180, 'FAKEPRINT')
+
+        @staticmethod
+        def compare_fingerprints(fp1, fp2):
+            raise ModuleNotFoundError('function needs chromaprint')
+
+    a = _make_song(tmp_path, 'Song A')
+    b = _make_song(tmp_path, 'Song B')
+    (a / 'song.ogg').write_bytes(b'x')
+    (b / 'song.ogg').write_bytes(b'x')
+
+    monkeypatch.setattr(dr, 'acoustid', _FakeAcoustidNoNativeLib())
+
+    assert dr.confirm_group([a, b]) == []
+
+
 def test_confirm_group_confirms_matching_fingerprints(tmp_path, monkeypatch):
     a = _make_song(tmp_path, 'Song A')
     b = _make_song(tmp_path, 'Song B')
@@ -85,6 +115,8 @@ def test_confirm_group_rejects_dissimilar_fingerprints(tmp_path, monkeypatch):
     (b / 'song.ogg').write_bytes(b'x')
 
     class _FakeAcoustidMismatch:
+        have_chromaprint = True
+
         @staticmethod
         def fingerprint_file(path):
             return (180, 'FAKEPRINT')

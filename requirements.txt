@@ -7,4 +7,9 @@ python-mpv>=1.0.7   # embedded sync-editor preview; needs libmpv-2.dll alongside
 requests>=2.31       # chorus_client.py: Chorus Encore metadata lookups (enrichment, dedupe)
 pyacoustid>=1.3.0   # dedupe_report.py: audio fingerprinting -- also needs the fpcalc binary
                      # (official AcoustID/Chromaprint release) on PATH; without it, dedupe
-                     # still runs and reports candidate groups, but confirms/moves nothing
+                     # still runs and reports candidate groups, but confirms/moves nothing.
+                     # fpcalc alone is NOT enough to confirm/move anything either: comparing
+                     # two fingerprints needs the separate native Chromaprint library, which
+                     # the standard fpcalc-only install doesn't provide, and which this project
+                     # hasn't yet validated as reliable on Clone Hero chart audio in any case
+                     # (see tasks/todo.md) -- dedupe currently only ever reports candidates.
