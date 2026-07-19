@@ -612,6 +612,96 @@ evidence into one commit decision is the integration step, and it owns the final
 - [ ] Update `tasks/todo.md` -- tick Checkpoint 3 only if 4c actually happened in-game.
 - [ ] Write the commit message covering the merge honestly, including what remains unverified.
 
+### Phase 5 outcome (2026-07-19) -- GO, with what remains unverified stated
+
+**Suite: 358 passed, 0 skipped, across 20 test files. Baseline was 185.**
+
+#### The four explicit blockers, checked
+
+| # | Blocker | Status |
+|---|---|---|
+| 1 | `HANDOFF.md` / `launch_log.txt` staged | **Clear.** Neither is tracked; both are in `.gitignore`, along with `__pycache__/` and `.pytest_cache/`. Working tree clean. |
+| 2 | Any dry run producing a non-zero filesystem diff | **Clear.** Verified three times on real trees: nested-library scan, migration against a copy of the real library, and the six-tool sweep. Zero-line diffs every time, on a cp1252 console. |
+| 3 | Any Station-3 finding from 2a with no fix and no test | **Clear.** All four 2a findings fixed with tests proven red-on-revert. `_apply_renames_atomically` and `make_console_encoding_safe` are covered through their callers rather than by name. |
+| 4 | Checkpoint 3 (4c) not performed | **PERFORMED.** The in-game playtest happened and produced the single most valuable finding of the whole plan. Long-standing; no longer outstanding. |
+
+#### What the in-game playtest found, and why it was worth the whole exercise
+
+> "ALMOST ALL OF THE MEASURED VIDEOS ARE LYRIC VIDEOS, GUITAR HERO/ROCKBAND VIDEOS.
+>  Learn to Live had a real video but the offset was wrong"
+
+Not a sync bug. **Fingerprinting confirms the audio and is blind to the picture.** A
+lyric video, a Rock Band capture and the official music video carry identical audio, so
+audiosync confirms all three and stamps `measured` on each. `measured` means "the audio
+lines up" -- which the plan, the code and this document had all been reading as "this one
+is good". Nothing in `select_video` had ever looked at what kind of video a candidate was,
+despite the title being fetched and then used only for display.
+
+Fixed by ranking on (duration, kind, search order) and by recording the attached video's
+title so the library can be audited. Measured over 358 real videos: 26% are not music
+videos at all (66 gameplay, 14 lyric, 12 audio-only).
+
+#### Findings that only real data produced
+
+Five bugs surfaced **after Phases 2 and 3 had signed off**, every one from pointing the
+code at the real library rather than a fixture. The pattern is the point:
+
+| Finding | The fixture that hid it |
+|---|---|
+| Candidate kind never judged | No test ever asserted anything about a candidate's title |
+| `select_video`'s early returns did no filtering at all | Tests only covered the fingerprint path |
+| Resync's "zero network requests" path never applies to our own downloads | Verified by **muxing synthetic audio into an MP4** -- a shape the downloader never produces |
+| `_Weird Al_ Yankovic` invisible to every tool | No fixture had a song folder starting with `_` |
+| Predecessor's `_NeedsReview` folder unmigrated | Fixtures used this project's spelling only |
+
+Plus one caught by the revert discipline alone: the first unicode test **passed without its
+fix**, because its fixture songs never printed their own names.
+
+**This is the honest lesson of the exercise.** Phases 2 and 3 were thorough -- five parallel
+reviewers, two adversarial passes, every finding remediated with red-on-revert tests -- and
+they still could not see any of the above, because they were reasoning about the same
+fixtures the code was written against. A green suite measures agreement between code and
+fixtures. Only real data measures agreement between code and the world.
+
+Two of the adversarial agents also ran **without an execution tool** and said so; re-testing
+their findings by hand changed several verdicts and demoted two. Agent findings are
+hypotheses.
+
+#### Verified against the real 5,130-song library
+
+- **static-art detector**, the only feature that deletes files: all 434 videos probed
+  read-only. Convert side 0-4, keep side 50-255, threshold 14, **nothing between 5 and 49**.
+  Sharply bimodal, so the threshold could sit anywhere in that gap and behave identically.
+- **Discovery**: 5,245 song folders found, including the `_`-prefixed one that was invisible.
+- **Migration**: dry-run zero-diff, real run moved only the intended folders, manifest written.
+- **Title backfill**: 358 songs, 0 lookup failures, 242 ids recovered from the predecessor's
+  `video_meta.json` -- without which most of the library could not have been audited at all.
+
+#### What remains genuinely unverified
+
+- **In-game sync was spot-checked, not swept.** A handful of songs were played. The
+  `measured`-but-wrong case (`Learn to Live`) was hand-fixed before it could be diagnosed,
+  so the original computed offset is gone and that specific failure is unexplained.
+- **199 of 358 videos remain `unknown`** by kind. 148 are plain `Artist - Title`, which
+  genuinely carries no signal; the rest may hide gameplay captures with plain titles.
+- **27 songs have no recoverable video id**, so they cannot be audited without re-downloading.
+- **266 videos predate this app** and were never filtered by anything.
+- **The new kind-ranking has never run a real download.** It is tested and measured against
+  real titles, but no song has been downloaded through it end to end.
+- **`fpcalc` is present but pyacoustid cannot load chromaprint** on this machine, so the
+  dedupe confirm path has never executed. Its "fails closed" behaviour is environmental
+  luck here, not a demonstrated guard.
+- **Cross-volume `move_to_review`** (the `M:` drive case) is still untested on real data.
+
+#### Verdict
+
+**GO.** All four blockers are clear, Checkpoint 3 is done, and every finding has a fix and a
+test. The commit message must carry the unverified list above -- particularly that in-game
+sync was spot-checked rather than swept, and that the kind-ranking has not yet driven a real
+download.
+
+---
+
 ### Explicit commit blockers
 1. `HANDOFF.md` or `launch_log.txt` still staged.
 2. Any dry run that produced a non-zero filesystem diff.

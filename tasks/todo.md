@@ -18,7 +18,31 @@ See [`plan.md`](plan.md) for full detail, acceptance criteria, and verification 
 ## Phase 2 — Surface & finish
 - [x] **Task 8** — GUI "Library Tools" panel: Repair videos / Fix chart names / Enrich metadata / Find duplicates (threaded, dry-run toggles, progress + summary). Verified: widget tree constructs (real Tk instantiation, not just import), and all four tool workers run end-to-end against a real temp library.
 - [x] **Task 9** — `requirements.txt` (+`requests`, `pyacoustid`; note `fpcalc`), README updated (Library Tools section, "What's different in this fork", credit to `jmb988`/MIT preserved).
-- [ ] **▶ CHECKPOINT 3** — **Requires the user's own environment** (real Clone Hero library + Clone Hero itself installed) -- not something achievable from this session. Two things specifically need a human: (1) click through the actual running app against a real library, not just the synthetic smoke tests already run here; (2) the **required in-game sync playtest** -- load at least one auto-synced song in Clone Hero and confirm the video is actually in sync. An offset write has never been trustworthy until confirmed in-game, same discipline as the predecessor project.
+- [x] **▶ CHECKPOINT 3 — DONE 2026-07-19.** Both halves happened: the app was driven against
+      the real `M:\_Organized\Songs` library (3,909 songs), and the **in-game sync playtest
+      was performed in Clone Hero**.
+
+      **What it found — the most valuable result of the entire verification effort.** The
+      offsets were largely right; the *videos* were wrong. Almost every fingerprint-confirmed
+      (`measured`) song had a lyric video or Rock Band / Guitar Hero gameplay capture attached.
+      Fingerprinting confirms the AUDIO matches and is completely blind to the picture, so a
+      lyric video, a gameplay capture and the official music video are indistinguishable to it
+      and all three get stamped `measured`. Nothing in `select_video` had ever examined what
+      kind of video a candidate was, even though the title was fetched and then used only for
+      display. Fixed by ranking on (duration, kind, search order); 26% of 358 real videos
+      measured as not-music-videos.
+
+      Two more bugs came out of chasing the one `measured`-but-wrong song: `select_video`'s
+      early-return paths did no filtering whatsoever, and `process_resync`'s documented
+      "zero network requests" shortcut never applied to this app's own downloads (they carry
+      no audio track — it had been verified by muxing synthetic audio into a test MP4, a shape
+      the downloader never produces).
+
+      **Still outstanding within 4c**: sync was spot-checked, not swept. The one
+      `measured`-but-wrong song (`Learn to Live`) was hand-fixed before it could be diagnosed,
+      so that specific failure remains unexplained.
+
+- [x] ~~**▶ CHECKPOINT 3** — **Requires the user's own environment**~~ (real Clone Hero library + Clone Hero itself installed) -- not something achievable from this session. Two things specifically need a human: (1) click through the actual running app against a real library, not just the synthetic smoke tests already run here; (2) the **required in-game sync playtest** -- load at least one auto-synced song in Clone Hero and confirm the video is actually in sync. An offset write has never been trustworthy until confirmed in-game, same discipline as the predecessor project.
 
 ---
 
