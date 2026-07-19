@@ -242,28 +242,55 @@ def looks_like_song_folder(folder):
     return False
 
 
-def iter_song_folders(home_folder, skip_prefixes=('_',)):
+def is_review_folder_name(name):
+    """True for a folder these tools created to hold songs pulled out for review.
+
+    Matched by NAME, never by a leading-underscore rule. That rule looked
+    tidy and was wrong: a real 5,130-song library turned out to contain
+    `_Weird Al_ Yankovic - White & Nerdy` -- a perfectly good song whose
+    folder starts with an underscore only because the quotes in
+    "Weird Al" Yankovic became underscores when it was named. Under the
+    prefix rule every hygiene tool silently skipped it, so a genuine song was
+    invisible to repair, enrichment and dedupe alike with nothing to indicate
+    it had been passed over.
+
+    Two shapes count: the legacy names that used to sit inside the library,
+    and the current sibling naming (`Songs_needs_review`), which lands inside
+    the scanned root whenever the user points the tools one level higher.
+    """
+    lowered = name.lower()
+    if lowered in {n.lower() for n in LEGACY_REVIEW_FOLDER_NAMES}:
+        return True
+    return lowered.endswith(('_needs_review', '_duplicates_review'))
+
+
+def iter_song_folders(home_folder, skip_names=None):
     """Yield every song folder under home_folder, at any depth, sorted.
 
     Mirrors the recursive discovery the app uses, so the hygiene tools and the
-    downloader agree on what a song is. Folders whose names start with any of
-    skip_prefixes (the review folders these tools create) are never entered,
-    nor are symlinked directories -- a symlink pointing back up the tree would
-    otherwise recurse forever. A song folder is never descended into either: a
-    song does not contain other songs, and its stems must not be mistaken for
-    a nested library.
+    downloader agree on what a song is. Review folders are never entered (see
+    is_review_folder_name), nor are symlinked directories -- a symlink
+    pointing back up the tree would otherwise recurse forever. A song folder
+    is never descended into either: a song does not contain other songs, and
+    its stems must not be mistaken for a nested library.
+
+    skip_names, when given, replaces the review-folder test entirely; it
+    exists for callers that know exactly what they want excluded.
     """
+    extra = {n.lower() for n in skip_names} if skip_names is not None else None
     try:
         entries = sorted(p for p in Path(home_folder).iterdir() if p.is_dir())
     except OSError:
         return
     for folder in entries:
-        if folder.name.startswith(skip_prefixes) or folder.is_symlink():
+        skip = (folder.name.lower() in extra if extra is not None
+                else is_review_folder_name(folder.name))
+        if skip or folder.is_symlink():
             continue
         if looks_like_song_folder(folder):
             yield folder
         else:
-            yield from iter_song_folders(folder, skip_prefixes)
+            yield from iter_song_folders(folder, skip_names)
 
 
 def find_song_audio(song_dir):

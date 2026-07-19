@@ -287,6 +287,42 @@ def test_text_utf8_replaces_undecodable_bytes_instead_of_raising():
     assert 'ok' in result.stdout and 'end' in result.stdout
 
 
+def test_a_song_whose_name_starts_with_an_underscore_is_not_skipped(tmp_path):
+    """Found in the user's real 5,130-song library during Phase 4:
+    `_Weird Al_ Yankovic - White & Nerdy` is a genuine song -- the underscores
+    are what the quotes in "Weird Al" Yankovic became when the folder was
+    named. The leading-underscore skip rule made it, and any song like it,
+    invisible to every hygiene tool with nothing to say it had been passed
+    over."""
+    home = tmp_path / 'Songs'
+    home.mkdir()
+    _song(home / '_Weird Al_ Yankovic - White & Nerdy', 'White & Nerdy')
+    _song(home / 'Normal Song', 'Normal Song')
+
+    found = sorted(p.name for p in library_common.iter_song_folders(home))
+
+    assert found == ['Normal Song', '_Weird Al_ Yankovic - White & Nerdy']
+
+
+@pytest.mark.parametrize('name', [
+    '_needs_review', '_NeedsReview', '_duplicates_review', '_DuplicatesReview',
+    'Songs_needs_review', 'Library Test_duplicates_review',
+])
+def test_actual_review_folders_are_still_skipped(tmp_path, name):
+    """The sibling names matter too: point the tools one level above the
+    library and `Songs_needs_review` sits inside the scanned root, where
+    re-processing songs already pulled out for review would undo the point of
+    pulling them out."""
+    home = tmp_path / 'Root'
+    home.mkdir()
+    _song(home / name / 'Some Song', 'Some Song')
+    _song(home / 'Real Song', 'Real Song')
+
+    found = [p.name for p in library_common.iter_song_folders(home)]
+
+    assert found == ['Real Song']
+
+
 def test_a_folder_holding_only_a_video_still_counts_as_a_song_folder(tmp_path):
     """video_repair's whole job is folders that have a video, including ones
     whose chart files are missing or misnamed."""
