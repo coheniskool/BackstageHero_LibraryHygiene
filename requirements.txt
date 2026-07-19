@@ -4,3 +4,7 @@ numpy>=1.21
 customtkinter>=5.2.0
 pillow>=9.0          # header logo / splash rendering
 python-mpv>=1.0.7   # embedded sync-editor preview; needs libmpv-2.dll alongside
+requests>=2.31       # chorus_client.py: Chorus Encore metadata lookups (enrichment, dedupe)
+pyacoustid>=1.3.0   # dedupe_report.py: audio fingerprinting -- also needs the fpcalc binary
+                     # (official AcoustID/Chromaprint release) on PATH; without it, dedupe
+                     # still runs and reports candidate groups, but confirms/moves nothing

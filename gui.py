@@ -3,6 +3,23 @@
 
 import os
 import sys
+
+# pythonw.exe (no console attached -- a plain double-click launch, or this
+# project's own "Launch BackstageHero.bat") sets sys.stdout/stderr to None,
+# not just closed. The first print() or warnings.warn() call anywhere in
+# this app or a dependency then crashes immediately with no visible error,
+# no window, nothing -- confirmed the hard way (2026-07-18): it looked fine
+# invoked through a shell that happened to inherit real stdio handles, but
+# failed silently on a genuine Explorer double-click. Redirect to a discard
+# sink before any other import runs, matching this codebase's own existing
+# assumption that print() "goes nowhere" without a console (see
+# VideoDownload._setup_logging()) -- true for a frozen --noconsole build,
+# but not for plain pythonw without this guard.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 import glob
 import logging
 import random
@@ -24,10 +41,15 @@ from VideoDownload import (
     ffmpegAvailable, ffplayPath, audiosync, __version__,
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
     SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution, scan_song,
+    SYNC_MANUAL,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
 import resolver_client
+import video_repair
+import chart_rename
+import metadata_enrichment
+import dedupe_report
 
 log = logging.getLogger('backstagehero')
 
@@ -747,6 +769,207 @@ class UpdateDialog(ctk.CTkToplevel):
                           fg_color='#313244', hover_color='#414160').pack(pady=(8, 0))
 
 
+# (key, label, description) -- each tool scans the whole library and
+# supports dry-run; the description is shown verbatim in the dialog.
+_LIBRARY_TOOLS = (
+    ('repair_videos', 'Repair videos',
+     'Detects variable-frame-rate video and re-encodes it to a constant '
+     'frame rate. Also removes unsupported (non-VP8) WebM files left by '
+     'other tools -- the song then re-downloads on the next run.'),
+    ('fix_chart_names', 'Fix chart names',
+     'Renames ID-suffixed song.ini/notes.chart/audio-stem/album-art files, '
+     'verifying content matches first. Anything unconfirmed is moved to '
+     '_needs_review/, never guessed at.'),
+    ('enrich_metadata', 'Enrich metadata',
+     'Fills blank song.ini fields (year/genre/charter/album) from a '
+     'confident Chorus Encore match. Never overwrites an existing value.'),
+    ('find_duplicates', 'Find duplicates',
+     'Finds duplicate charts of the same song, scores each copy, and moves '
+     'everything but the best-scoring keeper to _duplicates_review/. Never '
+     'deletes anything.'),
+)
+
+
+class LibraryToolsDialog(ctk.CTkToplevel):
+    """Library-wide hygiene scans: video repair, chart-name fixes, metadata
+    enrichment, duplicate detection.
+
+    Each runs the whole library in a background thread so the window stays
+    responsive; the summary shown when it finishes is built from the scan's
+    own returned counts dict, not parsed console output. Only one tool runs
+    at a time -- fix_chart_names and find_duplicates both read/write the
+    same per-folder chart_rename_status, so overlapping runs could race.
+    """
+
+    def __init__(self, parent, songs_folder, on_close=None):
+        super().__init__(parent)
+        self._songs_folder = songs_folder
+        self._on_close = on_close
+        self._running_key = None
+        self._dry_run_vars = {}
+        self._status_labels = {}
+        self._run_buttons = {}
+
+        self.title('Library Tools')
+        self.geometry('600x620')
+        self.minsize(480, 380)
+        self.resizable(True, True)
+        self.configure(fg_color=_BG)
+        self.grab_set()
+        self.protocol('WM_DELETE_WINDOW', self._close)
+        try:
+            ico = _asset_path('icon.ico')
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+
+        self._build()
+        self.after(50, self._center)
+
+    def _build(self):
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self, fg_color='transparent')
+        header.grid(row=0, column=0, sticky='ew')
+        ctk.CTkLabel(header, text='Library Tools',
+                     font=ctk.CTkFont(size=16, weight='bold'),
+                     text_color=_TEXT).pack(padx=20, pady=(18, 2), anchor='w')
+        ctk.CTkLabel(
+            header,
+            text='Each tool scans your whole library. Dry run previews what '
+                 'would happen without changing anything on disk.',
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            wraplength=530, justify='left').pack(padx=20, anchor='w')
+
+        # Scrollable so the window can be resized smaller (or run at a
+        # higher OS text-scaling setting) without any card's content or the
+        # Close button getting clipped off-screen.
+        scroll = ctk.CTkScrollableFrame(self, fg_color='transparent')
+        scroll.grid(row=1, column=0, sticky='nsew', padx=8, pady=(8, 0))
+
+        for key, label, desc in _LIBRARY_TOOLS:
+            card = ctk.CTkFrame(scroll, fg_color='#252540', corner_radius=10)
+            card.pack(fill='x', padx=12, pady=(10, 0))
+
+            top = ctk.CTkFrame(card, fg_color='transparent')
+            top.pack(fill='x', padx=16, pady=(12, 2))
+            ctk.CTkLabel(top, text=label, font=ctk.CTkFont(size=13, weight='bold'),
+                         text_color=_TEXT).pack(side='left')
+
+            dry_var = tk.BooleanVar(value=True)
+            self._dry_run_vars[key] = dry_var
+            ctk.CTkCheckBox(top, text='Dry run', variable=dry_var,
+                            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+                            checkbox_width=16, checkbox_height=16,
+                            checkmark_color=_BG, fg_color=_BLUE,
+                            hover_color='#7aaef8').pack(side='right')
+
+            ctk.CTkLabel(card, text=desc, font=ctk.CTkFont(size=10),
+                         text_color=_SUBTEXT, wraplength=480, justify='left',
+                         anchor='w').pack(fill='x', padx=16, anchor='w')
+
+            row = ctk.CTkFrame(card, fg_color='transparent')
+            row.pack(fill='x', padx=16, pady=(10, 12))
+            status_lbl = ctk.CTkLabel(row, text='Ready', font=ctk.CTkFont(size=10),
+                                      text_color=_SUBTEXT, anchor='w')
+            status_lbl.pack(side='left', fill='x', expand=True)
+            self._status_labels[key] = status_lbl
+
+            run_btn = ctk.CTkButton(row, text='Run', width=90, height=28,
+                                    font=ctk.CTkFont(size=11),
+                                    fg_color='#313244', hover_color='#414160',
+                                    command=lambda k=key: self._run_tool(k))
+            run_btn.pack(side='right')
+            self._run_buttons[key] = run_btn
+
+        ctk.CTkButton(self, text='Close', width=100,
+                      fg_color='transparent', border_width=1,
+                      border_color=_BORDER, hover_color='#30304a',
+                      text_color=_SUBTEXT, font=ctk.CTkFont(size=12),
+                      command=self._close).grid(row=2, column=0, pady=18)
+
+    def _run_tool(self, key):
+        if self._running_key is not None:
+            return
+        dry_run = self._dry_run_vars[key].get()
+        self._running_key = key
+        for btn in self._run_buttons.values():
+            btn.configure(state='disabled')
+        self._status_labels[key].configure(text='Running...', text_color=_BLUE)
+        threading.Thread(target=self._worker, args=(key, dry_run), daemon=True).start()
+
+    def _worker(self, key, dry_run):
+        try:
+            if key == 'repair_videos':
+                counts = video_repair.scan_and_repair_video_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'fix_chart_names':
+                counts = chart_rename.scan_and_fix_chart_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'enrich_metadata':
+                counts = metadata_enrichment.enrich_song_ini_metadata_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'find_duplicates':
+                counts = dedupe_report.generate_dedupe_report(self._songs_folder, dry_run=dry_run)
+            else:
+                counts = {}
+            text = self._format_summary(key, counts, dry_run)
+            color = _GREEN
+        except Exception as e:
+            log.exception('Library tool %s failed', key)
+            text = f'Error: {e}'
+            color = _RED
+        try:
+            # the dialog may have been closed while the scan was running --
+            # scheduling on a destroyed Toplevel raises, so this is a no-op
+            # in that case rather than a crash
+            self.after(0, lambda: self._finish(key, text, color))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_summary(key, counts, dry_run):
+        suffix = ' (dry run)' if dry_run else ''
+        if key == 'repair_videos':
+            body = (f"{counts.get('ok', 0)} ok, {counts.get('reencoded_cfr', 0)} re-encoded, "
+                    f"{counts.get('removed_unsupported_codec', 0)} removed, "
+                    f"{counts.get('reencode_failed', 0)} failed")
+        elif key == 'fix_chart_names':
+            body = (f"{counts.get('confirmed_ok', 0)} confirmed, "
+                    f"{counts.get('needs_review', 0)} need review, "
+                    f"{counts.get('skipped_settled', 0)} already settled")
+        elif key == 'enrich_metadata':
+            body = (f"{counts.get('filled', 0)} filled, {counts.get('no_change', 0)} no change, "
+                    f"{counts.get('no_match', 0)} no match, {counts.get('error', 0)} error(s)")
+        elif key == 'find_duplicates':
+            body = (f"{counts.get('resolved', 0)} resolved, "
+                    f"{counts.get('skipped_all_ineligible', 0)} unscanned, "
+                    f"{counts.get('skipped_not_confirmed', 0)} unconfirmed")
+        else:
+            body = str(counts)
+        return body + suffix
+
+    def _finish(self, key, text, color):
+        self._running_key = None
+        if not self.winfo_exists():
+            return
+        for btn in self._run_buttons.values():
+            btn.configure(state='normal')
+        self._status_labels[key].configure(text=text, text_color=color)
+
+    def _close(self):
+        self.grab_release()
+        self.destroy()
+        if self._on_close:
+            self._on_close()
+
+    def _center(self):
+        self.update_idletasks()
+        pw = self.master.winfo_x() + self.master.winfo_width() // 2
+        ph = self.master.winfo_y() + self.master.winfo_height() // 2
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f'+{pw - w // 2}+{ph - h // 2}')
+
+
 class App(ctk.CTk):
 
     def __init__(self):
@@ -832,9 +1055,13 @@ class App(ctk.CTk):
             folder_row, text='No folder selected',
             font=ctk.CTkFont(size=11), text_color=_SUBTEXT, anchor='e')
         self._folder_lbl.grid(row=0, column=0, padx=(0, 10), sticky='e')
+        ctk.CTkButton(folder_row, text='Library Tools',
+                      width=110, height=28, font=ctk.CTkFont(size=11),
+                      fg_color='#313244', hover_color='#414160',
+                      command=self._open_library_tools).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(folder_row, text='Change folder',
                       width=115, height=28, font=ctk.CTkFont(size=11),
-                      command=self._pick_folder).grid(row=0, column=1)
+                      command=self._pick_folder).grid(row=0, column=2)
 
         # Filter / search bar
         fbar = ctk.CTkFrame(self, fg_color=_SURFACE, corner_radius=0, height=50)
@@ -1314,7 +1541,10 @@ class App(ctk.CTk):
 
     def _open_sync_editor(self, song: Song):
         def on_save(ms: int, share: bool):
-            set_ini_values(song.folder, {'video_start_time': str(ms)})
+            # a hand-set offset outranks anything automatic - mark it so a later
+            # re-sync sweep can be told to leave the user's own work alone
+            set_ini_values(song.folder, {'video_start_time': str(ms),
+                                         'backstagehero_sync': SYNC_MANUAL})
             s_abs = abs(ms) / 1000.0
             if ms < -50:
                 song.status = f'Synced  (−{s_abs:.1f}s intro)'
@@ -1331,6 +1561,16 @@ class App(ctk.CTk):
                     artist, title = read_metadata(song.folder)
                     resolver_client.report(ch, vid, ms, 0.5, artist, title)
         SyncEditor(self, song, on_save=on_save)
+
+    def _open_library_tools(self):
+        if self._running:
+            messagebox.showinfo('Busy', 'Wait for the current download/sync run to finish first.')
+            return
+        if not self._songs_folder:
+            messagebox.showinfo('No folder selected', 'Pick your Songs folder first.')
+            return
+        LibraryToolsDialog(self, self._songs_folder,
+                            on_close=lambda: self._load_library(self._songs_folder))
 
     def _update_buttons(self):
         checked    = [s for s in self._songs if s.checked]

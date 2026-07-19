@@ -1,13 +1,26 @@
+import os
+import sys
+
+# A console-less launch (pythonw.exe, or a --noconsole frozen build without
+# the bootloader's own stdio shim covering every case) sets sys.stdout/
+# stderr to None, not just closed -- the first print() or warnings.warn()
+# anywhere in this module or a dependency then crashes immediately with no
+# visible error. This is the file build.py's PyInstaller invocation
+# actually targets, so the guard belongs here, not only in gui.py. Must run
+# before any other import.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, 'w')
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, 'w')
+
 import configparser
 import glob
 import logging
 import logging.handlers
-import os
 import random
 import re
 import shutil
 import subprocess
-import sys
 import time
 
 # updater goes first so a cached newer yt-dlp gets onto sys.path before yt_dlp loads
@@ -45,6 +58,7 @@ import yt_dlp
 from tqdm import tqdm
 
 import resolver_client
+import video_repair
 
 __version__ = '2.2.0'
 
@@ -95,6 +109,20 @@ BOT_BACKOFF_SECONDS = [60, 180, 420]
 
 # default lead-in when we can't fingerprint-match - most music videos have a few seconds of intro
 DEFAULT_START_TIME = -3000
+
+# How the video_start_time we wrote was arrived at, recorded alongside it as
+# `backstagehero_sync`. Without this, a written offset is unfalsifiable: a real
+# measurement that happens to land near the default is byte-identical to a pure
+# guess, so there's no way to tell which songs are actually synced and which are
+# just running on DEFAULT_START_TIME. (Found the hard way -- a song reported as
+# out of sync turned out to have never been matched at all; its -3000 was the
+# fallback constant, indistinguishable from a measured value on inspection.)
+# Deliberately kept separate from the offset itself so playback is unaffected:
+# the guess is still the best guess, it's just now labelled as one.
+SYNC_MEASURED  = 'measured'    # audiosync fingerprint-matched this exact video
+SYNC_COMMUNITY = 'community'   # offset came from the resolver pool, not measured here
+SYNC_GUESS     = 'guess'       # never measured - DEFAULT_START_TIME fallback
+SYNC_MANUAL    = 'manual'      # user set it by hand in the sync editor
 
 _BOT_SIGNS = ('sign in to confirm', "you're not a bot", 'not a bot',
               'http error 429', 'too many requests')
@@ -430,12 +458,29 @@ def download_video(folder, url, quality, info=None):
         os.replace(tmp, final)
         print('  Video ready')
 
+    # VFR source video causes progressive audio/video desync that a single
+    # static video_start_time offset can't fix -- BackstageHero's own remux
+    # step above doesn't touch frame timing, only the container.
+    repair = video_repair.ensure_playable(final, allow_codec_removal=False)
+    if repair['status'] == 'reencoded_cfr':
+        print('  Video was variable-frame-rate; re-encoded to constant frame rate for sync accuracy')
+    elif repair['status'] == 'reencode_failed':
+        log.warning('CFR re-encode failed for %s', final)
+
 
 def select_video(folder, candidates, sync_ready, target_h=0):
     """Pick the right candidate. With sync available, fingerprints each one against
     the chart audio until we get a confident match.
     Returns (url, title, offset_ms, matched, confidence, info_dict) - info_dict
     is the winner's cached extraction so the download can reuse it, or None.
+    url is None if nothing fingerprint-confirmed AND even the best
+    duration-ranked candidate is implausible for this chart's length -- the
+    caller should leave the song without a video rather than attach a
+    confidently-wrong one. (Real case found in testing: with no confirmed
+    match, the old fallback used the raw top search result with zero
+    duration check at all, and attached a completely unrelated video -- a
+    different artist's static album-art upload -- to a chart it shares no
+    content with.)
 
     target_h is the resolution the user asked for. Among the candidates that
     match the song, a match that actually has that resolution wins; if the first
@@ -458,14 +503,15 @@ def select_video(folder, candidates, sync_ready, target_h=0):
     # anything outright, just tries the believable ones first.
     chart_dur = _chart_duration(folder)
     if chart_dur:
+        def is_plausible(dur):
+            return dur is None or (chart_dur - 25) <= dur <= (chart_dur + 150)
+
         def rank(item):
             i, (_, _, dur) = item
-            if dur is None:
-                return (0, i)
-            plausible = (chart_dur - 25) <= dur <= (chart_dur + 150)
-            return (0 if plausible else 1, i)
+            return (0 if is_plausible(dur) else 1, i)
         ordered = [c for _, c in sorted(enumerate(candidates), key=rank)]
     else:
+        is_plausible = None
         ordered = list(candidates)
 
     best = None   # (url, title, ms, height, conf, vinfo) - best match so far
@@ -497,10 +543,19 @@ def select_video(folder, candidates, sync_ready, target_h=0):
         print(f'  Using best available match ({best[3]}p)')
         return best[0], best[1], best[2], True, best[4], best[5]
 
-    # nothing matched - use top result with default offset
-    url, title = candidates[0][0], candidates[0][1]
-    print('  No confident match - using top result with default offset')
-    return url, title, DEFAULT_START_TIME, False, 0.0, None
+    # nothing fingerprint-confirmed -- fall back to the best duration-ranked
+    # candidate rather than the raw top search result (ordered already puts
+    # a plausible-length candidate first when duration data exists), but
+    # refuse entirely if even that one is implausible: a confidently-wrong
+    # video is worse than no video at all.
+    top_url, top_title, top_dur = ordered[0]
+    if chart_dur and not is_plausible(top_dur):
+        print(f'  No plausible match (best candidate is {top_dur}s vs chart ~{chart_dur:.0f}s) '
+              '- leaving without a video')
+        return None, None, DEFAULT_START_TIME, False, 0.0, None
+
+    print('  No confident match - using best duration-ranked result with default offset')
+    return top_url, top_title, DEFAULT_START_TIME, False, 0.0, None
 
 
 def download_with_fallback(folder, primary_url, candidates, quality, info=None):
@@ -544,8 +599,12 @@ def process_download(folder, song_name, quality, sync_ready, replace):
                 print('  Phase Shift converter file detected - video kept, timing left as-is')
                 return
             offset = hit.get('start_ms')
+            # a resolver hit without a start_ms is a known video but an unknown
+            # offset - the video is trustworthy, the timing is still a guess
+            how = SYNC_COMMUNITY if offset is not None else SYNC_GUESS
             offset = DEFAULT_START_TIME if offset is None else offset
             if not set_ini_values(folder, {'video_start_time': str(offset),
+                                            'backstagehero_sync': how,
                                             'backstagehero_source': hit['video_id']}):
                 raise Exception('song.ini missing [song] section')
             _probe_and_store_resolution(folder)
@@ -569,6 +628,9 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     target_h = int(m.group(1)) if m else 0
     url, vid_title, offset, matched, conf, vinfo = select_video(
         folder, candidates, sync_ready, target_h)
+    if url is None:
+        print('  No video attached - nothing plausible found. Will try again next run.')
+        return
     print('Downloading: ' + vid_title)
 
     # old video stays until new one is fully downloaded, so nothing is left half-done
@@ -586,7 +648,9 @@ def process_download(folder, song_name, quality, sync_ready, replace):
         offset, matched = DEFAULT_START_TIME, False
 
     vid = video_id_of(used_url)
-    values = {'video_start_time': str(offset), 'backstagehero_source': vid}
+    values = {'video_start_time': str(offset),
+              'backstagehero_sync': SYNC_MEASURED if matched else SYNC_GUESS,
+              'backstagehero_source': vid}
     if set_ini_values(folder, values):
         note = 'auto-synced' if matched else 'default offset'
         _probe_and_store_resolution(folder)
@@ -603,13 +667,32 @@ def process_download(folder, song_name, quality, sync_ready, replace):
 
 
 def process_resync(folder, song_name, sync_ready):
-    """Re-fingerprint an existing video to fix its timing."""
+    """Re-fingerprint an existing video to fix its timing.
+
+    Prefers the video file already on disk: ffmpeg decodes its audio track
+    directly (compute_offset_ms/_decode don't care whether the input is a
+    dedicated audio file or a muxed video), so the common case -- the video
+    hasn't changed, only its stored timing needs a recheck -- costs zero
+    network requests. Falls back to the stored YouTube source, then a fresh
+    search, exactly as before, for a local video that's missing, corrupted,
+    or genuinely no longer fingerprint-matches.
+    """
     if not sync_ready:
         return
     if is_converted(folder):
         return
 
     artist, title = read_metadata(folder)
+
+    local_video = os.path.join(folder, 'video.mp4')
+    if os.path.exists(local_video):
+        print('\nRe-syncing: ' + build_query(artist, title) + '  (from local video, no download)')
+        ms, info, _ = audiosync.compute_offset_ms(folder, local_video)
+        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms),
+                                                      'backstagehero_sync': SYNC_MEASURED}):
+            print('  Re-synced: ' + info)
+            return
+        print('  Could not confirm sync from the local video - falling back to source lookup')
 
     source = get_stored_source(folder)
 
@@ -622,7 +705,8 @@ def process_resync(folder, song_name, sync_ready):
                            if audio else (None, 'no audio', 0.0))
         finally:
             cleanup_temp_files(folder)
-        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms)}):
+        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms),
+                                                      'backstagehero_sync': SYNC_MEASURED}):
             _probe_and_store_resolution(folder)
             print('  Re-synced: ' + info)
             return
@@ -632,7 +716,8 @@ def process_resync(folder, song_name, sync_ready):
     print('\nRe-syncing: ' + query)
     candidates = search_candidates(query)
     _, vid_title, offset, matched, _, _ = select_video(folder, candidates, sync_ready)
-    if matched and set_ini_values(folder, {'video_start_time': str(offset)}):
+    if matched and set_ini_values(folder, {'video_start_time': str(offset),
+                                           'backstagehero_sync': SYNC_MEASURED}):
         print('  Re-synced against: ' + vid_title)
     else:
         print('  No confident match - timing left unchanged')

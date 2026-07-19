@@ -2,27 +2,23 @@
   <img src="assets/icon.png" width="80" height="80">
 </p>
 
-<h1 align="center">BackstageHero</h1>
+<h1 align="center">BackstageHero + Library Hygiene</h1>
 
-<p align="center">Downloads background videos for your Clone Hero songs and lines them up with the charts.</p>
-
-<p align="center">
-  <a href="https://github.com/jmb988/BackstageHero/releases/latest">
-    <img src="https://img.shields.io/github/v/release/jmb988/BackstageHero?label=download" alt="Download">
-  </a>
-</p>
+<p align="center">Downloads background videos for your Clone Hero songs, lines them up with the charts, and keeps the whole library clean.</p>
 
 ---
 
 ![BackstageHero](assets/screenshot.png)
 
-If a song folder has a `video.mp4` in it, Clone Hero plays it behind the chart. Doing that by hand across a whole library takes forever. This searches YouTube for the ones that are missing it, downloads a match, and lines the video up so it starts with the song.
+This is a fork of [jmb988/BackstageHero](https://github.com/jmb988/BackstageHero) (MIT licensed -- see **Credits**). BackstageHero's video download/matching/sync engine is unchanged; this fork adds four library-hygiene tools on top: repairing variable-frame-rate and unsupported-codec videos, fixing ID-suffixed chart filenames, filling in blank metadata, and finding duplicate charts.
+
+If a song folder has a `video.mp4` in it, Clone Hero plays it behind the chart. Doing that by hand across a whole library takes forever. This searches YouTube for the ones that are missing it, fingerprints candidates against your chart's own audio to make sure it's really the right song, downloads a match, and lines the video up so it starts with the song.
 
 Point it at your Songs folder and it fills in whatever doesn't have a video yet.
 
 ## Install
 
-Download `BackstageHero.exe` from the [latest release](https://github.com/jmb988/BackstageHero/releases/latest) and run it. It asks for your Songs folder the first time. ffmpeg is inside the exe, so there's nothing else to install.
+This fork runs from source only for now -- see **From source** below. (Upstream BackstageHero ships a packaged `.exe` with a self-updater; this fork hasn't set up its own release pipeline yet, so those parts of the original app are present in the code but dormant when run from source -- see **What's different in this fork**.)
 
 Songs that already have a video are skipped, so re-running after you add charts is fine. You can close it mid-run; it cleans up the song it was on and picks up again next time.
 
@@ -33,6 +29,17 @@ Songs that already have a video are skipped, so re-running after you add charts 
 - manual offset editor for the ones it gets wrong. right click a song, drag the slider, the preview follows
 - optional sharing: turn it on and once a few people land on the same offset for a chart, that becomes the default for anyone else who downloads it
 - updates itself, and keeps yt-dlp updated too (it has to, YouTube breaks it every few weeks)
+
+## Library Tools
+
+Click **Library Tools** next to the folder picker for four whole-library scans, each with a **Dry run** toggle so you can preview before anything changes:
+
+- **Repair videos** -- detects variable-frame-rate video (a single sync offset can't fix a *drift* that grows over the video, only the start point) and re-encodes it to constant frame rate. Also removes unsupported (non-VP8) WebM files left by other tools; the song then re-downloads on the next run.
+- **Fix chart names** -- some chart sources leave numeric-ID-suffixed filenames (`song_2400.ini` instead of `song.ini`, `notes_454.chart` instead of `notes.chart`, and the same for audio stems and album art) that Clone Hero can't load at all. This verifies a suffixed file's actual content matches the folder before renaming it -- never a blind guess. Anything it can't confirm is moved intact to `_needs_review/` for you to sort out by hand.
+- **Enrich metadata** -- looks up each song on [Chorus Encore](https://www.enchor.us/) and fills in **blank** `song.ini` fields (`year`/`genre`/`charter`/`album`) from a confident match. Never overwrites a field that already has a value.
+- **Find duplicates** -- finds charts of the same song from different sources (fuzzy title/artist match, confirmed with audio fingerprinting so a live version or cover is never mistaken for a duplicate), scores each copy by chart/instrument completeness, and moves everything but the best-scoring keeper to `_duplicates_review/`. **Nothing is ever deleted** -- review that folder and delete by hand once you're satisfied. Needs `fpcalc` (see **From source**) to actually confirm and move anything; without it, this just reports how many candidate groups it found.
+
+`dedupe_report.py` also runs standalone from a terminal (`python dedupe_report.py --library-path <path> [--dry-run]`), if you'd rather script it than click through the GUI.
 
 ## How the timing works
 
@@ -49,16 +56,25 @@ On a big run YouTube will start throttling. It paces itself to stay under that a
 ## From source
 
 ```
-git clone https://github.com/jmb988/BackstageHero
-cd BackstageHero
+git clone https://github.com/coheniskool/BackstageHero_LibraryHygiene
+cd BackstageHero_LibraryHygiene
 pip install -r requirements.txt
 python gui.py
 ```
 
 Timing needs ffmpeg on your PATH or sitting in the project folder. Static Windows builds are at [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases).
 
-To build the exe, run `python build.py`. It downloads ffmpeg and packs everything into `dist/`.
+Duplicate detection additionally needs `fpcalc` on PATH -- get it from the official [AcoustID/Chromaprint release](https://acoustid.org/chromaprint), not an arbitrary download (same trust bar as ffmpeg). Without it, **Find duplicates** still runs and reports candidate groups, but never confirms or moves anything.
+
+To build the exe, run `python build.py`. It downloads ffmpeg and packs everything into `dist/`. (Untested on this fork -- the exe self-updater points at upstream's GitHub releases, which won't have this fork's changes; see below.)
+
+## What's different in this fork
+
+- **Four new library-hygiene tools** (above), reachable from the **Library Tools** button, plus the standalone `dedupe_report.py` CLI.
+- **The community resolver stays on**, same as upstream -- chart lookups skip the YouTube search for known charts, and confident matches are reported back to help others. The **Share matches** checkbox still controls just the outbound half.
+- **The app self-updater is dormant from source** (it's `_frozen()`-gated in the original code too -- it only ever ran in the packaged exe). This fork doesn't have its own release pipeline yet, so there's no exe to update *to*. yt-dlp's separate PyPI auto-update channel is unaffected by this and still only matters for a packaged build.
+- Nothing about the video search/matching/sync engine changed -- `audiosync.py` and `VideoDownload.py` are upstream's, with one addition: every downloaded video now also gets a VFR check (see **Repair videos** above) before it's considered done.
 
 ## Credits
 
-ffmpeg ([BtbN builds](https://github.com/BtbN/FFmpeg-Builds), GPLv3) and [yt-dlp](https://github.com/yt-dlp/yt-dlp) do the real work.
+Built on [jmb988/BackstageHero](https://github.com/jmb988/BackstageHero) (MIT license, see `LICENSE`) -- the video download, matching, and sync engine is entirely jmb988's work. ffmpeg ([BtbN builds](https://github.com/BtbN/FFmpeg-Builds), GPLv3), [yt-dlp](https://github.com/yt-dlp/yt-dlp), and [Chorus Encore](https://www.enchor.us/) (metadata lookups) do the rest of the real work.
