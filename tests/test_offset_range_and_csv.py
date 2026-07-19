@@ -138,6 +138,33 @@ def test_the_csv_records_dumped_videos(tmp_path):
     assert 'bad1' in rows[1][8] and 'bad2' in rows[1][8]
 
 
+def test_a_webm_only_song_says_why_it_reads_as_having_no_video(tmp_path):
+    """Real library, Phase 4: a song with video.webm showed 'Has video: no',
+    which looks like a broken export. The app counts only video.mp4 on
+    purpose -- a webm from another tool is usually VP9 and unplayable here, so
+    the song is meant to re-download -- but the column has to say that rather
+    than flatly contradict what is in the folder."""
+    a = _write_song(tmp_path / 'Fat Lip', 'Fat Lip')
+    (a / 'video.webm').write_bytes(b'vp9 bytes')
+    songs = [_FakeSong(a, 'Sum 41 - Fat Lip', False, '-')]
+
+    _app_with(songs, tmp_path)._export_library_csv()
+
+    cell = _read_csv(tmp_path / gui.App.CSV_NAME)[1][3]
+    assert cell.startswith('no')
+    assert 'video.webm' in cell and 're-download' in cell
+
+
+def test_a_playable_song_still_just_says_yes(tmp_path):
+    a = _write_song(tmp_path / 'Good', 'Good')
+    (a / 'video.mp4').write_bytes(b'x')
+    songs = [_FakeSong(a, 'Good', True, '720p')]
+
+    _app_with(songs, tmp_path)._export_library_csv()
+
+    assert _read_csv(tmp_path / gui.App.CSV_NAME)[1][3] == 'yes'
+
+
 def test_a_song_with_no_video_reports_no_resolution(tmp_path):
     a = _write_song(tmp_path / 'No Video', 'No Video')
     songs = [_FakeSong(a, 'No Video', False, '-')]

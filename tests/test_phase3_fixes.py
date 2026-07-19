@@ -143,6 +143,45 @@ def test_migration_is_a_no_op_on_a_clean_library(tmp_path):
     assert library_common.migrate_legacy_review_folders(home) == {}
 
 
+def test_migration_finds_the_predecessors_camelcase_review_folder(tmp_path):
+    """Found in a real library during Phase 4: this project's predecessor
+    (clonehero-video-downloader) named it '_NeedsReview', so an exact-literal
+    match on '_needs_review' walked straight past three genuinely stranded
+    songs -- two of which the app cannot even see, because their .ini is
+    ID-suffixed and the **/song.ini glob never matches it."""
+    home = tmp_path / 'Songs'
+    home.mkdir()
+    legacy = home / '_NeedsReview'
+    _song(legacy / 'Styx - Mr. Roboto', 'Mr. Roboto', ini=False, chart=False)
+    (legacy / 'Styx - Mr. Roboto' / 'song_819.ini').write_text(
+        '[song]\nname = Mr. Roboto\n', encoding='utf-8')
+    (legacy / 'Styx - Mr. Roboto' / 'notes_454.chart').write_text('[Song]\n{\n}\n', encoding='utf-8')
+    (legacy / 'Styx - Mr. Roboto' / 'video_meta.json').write_text('{}', encoding='utf-8')
+
+    assert library_common.find_legacy_review_folders(home) == [legacy]
+
+    counts = library_common.migrate_legacy_review_folders(home)
+
+    assert counts.get('moved') == 1
+    assert (tmp_path / 'Songs_needs_review' / 'Styx - Mr. Roboto' / 'song_819.ini').exists()
+    assert not legacy.exists()
+
+
+def test_camelcase_and_snake_case_land_in_the_same_sibling_folder(tmp_path):
+    """Two tools' naming for one concept must not produce two review folders
+    for the user to hunt through."""
+    home = tmp_path / 'Songs'
+    home.mkdir()
+    _song(home / '_NeedsReview' / 'From Old Tool', 'A')
+    _song(home / '_needs_review' / 'From This Tool', 'B')
+
+    library_common.migrate_legacy_review_folders(home)
+
+    assert (tmp_path / 'Songs_needs_review' / 'From Old Tool' / 'song.ini').exists()
+    assert (tmp_path / 'Songs_needs_review' / 'From This Tool' / 'song.ini').exists()
+    assert not (tmp_path / 'Songs_NeedsReview').exists()
+
+
 def test_migration_ignores_a_users_own_underscore_folder(tmp_path):
     """Only the two literal legacy names are migrated -- a folder that merely
     starts with '_' is the user's own business."""

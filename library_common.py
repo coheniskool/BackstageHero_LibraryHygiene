@@ -51,16 +51,30 @@ def ensure_stdio_not_none():
 # The names are the literal ones the old code produced, matched exactly rather
 # than by prefix -- a user's own folder starting with '_' must not be swept up.
 
-LEGACY_REVIEW_FOLDER_NAMES = ('_needs_review', '_duplicates_review')
+# Matched case-insensitively against a closed list, never by '_' prefix: a
+# folder merely starting with an underscore is the user's own business and
+# must not be swept up by a tool that moves things.
+#
+# '_NeedsReview' is this project's PREDECESSOR (clonehero-video-downloader),
+# found in a real library during Phase 4 alongside its video_meta.json files.
+# Different tool, identical problem -- it sits inside the library root, so
+# Clone Hero still loads the broken songs in it while no repair scan can reach
+# them -- so it gets the same remedy.
+LEGACY_REVIEW_FOLDER_NAMES = ('_needs_review', '_duplicates_review',
+                              '_NeedsReview', '_DuplicatesReview')
 
 
 def find_legacy_review_folders(home_folder):
     """Old-style review folders sitting inside the library root, if any."""
     home_folder = Path(home_folder)
+    wanted = {name.lower() for name in LEGACY_REVIEW_FOLDER_NAMES}
     found = []
-    for name in LEGACY_REVIEW_FOLDER_NAMES:
-        candidate = home_folder / name
-        if candidate.is_dir() and not candidate.is_symlink():
+    try:
+        entries = sorted(p for p in home_folder.iterdir() if p.is_dir())
+    except OSError:
+        return found
+    for candidate in entries:
+        if candidate.name.lower() in wanted and not candidate.is_symlink():
             found.append(candidate)
     return found
 
@@ -80,7 +94,12 @@ def migrate_legacy_review_folders(home_folder, dry_run=False):
         counts[key] = counts.get(key, 0) + 1
 
     for legacy in find_legacy_review_folders(home_folder):
-        review_root = _review_root(home_folder, legacy.name)
+        # Normalise the destination: '_NeedsReview' and '_needs_review' are the
+        # same thing under two tools' naming, and must not land in two separate
+        # sibling folders for the user to hunt through.
+        canonical = ('_duplicates_review' if 'duplicate' in legacy.name.lower()
+                     else '_needs_review')
+        review_root = _review_root(home_folder, canonical)
         try:
             entries = sorted(p for p in legacy.iterdir() if p.is_dir())
         except OSError as e:
@@ -107,8 +126,8 @@ def migrate_legacy_review_folders(home_folder, dry_run=False):
                 print(f'  FAILED: {song_dir.name} ({e})')
                 bump('failed')
                 continue
-            _append_review_manifest(home_folder, legacy.name, song_dir, dest,
-                                    'migrated from legacy nested review folder',
+            _append_review_manifest(home_folder, canonical, song_dir, dest,
+                                    f'migrated out of nested {legacy.name}/',
                                     cross_volume=False, verification='migration')
             print(f'  Moved: {legacy.name}/{song_dir.name} -> {review_root.name}/')
             bump('moved')

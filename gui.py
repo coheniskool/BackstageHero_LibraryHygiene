@@ -198,6 +198,23 @@ def _open_in_file_manager(path):
         log.warning('Could not open folder: %s', path)
 
 
+def _video_status(song):
+    """What the 'Has video' column should say.
+
+    The app counts only video.mp4 as a video -- that is deliberate, since a
+    video.webm left by another tool is usually VP9, which this Clone Hero
+    build cannot decode, so the song is meant to re-download. But writing a
+    bare 'no' next to a folder that visibly contains a video file reads as a
+    bug in the export. Name the file instead, so the row explains itself.
+    """
+    if song.has_video:
+        return 'yes'
+    for name in library_common.VIDEO_NAMES:
+        if name != 'video.mp4' and os.path.exists(os.path.join(song.folder, name)):
+            return f'no ({name} present, not playable - will re-download)'
+    return 'no'
+
+
 def _read_song_value(folder, key):
     """One [song] value from a song.ini, or '' -- for building the CSV.
 
@@ -1580,7 +1597,7 @@ class App(ctk.CTk):
                         s.label,
                         artist or '',
                         title or '',
-                        'yes' if s.has_video else 'no',
+                        _video_status(s),
                         s.res if s.has_video else '',
                         _read_song_value(s.folder, 'video_start_time'),
                         # the provenance marker, so a spreadsheet sort shows at
