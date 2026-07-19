@@ -140,8 +140,10 @@ _GAMEPLAY_MARKERS = (
 
 # Short, collision-prone tokens: matched on word boundaries so 'rbn' does not
 # fire inside an ordinary word and 'fc' does not fire inside 'fcuk'.
+# rbn\d* rather than rbn: the real library contains "RBN2 EA - Calling to
+# Dance", which \brbn\b cannot match because RBN2 is a single word.
 _GAMEPLAY_TOKEN_RE = re.compile(
-    r'\b(rbn|rb1|rb2|rb3|gh1|gh2|gh3|gh5|fc\s*#?\d*|dc\d+)\b', re.I)
+    r'\b(rbn\d*|rb[123]|gh[1235]|fc\s*#?\d*|dc\d+)\b', re.I)
 _LYRIC_MARKERS = (
     'lyric', 'karaoke', 'sing along', 'singalong', 'sing-along',
 )
@@ -149,9 +151,20 @@ _AUDIO_ONLY_MARKERS = (
     'official audio', 'full album', 'audio only', '(audio)', '[audio]',
     'visualizer', 'visualiser',
 )
+# "official video" alone missed most of the real thing. Measured against 216
+# titles this classifier had called 'unknown': "Official HD Video" does not
+# contain the substring "official video", and plenty of genuine uploads say
+# only "Music Video", "(the music video)" or "Promovideo". Since the lyric and
+# gameplay checks run first, "Official Lyric Video" is still a lyric video --
+# these markers only ever get to promote something nothing else objected to.
 _OFFICIAL_MARKERS = (
-    'official video', 'official music video', 'official promo',
+    'music video', 'promovideo', 'promo video', 'officialvideo',
 )
+
+# "official <anything> video" -- HD, 4K, HQ, music, live clip. Enumerating the
+# variants was the wrong shape: the real library had "Official HD Video" and
+# "Official 4K Video", and the next one would have been missed too.
+_OFFICIAL_RE = re.compile(r'official\s+(?:\w+\s+){0,2}(?:video|clip)', re.I)
 
 
 def classify_candidate_title(title):
@@ -169,7 +182,7 @@ def classify_candidate_title(title):
         return 'lyric'
     if any(m in low for m in _AUDIO_ONLY_MARKERS):
         return 'audio_only'
-    if any(m in low for m in _OFFICIAL_MARKERS):
+    if any(m in low for m in _OFFICIAL_MARKERS) or _OFFICIAL_RE.search(low):
         return 'official'
     return 'unknown'
 

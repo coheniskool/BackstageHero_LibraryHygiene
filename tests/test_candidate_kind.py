@@ -85,6 +85,47 @@ def test_official_videos_are_recognised():
         'a-ha - Take On Me (Official Video)') == 'official'
 
 
+def test_official_is_matched_by_pattern_not_by_enumerating_variants():
+    """Real titles the substring list missed. Enumerating 'official hd video',
+    'official 4k video', ... was the wrong shape -- the next variant would
+    have been missed too."""
+    for title in (
+        'Alice In Chains - Rooster (Official HD Video)',
+        '311 - Down (Official 4K Video)',
+        'Some Band - Song (OFFICIAL HQ VIDEO)',
+        'ANTHRAX - Madhouse (OFFICIAL LIVE CLIP)',
+        'Some Band - Song (Official Music Video)',
+    ):
+        assert vd.classify_candidate_title(title) == 'official', title
+
+
+def test_uploads_that_only_say_music_video_are_recognised():
+    for title in (
+        'Amberian Dawn - My Only Star (the music video)',
+        'Freezepop- Doppelganger - Music Video',
+        '311 - Beautiful Disaster (Bonus Music Video)',
+        "Glitzy Glow 'Black And Sunny Day' Promovideo",
+    ):
+        assert vd.classify_candidate_title(title) == 'official', title
+
+
+def test_a_lyric_video_is_not_promoted_by_the_word_official():
+    """Order matters: the negative checks run first, so "OFFICIAL LYRIC
+    VIDEO" stays a lyric video rather than being promoted over a real one."""
+    for title in (
+        'ALL SHALL PERISH - The Death Plague (OFFICIAL LYRIC VIDEO)',
+        'All That Remains - The Waiting One (Official Lyric Video)',
+    ):
+        assert vd.classify_candidate_title(title) == 'lyric', title
+
+
+def test_numbered_rock_band_network_tags_are_recognised():
+    """\\brbn\\b could not match RBN2, which is one word. Both of these are
+    real titles from the library."""
+    assert vd.classify_candidate_title('RBN2 EA - Calling to Dance') == 'gameplay'
+    assert vd.classify_candidate_title('(RBN1.0) C&O - We Are The Best') == 'gameplay'
+
+
 def test_an_ordinary_upload_is_unknown_not_junk():
     """A plain upload of a real video usually says nothing special about
     itself, so 'unknown' must rank ABOVE anything self-declared as a lyric
