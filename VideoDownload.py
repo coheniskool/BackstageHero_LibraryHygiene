@@ -98,9 +98,91 @@ TEMP_ARTIFACTS = [
     'song.ini.tmp',
 ]
 
-# how many search results to pull, and how many to fingerprint-test before falling back
-SEARCH_RESULTS = 5
+# how many search results to pull, and how many to fingerprint-test before falling back.
+# Pulling more than we gate on is deliberate: ranking (duration, then what KIND
+# of video the title says it is) needs somewhere to demote the junk TO. The
+# extra results cost one search call and no extra audio downloads.
+SEARCH_RESULTS = 8
 GATE_CANDIDATES = 3
+
+# What the candidate's own title says it is.
+#
+# Fingerprinting confirms the AUDIO matches the chart. It is completely blind to
+# what is on screen -- a lyric video, a Guitar Hero playthrough and the official
+# music video all carry identical audio, so audiosync confirms all three with
+# equal confidence and writes `measured` for each. Found in a real playtest
+# (2026-07-19): almost every fingerprint-confirmed video in a 5,130-song library
+# was a lyric video or Rock Band / Guitar Hero gameplay footage. The offsets were
+# right; the videos were simply not what anyone wanted to watch.
+#
+# The candidate title comes back free with the flat search and was previously
+# only ever printed. Matching on it is the one signal available that can tell
+# these apart at all, before any download happens.
+#
+# Deliberately demote rather than exclude: for an obscure custom chart a lyric
+# video may be the only thing that exists, and this project's own rule is that a
+# video is worth having unless it is confidently wrong. A real video simply wins
+# whenever one is present.
+# Plain substrings are enough for the unambiguous ones.
+_GAMEPLAY_MARKERS = (
+    'guitar hero', 'rock band', 'rockband', 'clone hero', 'rocksmith',
+    'playthrough', 'play through', 'gameplay', 'sightread', 'sight read',
+    'chart preview', 'custom chart', 'drum chart', 'note chart', 'notes chart',
+    'expert+', 'expert +', '100% fc', 'full combo', 'beat saber',
+    # The Rock Band Network naming convention, which is what this library is
+    # actually full of: "<Song> by <Artist> Full Band FC #123". Measured on 42
+    # real fingerprint-confirmed songs -- the first version of this list caught
+    # 8 of them, because it looked for the words a person would use to describe
+    # gameplay rather than the words these uploads actually use.
+    'full band', 'expert guitar', 'expert bass', 'expert drums',
+    'expert vocals', 'pro drums', 'pro guitar', 'harmonies',
+)
+
+# Short, collision-prone tokens: matched on word boundaries so 'rbn' does not
+# fire inside an ordinary word and 'fc' does not fire inside 'fcuk'.
+_GAMEPLAY_TOKEN_RE = re.compile(
+    r'\b(rbn|rb1|rb2|rb3|gh1|gh2|gh3|gh5|fc\s*#?\d*|dc\d+)\b', re.I)
+_LYRIC_MARKERS = (
+    'lyric', 'karaoke', 'sing along', 'singalong', 'sing-along',
+)
+_AUDIO_ONLY_MARKERS = (
+    'official audio', 'full album', 'audio only', '(audio)', '[audio]',
+    'visualizer', 'visualiser',
+)
+_OFFICIAL_MARKERS = (
+    'official video', 'official music video', 'official promo',
+)
+
+
+def classify_candidate_title(title):
+    """What kind of video this title claims to be.
+
+    Returns 'official', 'gameplay', 'lyric', 'audio_only' or 'unknown'.
+    Checked most-specific first: a title can say both "official video" and
+    "lyrics", and the strongest negative signal should win, because being wrong
+    in the direction of keeping junk is what this exists to stop.
+    """
+    low = (title or '').lower()
+    if any(m in low for m in _GAMEPLAY_MARKERS) or _GAMEPLAY_TOKEN_RE.search(low):
+        return 'gameplay'
+    if any(m in low for m in _LYRIC_MARKERS):
+        return 'lyric'
+    if any(m in low for m in _AUDIO_ONLY_MARKERS):
+        return 'audio_only'
+    if any(m in low for m in _OFFICIAL_MARKERS):
+        return 'official'
+    return 'unknown'
+
+
+# Lower sorts earlier. 'unknown' beats a self-declared lyric video, because an
+# ordinary upload of a real video usually says nothing special about itself.
+CANDIDATE_KIND_RANK = {
+    'official': 0,
+    'unknown': 1,
+    'audio_only': 2,
+    'lyric': 3,
+    'gameplay': 4,
+}
 
 # random pause between songs so it doesn't look like a bot hammering the API
 SONG_DELAY_MIN = 1.0
@@ -504,16 +586,15 @@ def select_video(folder, candidates, sync_ready, target_h=0):
             print(f'  Skipping {len(candidates) - len(allowed)} previously dumped result(s)')
         candidates = allowed
 
-    if not sync_ready:
-        url, title = candidates[0][0], candidates[0][1]
-        return url, title, DEFAULT_START_TIME, False, 0.0, None
-
-    # no stems in this folder = nothing to fingerprint against, so don't waste
-    # audio downloads finding that out the hard way
-    if audiosync is None or not audiosync.chart_stems(folder):
-        url, title = candidates[0][0], candidates[0][1]
-        return url, title, DEFAULT_START_TIME, False, 0.0, None
-
+    # Rank BEFORE the early returns below, not after.
+    #
+    # Those two paths -- no ffmpeg, or a song with no stems to fingerprint
+    # against -- used to hand back candidates[0]: raw YouTube search order,
+    # with no duration check and no look at what the video even was. On a
+    # library of Guitar Hero charts the top result for a song is very often a
+    # Rock Band playthrough, so the one path with no fingerprint to protect it
+    # was also the one path doing no filtering at all.
+    #
     # rank by plausible length before spending downloads. the song has to fit
     # inside the video, plus some intro/outro, so a 30s short or a 20min live
     # set can't be it. unknown durations aren't punished. doesn't exclude
@@ -531,18 +612,39 @@ def select_video(folder, candidates, sync_ready, target_h=0):
         # search order, so a duration-less result could take ordered[0] ahead
         # of a verified one and sail past the floor on its behalf.
         def rank(item):
-            i, (_, _, dur) = item
+            i, (_url, title, dur) = item
             if dur is None:
                 tier = 1                     # unknown: eligible, but never preferred
             elif is_plausible(dur):
                 tier = 0                     # confirmed to fit this chart
             else:
                 tier = 2                     # known not to fit
-            return (tier, i)
+            # Duration first: a wrong-length result is the wrong SONG, which
+            # matters more than what kind of video it is. Kind then decides
+            # between candidates that all fit, which is where lyric videos and
+            # gameplay footage were quietly winning on search rank alone.
+            return (tier, CANDIDATE_KIND_RANK.get(
+                classify_candidate_title(title), 1), i)
         ordered = [c for _, c in sorted(enumerate(candidates), key=rank)]
     else:
+        # No chart duration to judge against, but the titles are still readable,
+        # so the kind preference still applies here rather than falling back to
+        # raw search order.
         is_plausible = None
-        ordered = list(candidates)
+        ordered = [c for _, c in sorted(
+            enumerate(candidates),
+            key=lambda item: (CANDIDATE_KIND_RANK.get(
+                classify_candidate_title(item[1][1]), 1), item[0]))]
+
+    if not sync_ready:
+        url, title = ordered[0][0], ordered[0][1]
+        return url, title, DEFAULT_START_TIME, False, 0.0, None
+
+    # no stems in this folder = nothing to fingerprint against, so don't waste
+    # audio downloads finding that out the hard way
+    if audiosync is None or not audiosync.chart_stems(folder):
+        url, title = ordered[0][0], ordered[0][1]
+        return url, title, DEFAULT_START_TIME, False, 0.0, None
 
     best = None   # (url, title, ms, height, conf, vinfo) - best match so far
     for url, title, _ in ordered[:GATE_CANDIDATES]:
@@ -708,9 +810,18 @@ def process_download(folder, song_name, quality, sync_ready, replace):
         offset, matched = DEFAULT_START_TIME, False
 
     vid = video_id_of(used_url)
+    # Record what we actually attached, by name. Only the video ID was stored
+    # before, which meant a library full of lyric videos and gameplay footage
+    # was indistinguishable from a library of real ones without re-querying
+    # YouTube for every song. The title is the one thing that tells them apart,
+    # and it costs nothing to keep. Titles come from a search result, so a fall
+    # back to a different candidate must report THAT one's title, not the
+    # originally-selected one.
+    used_title = next((c[1] for c in candidates if c[0] == used_url), vid_title)
     values = {'video_start_time': str(offset),
               'backstagehero_sync': SYNC_MEASURED if matched else SYNC_GUESS,
-              'backstagehero_source': vid}
+              'backstagehero_source': vid,
+              'backstagehero_video_title': used_title or ''}
     if set_ini_values(folder, values):
         note = 'auto-synced' if matched else 'default offset'
         _probe_and_store_resolution(folder)

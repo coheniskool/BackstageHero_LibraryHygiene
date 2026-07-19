@@ -44,7 +44,7 @@ from VideoDownload import (
     ffmpegAvailable, ffplayPath, audiosync, __version__,
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
     SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution, scan_song,
-    SYNC_MANUAL, dump_video, get_rejected_sources,
+    SYNC_MANUAL, dump_video, get_rejected_sources, classify_candidate_title,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
@@ -213,6 +213,22 @@ def _video_status(song):
         if name != 'video.mp4' and os.path.exists(os.path.join(song.folder, name)):
             return f'no ({name} present, not playable - will re-download)'
     return 'no'
+
+
+def _video_kind(folder):
+    """'lyric', 'gameplay', 'official'... for the attached video, or ''.
+
+    Derived from the stored title rather than stored separately, so there is
+    one fact on disk and no chance of the two disagreeing. Blank for anything
+    downloaded before titles were recorded -- those can only be identified by
+    re-querying YouTube, which is a deliberate opt-in, not something a library
+    scan should do 376 times unprompted.
+    """
+    title = _read_song_value(folder, 'backstagehero_video_title')
+    if not title:
+        return ''
+    kind = classify_candidate_title(title)
+    return '' if kind == 'unknown' else kind
 
 
 def _read_song_value(folder, key):
@@ -1589,8 +1605,8 @@ class App(ctk.CTk):
             with open(path, 'w', newline='', encoding='utf-8-sig') as fh:
                 w = csv.writer(fh)
                 w.writerow(['Song', 'Artist', 'Title', 'Has video', 'Resolution',
-                            'Offset (ms)', 'Offset source', 'Video ID',
-                            'Dumped videos', 'Folder'])
+                            'Offset (ms)', 'Offset source', 'Video kind',
+                            'Video title', 'Video ID', 'Dumped videos', 'Folder'])
                 for s in sorted(self._songs, key=lambda x: x.key):
                     artist, title = read_metadata(s.folder)
                     w.writerow([
@@ -1603,6 +1619,12 @@ class App(ctk.CTk):
                         # the provenance marker, so a spreadsheet sort shows at
                         # a glance which songs were never actually measured
                         _read_song_value(s.folder, 'backstagehero_sync'),
+                        # what KIND of video it is -- sorting on this column is
+                        # how you find every lyric video and gameplay capture
+                        # in one pass. Fingerprinting cannot tell these apart,
+                        # because their audio is identical to the real thing.
+                        _video_kind(s.folder),
+                        _read_song_value(s.folder, 'backstagehero_video_title'),
                         _read_song_value(s.folder, 'backstagehero_source'),
                         ' '.join(sorted(get_rejected_sources(s.folder))),
                         s.folder,

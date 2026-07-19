@@ -124,7 +124,7 @@ def test_the_csv_lands_in_the_songs_folder_with_the_song_data(tmp_path):
     assert body[4] == '1080p'
     assert body[5] == '-4200'
     assert body[6] == 'measured'          # provenance, so guesses sort out
-    assert body[7] == 'abc123'
+    assert body[9] == 'abc123'
 
 
 def test_the_csv_records_dumped_videos(tmp_path):
@@ -135,7 +135,37 @@ def test_the_csv_records_dumped_videos(tmp_path):
     _app_with(songs, tmp_path)._export_library_csv()
 
     rows = _read_csv(tmp_path / gui.App.CSV_NAME)
-    assert 'bad1' in rows[1][8] and 'bad2' in rows[1][8]
+    assert 'bad1' in rows[1][10] and 'bad2' in rows[1][10]
+
+
+def test_the_csv_names_the_kind_of_video_attached(tmp_path):
+    """Sorting on this column is how you find every lyric video and gameplay
+    capture in one pass -- fingerprinting cannot tell them apart, because
+    their audio is identical to the real thing."""
+    a = _write_song(tmp_path / 'Ironic', 'Ironic',
+                    backstagehero_video_title='Alanis Morissette - Ironic (Lyrics)')
+    b = _write_song(tmp_path / 'Living', 'Living',
+                    backstagehero_video_title='Among the Living (Rock Band Expert FC)')
+    c = _write_song(tmp_path / 'Creep', 'Creep',
+                    backstagehero_video_title='Radiohead - Creep')
+    songs = [_FakeSong(a, 'Ironic', True, '720p'),
+             _FakeSong(b, 'Living', True, '720p'),
+             _FakeSong(c, 'Creep', True, '720p')]
+
+    _app_with(songs, tmp_path)._export_library_csv()
+
+    kinds = {r[0]: r[7] for r in _read_csv(tmp_path / gui.App.CSV_NAME)[1:]}
+    assert kinds['Ironic'] == 'lyric'
+    assert kinds['Living'] == 'gameplay'
+    assert kinds['Creep'] == ''        # an ordinary upload is not flagged
+
+
+def test_the_kind_column_is_blank_for_videos_downloaded_before_titles_were_kept(tmp_path):
+    """Existing libraries have no stored title. Blank must mean 'unknown',
+    never be mistaken for 'checked and fine'."""
+    a = _write_song(tmp_path / 'Old', 'Old', backstagehero_source='abc123')
+    _app_with([_FakeSong(a, 'Old', True, '720p')], tmp_path)._export_library_csv()
+    assert _read_csv(tmp_path / gui.App.CSV_NAME)[1][7] == ''
 
 
 def test_a_webm_only_song_says_why_it_reads_as_having_no_video(tmp_path):
