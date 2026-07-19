@@ -16,11 +16,20 @@ ctk = pytest.importorskip('customtkinter')
 import gui
 
 
-@pytest.fixture
+@pytest.fixture(scope='module')
 def root():
+    """One Tk root for the whole module, deliberately.
+
+    A per-test root meant this module built and tore down eight Tcl
+    interpreters in a row, and the later ones intermittently failed with
+    "Can't find a usable init.tcl" -- which surfaced as a test that SKIPPED
+    on some runs and passed on others. A test that sometimes silently proves
+    nothing is worse than no test, so the churn is removed rather than the
+    symptom tolerated. Each test still gets its own dialog.
+    """
     try:
         r = ctk.CTk()
-    except Exception as exc:                      # no display / no Tk
+    except Exception as exc:                      # genuinely no display / no Tk
         pytest.skip(f'Tk unavailable: {exc}')
     r.withdraw()
     yield r
