@@ -158,6 +158,17 @@ def make_console_encoding_safe():
 # still needs to find and judge those.
 VIDEO_NAMES = ('video.mp4', 'video.avi', 'video.webm', 'video.ogv')
 
+# How to read text output from ffmpeg/ffprobe/fpcalc.
+#
+# subprocess's text=True decodes the child's output with the LOCALE encoding,
+# which is cp1252 on a default Windows install. ffprobe echoes the file path in
+# its messages, so a song folder named with a heart or any CJK text produced
+# bytes cp1252 cannot decode -- and the decode happens on subprocess's internal
+# reader thread, where the UnicodeDecodeError surfaced as a dead thread and a
+# failed probe rather than as anything a caller could catch. ffmpeg emits UTF-8,
+# so decode as UTF-8 and never let an undecodable byte break a scan.
+TEXT_UTF8 = {'text': True, 'encoding': 'utf-8', 'errors': 'replace'}
+
 
 # --- Song-folder discovery ------------------------------------------------
 #
@@ -328,7 +339,7 @@ def probe_audio_duration_ms(audio_path):
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', str(audio_path)],
-            check=True, capture_output=True, text=True,
+            check=True, capture_output=True, **TEXT_UTF8,
         )
         data = json.loads(result.stdout)
         duration = data.get('format', {}).get('duration')

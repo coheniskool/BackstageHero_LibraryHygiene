@@ -21,7 +21,8 @@ log = logging.getLogger('backstagehero')
 # Suppress the console window each ffmpeg/ffprobe child would otherwise
 # flash on a windowed (--noconsole) build; harmless 0 elsewhere. Matches
 # VideoDownload.py's NO_WINDOW convention.
-_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+_TEXT_UTF8 = library_common.TEXT_UTF8   # see the note on TEXT_UTF8 there
+_NO_WINDOW =getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
 
 def probe_frame_rate(video_path):
@@ -36,7 +37,8 @@ def probe_frame_rate(video_path):
             ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
              '-show_entries', 'stream=r_frame_rate,avg_frame_rate',
              '-of', 'json', str(video_path)],
-            check=True, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            check=True, capture_output=True, creationflags=_NO_WINDOW,
+            **_TEXT_UTF8,
         )
         data = json.loads(result.stdout)
         streams = data.get('streams', [])
@@ -62,7 +64,8 @@ def probe_video_codec(video_path):
             ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
              '-show_entries', 'stream=codec_name',
              '-of', 'json', str(video_path)],
-            check=True, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            check=True, capture_output=True, creationflags=_NO_WINDOW,
+            **_TEXT_UTF8,
         )
         data = json.loads(result.stdout)
         streams = data.get('streams', [])

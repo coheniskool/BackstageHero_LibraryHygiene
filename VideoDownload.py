@@ -381,8 +381,8 @@ def _chart_duration(folder):
                 None) or max(stems, key=os.path.getsize)
     try:
         r = subprocess.run(['ffmpeg', '-hide_banner', '-i', pick],
-                           capture_output=True, text=True, timeout=10,
-                           creationflags=NO_WINDOW)
+                           capture_output=True, timeout=10,
+                           creationflags=NO_WINDOW, **library_common.TEXT_UTF8)
         m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr)
         if m:
             return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
@@ -489,6 +489,21 @@ def select_video(folder, candidates, sync_ready, target_h=0):
     match is lower-res we keep looking for a better one and only settle for it
     if nothing higher turns up. Stops as soon as a match meets the target, so a
     good first hit costs nothing extra."""
+    # Drop anything the user has already thrown away for this song. Done first
+    # so every path below -- the fingerprint gate, the duration ranking and the
+    # final fallback alike -- is working from candidates that are actually
+    # allowed, rather than each having to remember to re-check.
+    rejected = get_rejected_sources(folder)
+    if rejected:
+        allowed = [c for c in candidates if video_id_of(c[0]) not in rejected]
+        if not allowed:
+            print(f'  Every result was previously dumped for this song '
+                  f'({len(rejected)} rejected) - leaving without a video')
+            return None, None, DEFAULT_START_TIME, False, 0.0, None
+        if len(allowed) != len(candidates):
+            print(f'  Skipping {len(candidates) - len(allowed)} previously dumped result(s)')
+        candidates = allowed
+
     if not sync_ready:
         url, title = candidates[0][0], candidates[0][1]
         return url, title, DEFAULT_START_TIME, False, 0.0, None
@@ -612,8 +627,14 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     artist, title = read_metadata(folder)
     ch = resolver_client.chart_hash(folder) if resolver_client.enabled() else None
 
-    # check the community resolver first - skips the YouTube search entirely for known charts
+    # check the community resolver first - skips the YouTube search entirely for known charts.
+    # A video this user has dumped is not acceptable just because the pool
+    # likes it: their rejection is about this library, and overriding it would
+    # make the dump silently useless for exactly the songs it matters on.
     hit = resolver_client.resolve(ch)
+    if hit and hit.get('video_id') in get_rejected_sources(folder):
+        print('  Community video for this chart was previously dumped here - searching instead')
+        hit = None
     if hit and hit.get('video_id'):
         url = 'https://www.youtube.com/watch?v=' + hit['video_id']
         print('\nResolved (community-confirmed): ' + (build_query(artist, title) or song_name))
@@ -809,6 +830,85 @@ def get_stored_source(folder):
     return _read_ini_value(folder, 'backstagehero_source')
 
 
+# Uploads the user has thrown away for this song, comma-separated in song.ini.
+#
+# Deleting a bad video is not enough on its own: the YouTube search is
+# effectively deterministic, so the very next run finds the same wrong upload,
+# downloads it again, and the user is back where they started. Remembering
+# what was rejected is what makes "dump this video" actually mean something.
+REJECTED_KEY = 'backstagehero_rejected'
+
+
+def get_rejected_sources(folder):
+    """Video IDs the user has dumped for this song, as a set."""
+    raw = _read_ini_value(folder, REJECTED_KEY) or ''
+    return {part.strip() for part in raw.split(',') if part.strip()}
+
+
+def dump_video(folder):
+    """Throw away this song's video and remember not to fetch it again.
+
+    Returns {'status', 'detail'}. Statuses: 'dumped', 'nothing_to_dump',
+    'failed'.
+
+    Ordered so the song is never left in a state that hides the problem: the
+    rejection is recorded BEFORE the file is removed, because a delete that
+    succeeds without a recorded rejection is the one outcome that guarantees
+    the same wrong video comes straight back.
+    """
+    folder = str(folder)
+    video_path = os.path.join(folder, 'video.mp4')
+    marker = _read_ini_value(folder, static_art.VIDEO_MARKER_KEY)
+    was_converted = marker == static_art.VIDEO_MARKER_STATIC_ART
+    if not os.path.exists(video_path) and not was_converted:
+        return {'status': 'nothing_to_dump', 'detail': 'this song has no video'}
+
+    vid = get_stored_source(folder)
+    values = {'backstagehero_source': ''}
+    if vid:
+        rejected = get_rejected_sources(folder)
+        rejected.add(vid)
+        values[REJECTED_KEY] = ','.join(sorted(rejected))
+    if was_converted:
+        # the static-art pass turned this upload into album art. Dumping it
+        # has to undo that too, or the song stays permanently skipped and the
+        # picture the user didn't want stays on disk.
+        values[static_art.VIDEO_MARKER_KEY] = ''
+
+    if not set_ini_values(folder, values):
+        return {'status': 'failed',
+                'detail': 'song.ini has no [song] section - nothing was removed'}
+
+    removed = []
+    if os.path.exists(video_path):
+        try:
+            os.remove(video_path)
+            removed.append('video.mp4')
+        except OSError as e:
+            log.error('could not remove dumped video %s: %s', video_path, e)
+            return {'status': 'failed',
+                    'detail': f'video.mp4 could not be removed ({e}); '
+                              f'the upload is recorded as rejected either way'}
+    if was_converted:
+        # only art this app extracted -- the marker is what says so. A user's
+        # own album art was never touched by the conversion and isn't now.
+        art = os.path.join(folder, 'album.png')
+        if os.path.exists(art):
+            try:
+                os.remove(art)
+                removed.append('album.png')
+            except OSError as e:
+                log.warning('could not remove extracted album art %s: %s', art, e)
+
+    note = ' and '.join(removed) if removed else 'nothing on disk'
+    detail = f'removed {note}'
+    if vid:
+        detail += f'; {vid} will be skipped in future searches'
+    else:
+        detail += '; no source ID was stored, so it cannot be excluded by ID'
+    return {'status': 'dumped', 'detail': detail}
+
+
 def get_stored_resolution(folder):
     """The stored backstagehero_res value (e.g. '720p'), or None."""
     return _read_ini_value(folder, 'backstagehero_res')
@@ -826,8 +926,8 @@ def probe_resolution(folder):
     try:
         r = subprocess.run(
             ['ffmpeg', '-hide_banner', '-i', video],
-            capture_output=True, text=True, timeout=10,
-            creationflags=NO_WINDOW)
+            capture_output=True, timeout=10,
+            creationflags=NO_WINDOW, **library_common.TEXT_UTF8)
         # Search only the Video: stream line so an embedded cover-art stream
         # (e.g. mjpeg 640x640) doesn't shadow the real video dimensions.
         video_line = next((l for l in r.stderr.splitlines() if 'Video:' in l), '')

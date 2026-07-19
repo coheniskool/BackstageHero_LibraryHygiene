@@ -22,6 +22,7 @@ import sys
 import library_common
 library_common.ensure_stdio_not_none()
 
+import csv
 import glob
 import logging
 import random
@@ -43,7 +44,7 @@ from VideoDownload import (
     ffmpegAvailable, ffplayPath, audiosync, __version__,
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
     SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution, scan_song,
-    SYNC_MANUAL,
+    SYNC_MANUAL, dump_video, get_rejected_sources,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
@@ -197,6 +198,19 @@ def _open_in_file_manager(path):
         log.warning('Could not open folder: %s', path)
 
 
+def _read_song_value(folder, key):
+    """One [song] value from a song.ini, or '' -- for building the CSV.
+
+    Thin wrapper over VideoDownload's reader rather than a second parser, so
+    the export can never disagree with what the app itself reads.
+    """
+    try:
+        from VideoDownload import _read_ini_value
+        return _read_ini_value(folder, key) or ''
+    except Exception:
+        return ''
+
+
 def _scan_library(songs_folder, progress=None):
     """Return a list[Song] for the folder, sorted alphabetically.
     progress(count) is called periodically so the UI can show a live tally."""
@@ -228,8 +242,19 @@ class SyncEditor(ctk.CTkToplevel):
     slider shifts the audio against it live, with no respawn. Otherwise it
     falls back to launching ffplay for a one-shot preview."""
 
-    _MS_MIN = -30_000
-    _MS_MAX =  90_000
+    # The slider's STARTING window, not a limit on the offset itself.
+    #
+    # These used to be hard bounds, clamped by both the slider and the
+    # fine-tune buttons, so a chart genuinely needing -78s could not be set at
+    # all -- it snapped back to -30s and silently stayed wrong. A real
+    # video_start_time has no natural bound (a long intro, a compilation
+    # upload, a chart cut from the middle of a set), so the window now grows to
+    # fit whatever is needed and the numeric box below accepts any value.
+    _MS_MIN_DEFAULT = -30_000
+    _MS_MAX_DEFAULT = 90_000
+    # how much headroom to add past the value when the window has to grow, so
+    # dragging to the end doesn't immediately need another resize
+    _MS_WINDOW_PAD = 30_000
 
     def __init__(self, parent, song: Song, on_save=None):
         super().__init__(parent)
@@ -248,6 +273,12 @@ class SyncEditor(ctk.CTkToplevel):
 
         self._ms    = tk.IntVar(value=self._read_offset())
         self._share = tk.BooleanVar(value=True)
+        # widen the initial window if this song's stored offset already sits
+        # outside it -- otherwise opening the editor would misrepresent the
+        # value it is supposed to be showing
+        self._ms_min = self._MS_MIN_DEFAULT
+        self._ms_max = self._MS_MAX_DEFAULT
+        self._grow_window_for(self._ms.get())
 
         self.title('Sync Editor')
         self.geometry('640x760' if self._embedded else '500x470')
@@ -319,20 +350,39 @@ class SyncEditor(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), text_color=_SUBTEXT)
         self._desc_lbl.pack(pady=(2, 12))
 
-        # Slider
+        # Slider. Its ends are labelled from the live window, not hard-coded,
+        # because the window grows to whatever this song actually needs.
         sf = ctk.CTkFrame(self, fg_color='transparent')
         sf.pack(fill='x', padx=20, pady=(14, 0))
-        ctk.CTkLabel(sf, text='-30s', font=ctk.CTkFont(size=10),
-                     text_color=_SUBTEXT).pack(side='left')
-        ctk.CTkLabel(sf, text='+90s', font=ctk.CTkFont(size=10),
-                     text_color=_SUBTEXT).pack(side='right')
+        self._min_lbl = ctk.CTkLabel(sf, text='', font=ctk.CTkFont(size=10),
+                                     text_color=_SUBTEXT)
+        self._min_lbl.pack(side='left')
+        self._max_lbl = ctk.CTkLabel(sf, text='', font=ctk.CTkFont(size=10),
+                                     text_color=_SUBTEXT)
+        self._max_lbl.pack(side='right')
         self._slider = ctk.CTkSlider(
-            sf, from_=self._MS_MIN, to=self._MS_MAX,
+            sf, from_=self._ms_min, to=self._ms_max,
             command=self._on_slider, height=16,
             button_color=_BLUE, button_hover_color='#7aaef8',
             progress_color=_BLUE)
         self._slider.set(self._ms.get())
         self._slider.pack(fill='x', padx=8)
+        self._sync_slider_range()
+
+        # Exact-value entry, so an offset can be typed rather than dragged to.
+        ef = ctk.CTkFrame(self, fg_color='transparent')
+        ef.pack(fill='x', padx=20, pady=(8, 0))
+        ctk.CTkLabel(ef, text='Exact offset (ms):', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).pack(side='left', padx=(8, 6))
+        self._ms_entry = ctk.CTkEntry(ef, width=110, height=26,
+                                      font=ctk.CTkFont(size=11))
+        self._ms_entry.pack(side='left')
+        self._ms_entry.bind('<Return>', self._on_entry_commit)
+        self._ms_entry.bind('<FocusOut>', self._on_entry_commit)
+        ctk.CTkButton(ef, text='Set', width=46, height=26,
+                      fg_color='#2a2a3e', hover_color='#383858',
+                      text_color=_TEXT, font=ctk.CTkFont(size=10),
+                      command=self._on_entry_commit).pack(side='left', padx=6)
 
         # Fine-tune buttons
         bf = ctk.CTkFrame(self, fg_color='transparent')
@@ -426,10 +476,55 @@ class SyncEditor(ctk.CTkToplevel):
             pass
         return DEFAULT_START_TIME
 
+    def _grow_window_for(self, ms):
+        """Widen the slider window so `ms` is representable. Returns True if it
+        changed. Only ever grows -- shrinking mid-edit would yank the handle."""
+        changed = False
+        if ms < self._ms_min:
+            self._ms_min = ms - self._MS_WINDOW_PAD
+            changed = True
+        if ms > self._ms_max:
+            self._ms_max = ms + self._MS_WINDOW_PAD
+            changed = True
+        return changed
+
+    def _sync_slider_range(self):
+        self._slider.configure(from_=self._ms_min, to=self._ms_max)
+        self._min_lbl.configure(text=f'{self._ms_min / 1000:g}s')
+        self._max_lbl.configure(text=f'+{self._ms_max / 1000:g}s'
+                                if self._ms_max > 0 else f'{self._ms_max / 1000:g}s')
+
+    def _set_ms(self, new):
+        """The single place the offset changes. No clamping: the window moves
+        to fit the value, never the other way round."""
+        new = int(new)
+        if self._grow_window_for(new):
+            self._sync_slider_range()
+        self._ms.set(new)
+        self._slider.set(new)
+        self._refresh()
+        self._apply_live_delay()
+
+    def _on_entry_commit(self, event=None):
+        raw = self._ms_entry.get().strip().replace(',', '')
+        if not raw:
+            self._refresh()
+            return
+        try:
+            self._set_ms(int(float(raw)))
+        except ValueError:
+            self._refresh()      # unparseable: put the real value back
+
     def _refresh(self):
         ms = self._ms.get()
         sign = '+' if ms > 0 else ''
         self._ms_lbl.configure(text=f'{sign}{ms:,} ms' if ms != 0 else '0 ms')
+        if getattr(self, '_ms_entry', None) is not None:
+            # keep the box in step with the slider, but don't fight the user
+            # while they are typing in it
+            if self.focus_get() is not self._ms_entry:
+                self._ms_entry.delete(0, 'end')
+                self._ms_entry.insert(0, str(ms))
         s = abs(ms) / 1000.0
         if ms < -50:
             desc = f'Video has a {s:.1f}s intro before the song starts'
@@ -440,16 +535,16 @@ class SyncEditor(ctk.CTkToplevel):
         self._desc_lbl.configure(text=desc)
 
     def _on_slider(self, value):
+        # no _set_ms here: the handle is already where the user put it, and
+        # re-setting it mid-drag fights the widget
         self._ms.set(int(round(value)))
         self._refresh()
         self._apply_live_delay()
 
     def _nudge(self, delta):
-        new = max(self._MS_MIN, min(self._MS_MAX, self._ms.get() + delta))
-        self._ms.set(new)
-        self._slider.set(new)
-        self._refresh()
-        self._apply_live_delay()
+        # deliberately unclamped -- the window grows instead. Clamping here was
+        # half of why an offset past -30s could not be reached.
+        self._set_ms(self._ms.get() + delta)
 
     def _audio_delay(self):
         """mpv audio-delay (seconds) for the current offset. A negative
@@ -1455,7 +1550,48 @@ class App(ctk.CTk):
         else:
             self._status_lbl.configure(
                 text=f'{n} song{"s" if n != 1 else ""} found')
+        self._export_library_csv()
         self._update_buttons()
+
+    CSV_NAME = 'backstagehero_library.csv'
+
+    def _export_library_csv(self):
+        """Write a spreadsheet of the library next to the songs themselves.
+
+        Rewritten after every scan so it never quietly goes stale. Failure is
+        logged and otherwise ignored on purpose -- a read-only or full drive
+        should cost the user a convenience file, not the ability to use the
+        app. Clone Hero ignores a loose .csv in the Songs root.
+        """
+        if not self._songs_folder or not self._songs:
+            return
+        path = os.path.join(self._songs_folder, self.CSV_NAME)
+        try:
+            # newline='' is required by csv on Windows, otherwise every row is
+            # written with a blank line between it and the next
+            with open(path, 'w', newline='', encoding='utf-8-sig') as fh:
+                w = csv.writer(fh)
+                w.writerow(['Song', 'Artist', 'Title', 'Has video', 'Resolution',
+                            'Offset (ms)', 'Offset source', 'Video ID',
+                            'Dumped videos', 'Folder'])
+                for s in sorted(self._songs, key=lambda x: x.key):
+                    artist, title = read_metadata(s.folder)
+                    w.writerow([
+                        s.label,
+                        artist or '',
+                        title or '',
+                        'yes' if s.has_video else 'no',
+                        s.res if s.has_video else '',
+                        _read_song_value(s.folder, 'video_start_time'),
+                        # the provenance marker, so a spreadsheet sort shows at
+                        # a glance which songs were never actually measured
+                        _read_song_value(s.folder, 'backstagehero_sync'),
+                        _read_song_value(s.folder, 'backstagehero_source'),
+                        ' '.join(sorted(get_rejected_sources(s.folder))),
+                        s.folder,
+                    ])
+        except OSError as e:
+            log.warning('Could not write %s: %s', path, e)
 
     def _probe_resolutions(self, songs, total_songs):
         """Background thread: probe resolutions for unprobed videos, a few in
@@ -1476,6 +1612,10 @@ class App(ctk.CTk):
                 self._queue.put(('res_update', s,
                                  f'{total_songs} songs found, reading resolutions ({remaining} left)...'
                                  if remaining else f'{total_songs} songs found'))
+        # rewrite the CSV once resolutions are known -- the copy written right
+        # after the scan has '...' placeholders in that column
+        if not self._stop_evt.is_set():
+            self._queue.put(('csv_refresh',))
 
     def _set_filter(self, mode):
         self._filter_mode = mode
@@ -1615,6 +1755,8 @@ class App(ctk.CTk):
         if s.has_video:
             menu.add_command(label='Adjust sync offset',
                              command=lambda: self._open_sync_editor(s))
+            menu.add_command(label='Dump this video (wrong video?)',
+                             command=lambda: self._dump_video(s))
             menu.add_separator()
         menu.add_command(label='Open folder',
                          command=lambda: _open_in_file_manager(s.folder))
@@ -1622,6 +1764,42 @@ class App(ctk.CTk):
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _dump_video(self, song: Song):
+        """Throw away a video that turned out to be the wrong thing entirely.
+
+        Confirmed first: this deletes a file and is not undoable from inside
+        the app. The rejection it records is what stops the next run simply
+        fetching the same upload again.
+        """
+        if self._running or self._tool_running:
+            messagebox.showinfo('Busy', 'Wait for the current run to finish first.')
+            return
+        if not messagebox.askokcancel(
+                'Dump this video?',
+                f'{song.label}\n\n'
+                'Deletes the downloaded video and remembers this particular '
+                'upload so it is skipped next time.\n\n'
+                'The song will be downloaded again on the next run, and should '
+                'pick something different.'):
+            return
+
+        result = dump_video(song.folder)
+        if result['status'] == 'failed':
+            messagebox.showerror('Could not dump the video', result['detail'])
+            return
+        if result['status'] == 'nothing_to_dump':
+            messagebox.showinfo('Nothing to dump', result['detail'])
+            return
+
+        song.has_video = False
+        song.res       = '-'
+        song.status    = 'Dumped - will re-download'
+        song.stag      = 'dim'
+        self._update_row(song)
+        self._apply_filter()
+        self._export_library_csv()
+        self._status_lbl.configure(text=f'Dumped: {result["detail"]}')
 
     def _open_sync_editor(self, song: Song):
         def on_save(ms: int, share: bool):
@@ -1962,6 +2140,9 @@ class App(ctk.CTk):
             self._update_row(s)
             if not self._running:
                 self._status_lbl.configure(text=status_text)
+
+        elif kind == 'csv_refresh':
+            self._export_library_csv()
 
         elif kind == 'app_update_available':
             _, latest, asset, sha = msg

@@ -146,7 +146,8 @@ def _probe_duration_and_bitrate(video_path):
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration,bit_rate',
              '-of', 'json', str(video_path)],
-            check=True, capture_output=True, text=True, creationflags=_NO_WINDOW,
+            check=True, capture_output=True, creationflags=_NO_WINDOW,
+            **library_common.TEXT_UTF8,
         )
         fmt = json.loads(result.stdout).get('format', {})
         duration = fmt.get('duration')

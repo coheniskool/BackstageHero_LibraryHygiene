@@ -26,7 +26,9 @@ Songs that already have a video are skipped, so re-running after you add charts 
 
 - proper GUI instead of the old console prompts. you can see the whole library, filter by what's missing a video, and check resolutions
 - it works out the timing itself now, by matching the video's audio against the chart audio instead of dropping the same offset on everything
-- manual offset editor for the ones it gets wrong. right click a song, drag the slider, the preview follows
+- manual offset editor for the ones it gets wrong. right click a song, drag the slider, the preview follows. there's no cap on the offset -- the slider widens to whatever the chart needs, and you can type an exact value if dragging is fiddly
+- right click → **Dump this video** when a download turns out to be the wrong song, a lyric video, or someone's bedroom cover. it deletes the file *and* remembers that particular upload, so the next run picks something else instead of fetching the same one again
+- every library scan drops a `backstagehero_library.csv` next to your songs -- title, artist, whether it has a video, resolution, the offset and where the offset came from, and anything you've dumped. handy for finding the songs that were never really synced
 - optional sharing: turn it on and once a few people land on the same offset for a chart, that becomes the default for anyone else who downloads it
 - updates itself, and keeps yt-dlp updated too (it has to, YouTube breaks it every few weeks)
 

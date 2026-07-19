@@ -209,6 +209,45 @@ def test_no_scan_dies_on_a_song_name_cp1252_cannot_encode(tmp_path, name, scan, 
         sys.stdout = real
 
 
+def test_no_ffmpeg_call_decodes_child_output_with_the_locale_codec():
+    """subprocess's text=True decodes with the LOCALE encoding -- cp1252 on a
+    default Windows box. ffprobe echoes the file path in its messages, so a
+    song folder named with a heart or CJK text produced bytes cp1252 could not
+    decode, and the failure happened on subprocess's internal reader thread
+    where no caller could catch it: the probe just came back empty.
+
+    Surfaced as a PytestUnhandledThreadExceptionWarning during the unicode
+    scan tests, which is easy to scroll past -- hence this test rather than a
+    reliance on reading warning output.
+    """
+    import re
+    sources = ['VideoDownload.py', 'video_repair.py', 'static_art.py',
+               'library_common.py', 'chart_rename.py', 'dedupe_report.py']
+    offenders = []
+    for name in sources:
+        path = Path(library_common.__file__).parent / name
+        if not path.exists():
+            continue
+        for n, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith('#'):        # prose about the bug, not the bug
+                continue
+            if re.search(r'\btext\s*=\s*True', line) and 'TEXT_UTF8' not in line:
+                offenders.append(f'{name}:{n}: {stripped}')
+    assert not offenders, (
+        'these decode child output with the locale codec; use '
+        '**library_common.TEXT_UTF8 instead:\n  ' + '\n  '.join(offenders))
+
+
+def test_text_utf8_replaces_undecodable_bytes_instead_of_raising():
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, '-c',
+         r'import sys; sys.stdout.buffer.write(b"ok \x9d\xff end")'],
+        capture_output=True, **library_common.TEXT_UTF8)
+    assert 'ok' in result.stdout and 'end' in result.stdout
+
+
 def test_a_folder_holding_only_a_video_still_counts_as_a_song_folder(tmp_path):
     """video_repair's whole job is folders that have a video, including ones
     whose chart files are missing or misnamed."""
