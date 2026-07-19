@@ -152,14 +152,15 @@ def scan_and_repair_video_library(home_folder, dry_run=False):
     Returns the counts dict (status -> number of videos), so a caller (e.g.
     the GUI) can build its own summary without re-parsing printed output.
     """
+    library_common.make_console_encoding_safe()
     print('=' * 70)
     print('SCANNING VIDEO LIBRARY FOR VFR / UNSUPPORTED CODECS' + (' (DRY RUN)' if dry_run else ''))
     print('=' * 70)
 
     counts = {}
-    for folder in sorted(Path(home_folder).iterdir()):
-        if not folder.is_dir() or folder.name.startswith('_'):
-            continue
+    # recursive, matching the app's own **/song.ini discovery -- a one-level
+    # walk finds zero songs in a Songs/<Pack>/<Song>/ library
+    for folder in library_common.iter_song_folders(home_folder):
         # every recognized video file, not just the first -- a folder with a
         # good video.mp4 can still hold a stale VP9 video.webm from another
         # tool, and checking only find_video_file()'s first hit would leave

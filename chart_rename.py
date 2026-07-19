@@ -241,25 +241,30 @@ STEM_DURATION_TOLERANCE_MS = MID_DURATION_TOLERANCE_MS
 def _apply_renames_atomically(plan):
     """Apply (source, target) renames, undoing them all if any one fails.
 
-    Returns (completed, None) on success, or (completed, (path, error,
-    unwound)) on failure, where `unwound` says whether every rename that had
-    already landed was successfully put back. Rolling back is itself a file
-    operation and can fail (the same lock that blocked the rename can block
-    the undo), so the caller is told which of the two states it's in rather
-    than being left to assume.
+    Returns (completed, None) on success, or (completed, (path, error, stuck))
+    on failure, where `stuck` lists the files that could not be put back.
+    Rolling back is itself a file operation and can fail (the same lock that
+    blocked the rename can block the undo), so the caller is told exactly
+    which files are still displaced rather than being left to assume.
     """
     done = []
     for path, target in plan:
         try:
             path.rename(target)
         except OSError as exc:
-            unwound = True
+            # Undo everything that landed, and keep going after a failed undo
+            # rather than stopping -- one stuck file must not strand the rest.
+            # Report the files STILL displaced, not len(done): most of the
+            # plan is normally restored, and telling the user to hand-fix
+            # three files when only one is actually misplaced sends them
+            # hunting for problems that no longer exist.
+            stuck = []
             for moved_from, moved_to in reversed(done):
                 try:
                     moved_to.rename(moved_from)
                 except OSError:
-                    unwound = False
-            return done, (path, exc, unwound)
+                    stuck.append(moved_to)
+            return done, (path, exc, stuck)
         done.append((path, target))
     return done, None
 
@@ -364,11 +369,12 @@ def apply_stem_renames(song_dir, ini_fields, dry_run=False):
             # mid-scan, an open Explorer preview) is enough to trigger this, so
             # undo what landed and report rather than propagating -- an
             # exception here aborted the entire library scan.
-            failed_path, error, unwound = failure
+            failed_path, error, stuck = failure
             detail = f'{failed_path.name}: rename failed ({error})'
-            if not unwound:
-                detail += (f'; could not undo {len(done)} earlier rename(s) in this '
-                           f'folder -- it is left partially renamed, fix by hand')
+            if stuck:
+                names = ', '.join(p.name for p in stuck)
+                detail += (f'; could not undo {len(stuck)} of them ({names}) -- '
+                           f'those files are left renamed, fix by hand')
             return {'status': 'needs_review', 'detail': detail}
 
     parts = []

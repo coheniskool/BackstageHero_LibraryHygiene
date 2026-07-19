@@ -126,15 +126,16 @@ def enrich_song_ini_metadata_library(home_folder, dry_run=False):
     (e.g. the GUI) can build its own summary without re-parsing printed
     output.
     """
+    library_common.make_console_encoding_safe()
     print('=' * 70)
     print('ENRICHING SONG METADATA FROM CHORUS ENCORE' + (' (DRY RUN)' if dry_run else ''))
     print('=' * 70)
 
     counts = {}
-    for folder in sorted(Path(home_folder).iterdir()):
-        if not folder.is_dir() or folder.name.startswith('_'):
-            continue
-
+    # recursive, matching the app's own **/song.ini discovery. The flat walk
+    # both missed every song in a nested library AND reported one spurious
+    # "no song.ini found" error per pack folder it mistook for a song.
+    for folder in library_common.iter_song_folders(home_folder):
         result = fill_song_ini_metadata(str(folder), dry_run=dry_run)
         counts[result['status']] = counts.get(result['status'], 0) + 1
 

@@ -344,6 +344,95 @@ highest-reasoning task in this plan.
 
 ---
 
+### Phase 3 outcome (2026-07-19)
+
+Two independent `devils-advocate` agents ran. **Both were provisioned without an execution
+tool**, so everything they produced is a static trace, not a measurement -- they each
+disclosed this honestly and refused to fabricate numbers, which is the right call. Every
+finding below was therefore **re-tested by execution in the main session** before being
+recorded. That re-testing changed the verdict on several.
+
+| # | Finding | Status after execution |
+|---|---|---|
+| **P3-H1** | Songs in an OLD nested `Songs/_needs_review/` are invisible to the repair scan (`iter_song_folders` skips `_`), but fully live to `gui._scan_library`'s `**/song.ini` glob, to Clone Hero, and to auto-download/resync | **CONFIRMED by execution.** Affects the user's real Kryptonite folder. No migration exists; re-running the tool will never find it. |
+| **P3-H2** | `static_art` converts (deletes) videos whose motion is real but thin/small; margin erodes with resolution | **CONFIRMED by measurement.** See table below. |
+| **P3-M1** | `dedupe_report` fuzzy-matches two similarly-named PACK folders as duplicate songs and could relocate a whole pack | **CONFIRMED by execution** (found in main session, not by an agent). Corrects the Phase 2.5 commit claim that the un-migrated tools "do not relocate". |
+| **P3-M2** | `make_console_encoding_safe()` was wired into `chart_rename` only; three sibling tools share the crash surface | **PARTIALLY confirmed.** Structural gap real. Only `metadata_enrichment` demonstrably crashed on the fixture; `video_repair`/`dedupe_report` did not reach a printing path. Agent overstated demonstrated blast radius. |
+| **P3-M3** | The `pythonw` `stdout=None` guard has zero test coverage; "180/180 passing" is cited as if it corroborated it | **CONFIRMED by inspection.** The branch is structurally unreachable under pytest. Suite-count-only evidence. |
+| **P3-M4** | The `SYNC_MANUAL` code comment tells the reader to "clear the offset in the sync editor" -- no such control exists | **CONFIRMED.** My comment, written in Phase 2.5. The real escape hatch is a forced re-download. |
+| **P3-L1** | `convert_to_album_art` writes the marker BEFORE promoting `album.png`, and the `os.replace` promote is the one unguarded file op | Plausible, code-evident, **not yet execution-tested**. Video is not lost either way. |
+| **P3-L2** | `_apply_renames_atomically` reports `len(done)` rather than the count that actually failed to unwind | **NOT confirmed** -- my test fixture was broken (`drums_2` is itself a valid stem role, so the failure never triggered). Code-evident but unproven. |
+
+#### P3-H2 measured -- the number the whole feature rests on
+
+`_luminance_grid` resamples the **native-resolution** frame to a fixed 32x32, so a
+fixed-pixel-size element covers proportionally less of one cell as resolution rises. Real
+ffmpeg fixtures, real `probe_static_video()`, thresholds `hash<=2` **and** `cell<=24`:
+
+| content | 640x640 | 1280x720 | 1920x1080 | verdict |
+|---|---|---|---|---|
+| baseline held still | 1 | 1 | 1 | static (correct -- convert) |
+| CRF 40 heavy compression still | 6 | 3 | 2 | static (correct -- convert) |
+| scrolling lyric line, 4% tall | 228 | 228 | 230 | video (**safe**) |
+| scrolling lyric line, 2% tall | 129 | 131 | 132 | near_static (**safe**) |
+| corner equalizer bar | 80 | 84 | 84 | near_static (safe) |
+| moving dot, proportional to frame | 90 | 123 | 122 | near_static (safe) |
+| moving dot, fixed 16px | **133** | **53** | **31** | near_static -- but 4x erosion |
+| thin progress bar crawling | **19** | **17** | **17** | **static -- DELETED** |
+
+Threshold-crossing sweep at 1920x1080: 32px dot = 88, 24px = 63, 16px = 25 (**one point**
+above the threshold), 12px = 19 **deleted**, 8px = 8 **deleted**.
+
+**What this means, stated carefully.** The catastrophic reading is wrong: lyric videos,
+visualizers, equalizers and anything with proportionate motion score 80-230, an order of
+magnitude clear of the threshold. The feature does not eat real music videos. But two claims
+are falsified as written:
+
+1. README: *"Anything with real motion -- a slow zoom, a visualizer, a locked-off
+   performance -- is reported but never touched."* A thin progress bar is real motion and is
+   touched, at every resolution tested.
+2. `static_art.py`'s own comment: *"roughly 2x headroom over the worst legitimate still and
+   5x clearance under the smallest real motion."* At 1080p the smallest real motion tested
+   clears by **1.04x**, not 5x. The comment's numbers were measured at 640x640 only.
+
+The practical harm is bounded -- what slips through is content whose motion is genuinely
+trivial (a progress bar, a small logo bug), which arguably *should* convert. The defect is
+that the guarantee is stated far more strongly than the implementation delivers, and that
+the margin silently depends on a variable (resolution) nothing in the tests controls for.
+
+**Recommended, in order:** (a) correct the README and the code comment to state the real
+behaviour and the real measured margins; (b) resolution-normalise -- downscale the source
+frame to a fixed size *before* building the 32x32 grid, so cell size stops depending on
+input resolution; (c) pin the measured `cell` values for the CRF40 and small-motion fixtures
+in tests so erosion fails CI instead of rotting silently in a comment.
+
+### Phase 3 remediation (2026-07-19) -- all findings fixed, suite 264 -> 296
+
+| # | Fix |
+|---|---|
+| P3-H1 | `library_common.migrate_legacy_review_folders()` + a sixth Library Tools entry, **Move old review folders out of the library**. Moves each song individually so an existing sibling folder is merged rather than clobbered; a name that already exists on the far side is reported and left in place; every move is written to the same JSONL manifest the other tools use. Only the two literal legacy names are touched -- a user's own `_`-prefixed folder is left alone. |
+| P3-H2 | `_normalise()` scales every frame to a fixed 640px long edge **before** either measure, so a score describes content and not download quality. `STATIC_MAX_CELL_DELTA` re-derived from measurement: **24 -> 14**, between the worst legitimate still (10) and the smallest real motion (17). The progress bar now correctly reports `near_static` at every resolution instead of being deleted. Both edges pinned by tests that assert measured values, not just categorical verdicts. README and the code comment now state the real behaviour, including the honest limit (motion under ~1% of frame can still convert). |
+| P3-M1 | All four remaining tools switched to `iter_song_folders()`. `dedupe_report` no longer groups pack folders; `metadata_enrichment` no longer emits a spurious error per pack; `video_repair` and `static_art` now actually process nested libraries instead of silently finding nothing. |
+| P3-M2 | `make_console_encoding_safe()` wired into all five scans, with a parametrised cp1252 test covering every one. |
+| P3-M3 | Guard extracted to `library_common.ensure_stdio_not_none()`, called from both entry points, now covered by three tests -- including one proving the replacement stream itself survives non-cp1252 text, which the old `open(os.devnull, 'w')` did not. |
+| P3-M4 | The misleading comment now describes the real escape hatch (force a re-download) and states plainly that no "clear the marker" control exists. |
+| P3-L1 | `convert_to_album_art` promotes the art **before** committing the marker, with the `os.replace` guarded; a failure there now lands in the same clean state as a failed extraction, and a marker failure removes only art this call created. |
+| P3-L2 | The rollback message reports the files **actually** still displaced, by name, instead of `len(done)`. |
+
+Two of these were caught only because the fix broke an existing test, and in both cases the
+**test was right and the first fix was wrong**: `looks_like_song_folder()` did not count a
+folder holding only a video file (which is exactly what `video_repair` exists for), and the
+reordered promote initially left a stray `album.png` behind on a marker failure.
+
+**Verified end-to-end**, not just by unit test: a real library with a nested pack plus a song
+stranded in an old nested `_needs_review`, driven through the actual `LibraryToolsDialog`
+worker. Dry run produced a zero-line filesystem diff; the real run moved only the stranded
+song, wrote a manifest, left the pack untouched, removed the song from the app's own song
+list, and let `chart_rename` reach both nested songs afterwards. A second run reports
+"nothing to migrate".
+
+---
+
 ## Phase 4 -- Empirical verification *(user-run; logs over screenshots)*
 
 > Screenshots have been unreliable for us. **Every check below is verified by reading a log

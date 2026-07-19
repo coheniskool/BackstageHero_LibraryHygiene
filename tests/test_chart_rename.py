@@ -789,6 +789,42 @@ def test_a_failed_rename_says_so_when_it_cannot_roll_back(tmp_path):
     assert 'fix by hand' in result['detail']
 
 
+def test_the_failure_message_counts_only_the_files_actually_still_displaced(tmp_path):
+    """It used to report len(done) -- every rename that had landed -- even
+    though the rollback loop keeps going after a failure and normally restores
+    most of them. Telling the user to hand-fix three files when one is
+    misplaced sends them hunting for problems that no longer exist."""
+    for n in ('crowd_1.ogg', 'guitar_2.ogg', 'vocals_3.ogg', 'keys_4.ogg'):
+        (tmp_path / n).write_bytes(b'x')
+
+    real_rename = cr.Path.rename
+    calls = []
+
+    def flaky(self, target):
+        calls.append(self.name)
+        if len(calls) == 4:      # the 4th forward rename fails...
+            raise OSError(32, 'locked')
+        if len(calls) == 5:      # ...and exactly one undo fails too
+            raise OSError(32, 'locked')
+        return real_rename(self, target)
+
+    cr.Path.rename = flaky
+    try:
+        result = cr.apply_stem_renames(tmp_path, {})
+    finally:
+        cr.Path.rename = real_rename
+
+    originals = ('crowd_1.ogg', 'guitar_2.ogg', 'vocals_3.ogg', 'keys_4.ogg')
+    still_displaced = [n for n in originals if not (tmp_path / n).exists()]
+
+    assert result['status'] == 'needs_review'
+    assert len(still_displaced) == 1
+    assert 'could not undo 1 of them' in result['detail']
+    # and it names the file, so the user knows which one
+    role = still_displaced[0].split('_')[0]          # e.g. 'crowd_1.ogg' -> 'crowd'
+    assert f'{role}.ogg' in result['detail']
+
+
 def test_dry_run_never_renames_even_with_a_full_plan(tmp_path):
     (tmp_path / 'crowd_101.ogg').write_bytes(b'x')
     (tmp_path / 'vocals_103.ogg').write_bytes(b'x')

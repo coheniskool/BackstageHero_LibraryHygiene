@@ -8,10 +8,11 @@ import sys
 # visible error. This is the file build.py's PyInstaller invocation
 # actually targets, so the guard belongs here, not only in gui.py. Must run
 # before any other import.
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, 'w')
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, 'w')
+# The guard itself lives in library_common so it can be unit-tested -- inline
+# import-time code here is unreachable under pytest, so its removal would not
+# fail a single test. library_common imports only stdlib and prints nothing.
+import library_common
+library_common.ensure_stdio_not_none()
 
 import configparser
 import glob
@@ -726,9 +727,12 @@ def process_resync(folder, song_name, sync_ready):
     # SYNC_MANUAL for exactly this check -- without it, "Auto-sync" over a
     # checked library silently re-breaks the songs the user already fixed by
     # hand, which are by definition the ones audiosync got wrong the first
-    # time. To re-sync one of these on purpose, clear the offset in the sync
-    # editor; a deliberate re-download (replace=True) still overwrites it,
-    # since a new video makes the old hand-set offset meaningless anyway.
+    # time. The way back, if the user does want this song re-synced
+    # automatically: re-download it (select it and confirm the re-download
+    # prompt, which passes replace=True). process_download does not consult
+    # this marker, because a new video makes the old hand-set offset
+    # meaningless anyway. There is deliberately no "clear the marker" control
+    # -- the sync editor only ever writes SYNC_MANUAL, never clears it.
     if _read_ini_value(folder, 'backstagehero_sync') == SYNC_MANUAL:
         print('  Manually synced - leaving as-is')
         return 'skipped'

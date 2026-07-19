@@ -15,10 +15,12 @@ import sys
 # assumption that print() "goes nowhere" without a console (see
 # VideoDownload._setup_logging()) -- true for a frozen --noconsole build,
 # but not for plain pythonw without this guard.
-if sys.stdout is None:
-    sys.stdout = open(os.devnull, 'w')
-if sys.stderr is None:
-    sys.stderr = open(os.devnull, 'w')
+# The guard itself lives in library_common so it can actually be unit-tested;
+# as inline import-time code here it was unreachable under pytest, so nothing
+# in the suite would have caught its removal. library_common imports only
+# stdlib and prints nothing, so it is safe to load before the redirect.
+import library_common
+library_common.ensure_stdio_not_none()
 
 import glob
 import logging
@@ -792,6 +794,11 @@ _LIBRARY_TOOLS = (
      'Detects videos that are just an album cover held for the whole song, '
      'converts them to album art, and removes the video. Anything uncertain '
      '-- a slow zoom, a visualizer -- is only reported, never acted on.'),
+    ('migrate_review_folders', 'Move old review folders out of the library',
+     'Earlier versions put _needs_review inside your Songs folder, where Clone '
+     'Hero still loads them and this app still downloads videos for them, but '
+     'no repair scan can find them again. Moves any it finds to a folder '
+     'alongside your library instead. Nothing is deleted.'),
 )
 
 
@@ -941,6 +948,8 @@ class LibraryToolsDialog(ctk.CTkToplevel):
                 counts = dedupe_report.generate_dedupe_report(self._songs_folder, dry_run=dry_run)
             elif key == 'find_static_art':
                 counts = static_art.scan_and_convert_static_art_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'migrate_review_folders':
+                counts = library_common.migrate_legacy_review_folders(self._songs_folder, dry_run=dry_run)
             else:
                 counts = {}
             text = self._format_summary(key, counts, dry_run)
@@ -983,6 +992,18 @@ class LibraryToolsDialog(ctk.CTkToplevel):
             body = (f"{counts.get('converted', 0)} converted, "
                     f"{counts.get('near_static', 0)} near-static (reported), "
                     f"{counts.get('ok', 0)} real videos left alone")
+        elif key == 'migrate_review_folders':
+            if not counts:
+                body = 'nothing to migrate - no old review folders inside your library'
+            else:
+                # past tense on a dry run would read as if files had moved
+                moved = counts.get('would_move', 0) if dry_run else counts.get('moved', 0)
+                body = (f"{moved} folder(s) would move out" if dry_run
+                        else f"{moved} folder(s) moved out")
+                if counts.get('conflict'):
+                    body += f", {counts['conflict']} already existed (left in place)"
+                if counts.get('failed'):
+                    body += f", {counts['failed']} failed (details in log)"
         else:
             body = str(counts)
         return body + suffix

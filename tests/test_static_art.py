@@ -558,3 +558,136 @@ def test_real_process_download_loop_guard(tmp_path_factory, static_video):
     result = VideoDownload.process_download(str(song), 'Test', 'height<=720', False, False)
 
     assert result == 'skipped'
+
+
+# --- the safety margin, pinned by measurement -----------------------------
+#
+# Phase 3 found that STATIC_MAX_CELL_DELTA's justification lived only in a
+# comment, asserted at 640x640 and never re-measured. Real downloads run at
+# 720p/1080p, and the same content scored very differently there, so the
+# margin the whole feature rests on could erode to nothing without one test
+# going red. These assert the actual numbers, not just the categorical verdict.
+
+def _cell_delta(video):
+    """Largest per-cell change across the sampled frames -- the number the
+    delete decision is actually made on."""
+    duration, _ = sa._probe_duration_and_bitrate(str(video))
+    grids = [g for _h, g in sa._sample_frames(str(video), duration)]
+    return max((sa._max_cell_delta(a, b)
+                for i, a in enumerate(grids) for b in grids[i + 1:]), default=0)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('size', ['640x640', '1280x720', '1920x1080'])
+def test_a_held_still_scores_far_under_the_threshold_at_every_resolution(tmp_path_factory, size):
+    w, h = (int(v) for v in size.split('x'))
+    src = tmp_path_factory.mktemp('art') / 'art.png'
+    img = Image.new('RGB', (w, h), (18, 28, 58))
+    ImageDraw.Draw(img).ellipse([w * .2, h * .2, w * .8, h * .8], fill=(200, 60, 40))
+    img.save(src)
+    path = tmp_path_factory.mktemp('fx') / f'still_{size}.mp4'
+    _encode(['ffmpeg', '-loop', '1', '-i', str(src), '-t', '60', '-r', '30'], path)
+
+    delta = _cell_delta(path)
+
+    assert delta <= 4, f'held still scored {delta} at {size} (measured 1-2)'
+    assert sa.probe_static_video(path) == 'static'
+
+
+@requires_ffmpeg
+def test_heavy_compression_still_leaves_headroom_under_the_threshold(tmp_path_factory, art_image):
+    """The convert-side edge. If this creeps up toward STATIC_MAX_CELL_DELTA
+    the band has closed from below and the threshold needs re-deriving."""
+    path = tmp_path_factory.mktemp('fx') / 'crf40.mp4'
+    subprocess.run(['ffmpeg', '-loop', '1', '-i', str(art_image), '-t', '60', '-r', '30',
+                    '-c:v', 'libx264', '-crf', '40', '-pix_fmt', 'yuv420p', '-y', str(path)],
+                   check=True, capture_output=True)
+
+    delta = _cell_delta(path)
+
+    assert delta <= 10, f'worst legitimate still scored {delta}, threshold is {sa.STATIC_MAX_CELL_DELTA}'
+    assert sa.probe_static_video(path) == 'static'
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize('size', ['640x640', '1280x720', '1920x1080'])
+def test_a_thin_progress_bar_is_never_converted(tmp_path_factory, size):
+    """The actual false positive Phase 3 caught: a crawling progress bar is
+    real motion, but being THIN its delta averages down to 17-19 -- under the
+    old threshold of 24, so the video was being deleted. The README promises
+    real motion is never touched; this is what holds that promise."""
+    w, h = (int(v) for v in size.split('x'))
+    src = tmp_path_factory.mktemp('art') / 'art.png'
+    img = Image.new('RGB', (w, h), (18, 28, 58))
+    ImageDraw.Draw(img).ellipse([w * .2, h * .2, w * .8, h * .8], fill=(200, 60, 40))
+    img.save(src)
+    barh = max(4, int(h * 0.012))
+    path = tmp_path_factory.mktemp('fx') / f'bar_{size}.mp4'
+    subprocess.run([
+        'ffmpeg', '-loop', '1', '-i', str(src), '-t', '60', '-r', '30',
+        '-f', 'lavfi', '-i', f'color=c=red:s={w}x{barh}:r=30',
+        '-filter_complex',
+        f"[1:v]loop=loop=-1:size=1[p];[0:v][p]overlay=x=-{w}+{w}*t/60:y={h - barh}",
+        '-t', '60', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', str(path),
+    ], check=True, capture_output=True)
+
+    assert sa.probe_static_video(path) != 'static'
+
+
+@requires_ffmpeg
+def test_a_scrolling_lyric_line_is_nowhere_near_the_threshold(tmp_path_factory, art_image):
+    """A lyric video is real content a user would be upset to lose. Measured
+    at 129-230, an order of magnitude clear -- this is the reassuring end of
+    the finding and it should stay that way."""
+    path = tmp_path_factory.mktemp('fx') / 'lyrics.mp4'
+    subprocess.run([
+        'ffmpeg', '-loop', '1', '-i', str(art_image), '-t', '60', '-r', '30',
+        '-f', 'lavfi', '-i', 'color=c=white:s=320x26:r=30',
+        '-filter_complex',
+        "[1:v]loop=loop=-1:size=1[t];[0:v][t]overlay=x=160:y=640-640*mod(t\\,6)/6",
+        '-t', '60', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', str(path),
+    ], check=True, capture_output=True)
+
+    delta = _cell_delta(path)
+
+    assert delta >= 100, f'lyric line scored only {delta} -- margin has collapsed'
+    assert sa.probe_static_video(path) != 'static'
+
+
+def test_normalising_makes_the_score_independent_of_resolution():
+    """_normalise scales every frame to a fixed long edge before measuring, so
+    the same content scores the same whether it was downloaded at 720p or
+    1080p. Without it the delete decision depended on download quality."""
+    big = Image.new('RGB', (1920, 1080), (10, 10, 10))
+    ImageDraw.Draw(big).rectangle([200, 200, 800, 700], fill=(220, 40, 40))
+    small = big.resize((640, 360), sa._RESAMPLE)
+
+    assert sa._luminance_grid(sa._normalise(big), sa.STATIC_GRID) == \
+        sa._luminance_grid(sa._normalise(small), sa.STATIC_GRID)
+
+
+def test_normalise_leaves_an_already_small_frame_alone():
+    small = Image.new('RGB', (320, 240), (5, 5, 5))
+    assert sa._normalise(small) is small
+
+
+# --- ordering: a failed art promote must not leave a committed marker -----
+
+def test_a_failed_art_promote_leaves_no_marker_and_keeps_the_video(monkeypatch, tmp_path):
+    """The promote used to run AFTER the marker was committed, and unguarded.
+    A failure there left marker-set / no-album.png / video-still-present --
+    a state with no name, which process_download then skipped forever."""
+    song = _make_song(tmp_path)
+    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
+    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', lambda p: (30.0, None))
+    monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: b'FAKE PNG BYTES')
+    monkeypatch.setattr(sa.os, 'replace',
+                        lambda *a, **k: (_ for _ in ()).throw(OSError(13, 'locked')))
+
+    result = sa.convert_to_album_art(song)
+
+    assert result['status'] == 'failed'
+    assert (song / 'video.mp4').exists()
+    assert not (song / 'album.png').exists()
+    assert not (song / 'album.png.tmp').exists()
+    assert 'backstagehero_video' not in (song / 'song.ini').read_text(encoding='utf-8')

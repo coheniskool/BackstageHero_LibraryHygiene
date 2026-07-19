@@ -15,6 +15,115 @@ import sys
 from pathlib import Path
 
 
+def ensure_stdio_not_none():
+    """Give print() somewhere to go when there is no console at all.
+
+    pythonw.exe with no console attached (a plain Explorer double-click, or
+    this project's own .bat launcher) sets sys.stdout/stderr to None -- not
+    closed, None. The first print() or warnings.warn() anywhere in the app or
+    any dependency then dies instantly with no window and no error.
+
+    Lives here, called from both entry points, specifically so it can be
+    tested: as import-time code in gui.py it was structurally unreachable
+    under pytest (pytest never sets sys.stdout to None), so deleting it would
+    not have failed a single test in the suite despite the suite count being
+    cited as evidence the fix worked.
+    """
+    opened = []
+    for name in ('stdout', 'stderr'):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, open(os.devnull, 'w', encoding='utf-8', errors='replace'))
+            opened.append(name)
+    return opened
+
+
+# --- legacy review-folder migration ---------------------------------------
+#
+# Review folders used to be created INSIDE the scanned library root
+# (Songs/_needs_review/...). That was fixed to place them as a sibling, but
+# only for folders relocated afterwards -- anything already moved stayed put,
+# and is now in the worst of both worlds: iter_song_folders() skips any name
+# starting with '_', so no repair scan will ever find it again, while
+# gui._scan_library()'s recursive **/song.ini glob has no such filter, so the
+# app's song list, auto-download and auto-resync all still act on it, and
+# Clone Hero still shows it. Confirmed by execution, not assumed.
+#
+# The names are the literal ones the old code produced, matched exactly rather
+# than by prefix -- a user's own folder starting with '_' must not be swept up.
+
+LEGACY_REVIEW_FOLDER_NAMES = ('_needs_review', '_duplicates_review')
+
+
+def find_legacy_review_folders(home_folder):
+    """Old-style review folders sitting inside the library root, if any."""
+    home_folder = Path(home_folder)
+    found = []
+    for name in LEGACY_REVIEW_FOLDER_NAMES:
+        candidate = home_folder / name
+        if candidate.is_dir() and not candidate.is_symlink():
+            found.append(candidate)
+    return found
+
+
+def migrate_legacy_review_folders(home_folder, dry_run=False):
+    """Move old nested review folders out to the sibling location.
+
+    Returns a counts dict. Each song folder is moved individually into the
+    sibling review root so an existing sibling folder is merged with rather
+    than clobbered, and a name that already exists on the far side is left
+    where it is and reported -- never overwritten.
+    """
+    home_folder = Path(home_folder)
+    counts = {}
+
+    def bump(key):
+        counts[key] = counts.get(key, 0) + 1
+
+    for legacy in find_legacy_review_folders(home_folder):
+        review_root = _review_root(home_folder, legacy.name)
+        try:
+            entries = sorted(p for p in legacy.iterdir() if p.is_dir())
+        except OSError as e:
+            log.error('could not read legacy review folder %s: %s', legacy, e)
+            bump('unreadable')
+            continue
+
+        for song_dir in entries:
+            dest = review_root / song_dir.name
+            if dest.exists():
+                print(f'  CONFLICT: {song_dir.name} already exists in {review_root.name} '
+                      f'- left in place')
+                bump('conflict')
+                continue
+            if dry_run:
+                print(f'  Would move: {legacy.name}/{song_dir.name} -> {review_root.name}/')
+                bump('would_move')
+                continue
+            try:
+                review_root.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(song_dir), str(dest))
+            except (OSError, shutil.Error) as e:
+                log.error('could not migrate %s: %s', song_dir, e)
+                print(f'  FAILED: {song_dir.name} ({e})')
+                bump('failed')
+                continue
+            _append_review_manifest(home_folder, legacy.name, song_dir, dest,
+                                    'migrated from legacy nested review folder',
+                                    cross_volume=False, verification='migration')
+            print(f'  Moved: {legacy.name}/{song_dir.name} -> {review_root.name}/')
+            bump('moved')
+
+        # only remove the old container once it is genuinely empty
+        if not dry_run:
+            try:
+                if not any(legacy.iterdir()):
+                    legacy.rmdir()
+                    bump('emptied')
+            except OSError:
+                pass
+    return counts
+
+
 def make_console_encoding_safe():
     """Make print() incapable of killing a library scan.
 
@@ -83,10 +192,20 @@ def looks_like_song_folder(folder):
     """True if this directory holds song content itself, rather than holding
     other song folders. Deliberately generous: an ID-suffixed song_2400.ini
     or a bare notes.chart counts, since those broken states are exactly what
-    the hygiene tools are for."""
+    the hygiene tools are for.
+
+    A recognised background-video file counts too. Clone Hero only ever reads
+    one from inside a song folder, so its presence identifies one just as well
+    as a chart does -- and video_repair's whole job is folders that have a
+    video, including any whose chart files are missing or misnamed.
+    """
     try:
         for path in Path(folder).iterdir():
-            if path.is_file() and path.suffix.lower() in SONG_FOLDER_MARKER_EXTENSIONS:
+            if not path.is_file():
+                continue
+            if path.suffix.lower() in SONG_FOLDER_MARKER_EXTENSIONS:
+                return True
+            if path.name.lower() in VIDEO_NAMES:
                 return True
     except OSError:
         pass

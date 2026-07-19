@@ -81,16 +81,41 @@ STATIC_LOOSE_DISTANCE = 10
 # tightening; a global average simply cannot see local motion, and tightening
 # it only breaks legitimately static videos instead.
 #
-# So compare frames cell by cell too, on a 32x32 luminance grid, and take the
-# single largest change in any one cell. Lossy noise on a held still is small
-# and spread evenly, while any real movement spikes at least one cell hard,
-# even when the frame-wide average barely shifts. The measured separation is
-# wide: a held still scores 1, the same still re-encoded at a deliberately
-# awful CRF 40 scores 10, while the smallest real motion tested scores 129.
-# 24 sits inside that gap with roughly 2x headroom over the worst legitimate
-# still and 5x clearance under the smallest real motion.
+# So compare frames cell by cell too, on a 32x32 luminance grid (of the
+# normalised frame -- see _normalise), and take the single largest change in
+# any one cell. Lossy noise on a held still is small and spread evenly, while
+# real movement spikes at least one cell hard, even when the frame-wide average
+# barely shifts.
+#
+# Measured on real ffmpeg fixtures at 640x640, 720p and 1080p. Convert side:
+# a held still scores 1-2, the same still under a grain overlay 2, and at a
+# deliberately awful CRF 40 it reaches 6 (10 on an earlier, harsher fixture).
+# Keep side: a scrolling lyric line scores 129-230, a corner equaliser 80-84, a
+# proportionally-sized moving element 90-122.
+#
+# The number was 24 and that was wrong. A thin element -- the crawling progress
+# bar common on album-art uploads -- occupies a fraction of a cell's height, so
+# its delta averages down to 17-19 and it was being CONVERTED, i.e. a video
+# with real motion was deleted, which is the one outcome this module exists to
+# prevent. 14 sits between the worst legitimate still measured (10) and the
+# smallest real motion measured (17).
+#
+# That is a deliberately narrow band, and the direction of each error is why it
+# is acceptable: too high deletes real video, too low merely keeps a static one
+# and wastes disk. Erring low is the cheap mistake. Both edges are pinned by
+# tests asserting the measured values, so this stops being a comment that can
+# quietly rot away from the code.
+#
+# Known and accepted limit: motion occupying well under ~1% of the frame (a
+# small logo bug, an 8px blinking dot at 1080p) still scores below 14 and will
+# convert. Detecting that reliably needs a finer measure than a 32x32 grid, and
+# the README says so rather than promising otherwise.
 STATIC_GRID = 32
-STATIC_MAX_CELL_DELTA = 24
+STATIC_MAX_CELL_DELTA = 14
+
+# Every frame is scaled to this long edge before either measure is taken, so a
+# score describes content and not resolution. See _normalise().
+NORMALISE_LONG_EDGE = 640
 
 # Videos shorter than this are never classified at all: too few distinct frames
 # to distinguish a still from a short shot that happens to hold steady.
@@ -153,6 +178,30 @@ def _extract_frame_png(video_path, timestamp):
     except Exception as e:
         log.error(f'ffmpeg frame extract error {video_path} @ {timestamp:.1f}s: {e}')
         return None
+
+
+def _normalise(image):
+    """Scale a frame to a fixed long edge before any measurement is taken.
+
+    Without this the cell-delta score depends on the video's resolution, not
+    just its content. _luminance_grid resamples whatever it is given down to a
+    fixed grid, so one cell covers 20 source pixels on a 640px frame but 60 on
+    a 1920px one -- and a moving element smaller than a cell has its
+    contribution averaged down in proportion. Measured on identical content: a
+    fixed 16px moving dot scored 133 at 640x640, 53 at 720p and 31 at 1080p.
+    Same video, same motion, a 4x difference in the number the delete decision
+    is made on, purely from resolution.
+
+    That made the thresholds untestable in any durable way: every number in
+    this module was measured at 640x640, while real downloads run at 720p or
+    1080p. Normalising first makes the score a function of how much of the
+    FRAME moves, which is the property actually being asked about.
+    """
+    if max(image.size) <= NORMALISE_LONG_EDGE:
+        return image
+    scale = NORMALISE_LONG_EDGE / max(image.size)
+    return image.resize((max(1, round(image.width * scale)),
+                         max(1, round(image.height * scale))), _RESAMPLE)
 
 
 def _luminance_grid(image, size):
@@ -225,8 +274,9 @@ def _sample_frames(video_path, duration, samples=SAMPLE_FRAMES):
             continue
         try:
             with Image.open(io.BytesIO(png)) as frame:
-                frames.append((_average_hash(_luminance_grid(frame, 8)),
-                               _luminance_grid(frame, STATIC_GRID)))
+                norm = _normalise(frame)
+                frames.append((_average_hash(_luminance_grid(norm, 8)),
+                               _luminance_grid(norm, STATIC_GRID)))
         except Exception as e:
             log.error(f'frame decode error {video_path} (sample {i}): {e}')
     return frames
@@ -388,20 +438,37 @@ def convert_to_album_art(song_dir, dry_run=False):
             return {'status': 'failed',
                     'detail': f'{video_path.name}: album art could not be written - video kept'}
 
-    # 2. Commit the marker before anything is removed. Without it the song
-    #    reads as "still needs a video" and the same static upload comes back
-    #    on the next run, so a marker we couldn't write means we must not
-    #    proceed -- a song.ini with no [song] section stops us here.
+    # 2. Promote the art to its final name BEFORE the marker is committed.
+    #    This used to run after, and unguarded: a failing os.replace (a lock,
+    #    a full disk, a long path) then threw with the marker already written,
+    #    leaving a state with no name in the vocabulary above -- marker set,
+    #    video still present, no album.png, an orphaned .tmp -- and one that
+    #    process_download's video-exists check permanently skips, so only the
+    #    library scan could ever heal it. Promoting first means a failure here
+    #    lands in the same clean, already-tested place as a failed extraction.
+    if art_tmp is not None:
+        try:
+            os.replace(art_tmp, song_dir / 'album.png')
+        except OSError as e:
+            log.error(f'could not finalise album art for {song_dir}: {e}')
+            art_tmp.unlink(missing_ok=True)
+            return {'status': 'failed',
+                    'detail': f'{video_path.name}: album art could not be finalised - video kept'}
+
+    # 3. Commit the marker. Without it the song reads as "still needs a video"
+    #    and the same static upload comes back on the next run, so a marker we
+    #    couldn't write means we must not proceed -- a song.ini with no [song]
+    #    section stops us here, with the video still on disk. Undo the art we
+    #    just promoted so a failed conversion leaves nothing behind; only art
+    #    this call created is removed (art_tmp is None when the song already
+    #    had its own), so a user's existing album.png is never touched.
     if not _write_static_art_marker(song_dir):
         if art_tmp is not None:
-            art_tmp.unlink(missing_ok=True)
+            (song_dir / 'album.png').unlink(missing_ok=True)
         return {'status': 'failed',
                 'detail': f'{video_path.name}: song.ini has no [song] section - video kept'}
 
-    if art_tmp is not None:
-        os.replace(art_tmp, song_dir / 'album.png')
-
-    # 3. Only now, with the art and the marker both committed, remove the
+    # 4. Only now, with the art and the marker both committed, remove the
     #    video. Failing here is harmless: the song is already marked, so it
     #    won't re-download, and a later scan will retry the delete.
     try:
@@ -429,18 +496,23 @@ def scan_and_convert_static_art_library(home_folder, dry_run=False):
     video_repair.scan_and_repair_video_library's shape so the GUI can build
     its own summary without re-parsing printed output.
     """
+    library_common.make_console_encoding_safe()
     print('=' * 70)
     print('SCANNING FOR STATIC ALBUM-ART VIDEOS' + (' (DRY RUN)' if dry_run else ''))
     print('=' * 70)
 
     counts = {}
-    for folder in sorted(Path(home_folder).iterdir()):
-        if not folder.is_dir() or folder.name.startswith('_'):
-            continue
+    # recursive, matching the app's own **/song.ini discovery -- a one-level
+    # walk finds zero songs in a Songs/<Pack>/<Song>/ library
+    for folder in library_common.iter_song_folders(home_folder):
+        try:
+            label = str(folder.relative_to(home_folder))
+        except ValueError:
+            label = folder.name
         result = convert_to_album_art(folder, dry_run=dry_run)
         counts[result['status']] = counts.get(result['status'], 0) + 1
         if result['status'] in ('converted', 'near_static', 'failed'):
-            print(f"  {folder.name}: {result['detail']}")
+            print(f"  {label}: {result['detail']}")
 
     print()
     print(

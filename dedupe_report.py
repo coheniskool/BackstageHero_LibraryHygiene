@@ -296,8 +296,16 @@ def generate_dedupe_report(home_folder, dry_run=False):
     summary without re-parsing printed output.
     """
     home_folder = Path(home_folder)
-    song_folders = [f for f in home_folder.iterdir() if f.is_dir() and not f.name.startswith('_')]
+    # Recursive, matching the app's own **/song.ini discovery. The flat walk
+    # treated each PACK folder of a nested library as a song: two packs with
+    # near-identical names ("Guitar Hero III" / "Guitar Hero III (2)") fuzzy-
+    # matched into a candidate group on folder name alone, despite neither
+    # having a song.ini at all -- and find_song_audio()'s lone-file fallback
+    # can pick up a stray loose track in a pack root, which is enough to let a
+    # fingerprint confirm and relocate an ENTIRE pack into _duplicates_review.
+    song_folders = list(library_common.iter_song_folders(home_folder))
 
+    library_common.make_console_encoding_safe()
     print('=' * 70)
     print('DUPLICATE SONG DETECTION' + (' (DRY RUN)' if dry_run else ''))
     print('=' * 70)
