@@ -50,6 +50,7 @@ import video_repair
 import chart_rename
 import metadata_enrichment
 import dedupe_report
+import static_art
 
 log = logging.getLogger('backstagehero')
 
@@ -787,6 +788,10 @@ _LIBRARY_TOOLS = (
      'Finds duplicate charts of the same song, scores each copy, and moves '
      'everything but the best-scoring keeper to _duplicates_review/. Never '
      'deletes anything.'),
+    ('find_static_art', 'Find static album-art videos',
+     'Detects videos that are just an album cover held for the whole song, '
+     'converts them to album art, and removes the video. Anything uncertain '
+     '-- a slow zoom, a visualizer -- is only reported, never acted on.'),
 )
 
 
@@ -910,6 +915,8 @@ class LibraryToolsDialog(ctk.CTkToplevel):
                 counts = metadata_enrichment.enrich_song_ini_metadata_library(self._songs_folder, dry_run=dry_run)
             elif key == 'find_duplicates':
                 counts = dedupe_report.generate_dedupe_report(self._songs_folder, dry_run=dry_run)
+            elif key == 'find_static_art':
+                counts = static_art.scan_and_convert_static_art_library(self._songs_folder, dry_run=dry_run)
             else:
                 counts = {}
             text = self._format_summary(key, counts, dry_run)
@@ -944,6 +951,10 @@ class LibraryToolsDialog(ctk.CTkToplevel):
             body = (f"{counts.get('resolved', 0)} resolved, "
                     f"{counts.get('skipped_all_ineligible', 0)} unscanned, "
                     f"{counts.get('skipped_not_confirmed', 0)} unconfirmed")
+        elif key == 'find_static_art':
+            body = (f"{counts.get('converted', 0)} converted, "
+                    f"{counts.get('near_static', 0)} near-static (reported), "
+                    f"{counts.get('ok', 0)} real videos left alone")
         else:
             body = str(counts)
         return body + suffix

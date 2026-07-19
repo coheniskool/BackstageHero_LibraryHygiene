@@ -361,9 +361,11 @@ def scan_song_folder_album_art(song_dir):
 def apply_album_art_rename(song_dir, dry_run=False):
     """Rename an unambiguous ID-suffixed album-art file to its literal name.
 
-    No content verification is feasible for album art -- no embedded
-    metadata, and image content can't be meaningfully cross-checked against
-    song.ini -- so uniqueness alone (already guaranteed by
+    For user-provided or external album art: no content verification is
+    feasible -- no embedded metadata, and image content can't be meaningfully
+    cross-checked against song.ini. For album art extracted from a static
+    video: static_art.py's frame-based verification has already confirmed
+    content. In both cases, uniqueness alone (guaranteed by
     scan_song_folder_album_art() before this is reached) is the safety bar,
     consistent with album art's non-blocking status in Clone Hero.
 

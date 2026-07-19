@@ -58,6 +58,7 @@ import yt_dlp
 from tqdm import tqdm
 
 import resolver_client
+import static_art
 import video_repair
 
 __version__ = '2.2.0'
@@ -585,6 +586,15 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     if not replace and os.path.exists(os.path.join(folder, 'video.mp4')):
         return 'skipped'
 
+    # a song deliberately left without a video is done, not still missing one.
+    # without this the static-art conversion defeats itself: every run would
+    # re-download the same album-art upload, re-detect it, and delete it again,
+    # forever. treated exactly like an existing video.mp4 above, including
+    # honouring replace=True.
+    if not replace and _read_ini_value(folder, static_art.VIDEO_MARKER_KEY) == \
+            static_art.VIDEO_MARKER_STATIC_ART:
+        return 'skipped'
+
     artist, title = read_metadata(folder)
     ch = resolver_client.chart_hash(folder) if resolver_client.enabled() else None
 
@@ -639,6 +649,21 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     if is_converted(folder):
         print('  Phase Shift converter file detected - video kept, timing left as-is')
         return
+
+    # some "videos" are just the album cover held for the length of the song.
+    # the duration floor in select_video can't catch those - a static upload of
+    # the right song is exactly the right length - so judge the file we just
+    # downloaded on its contents. only a strict-tier match converts; anything
+    # uncertain keeps the video and carries on as normal.
+    if static_art.probe_static_video(os.path.join(folder, 'video.mp4')) == 'static':
+        result = static_art.convert_to_album_art(folder)
+        if result['status'] == 'converted':
+            print('  ' + result['detail'])
+            # no resolver report: there's no video match to contribute here,
+            # and reporting one would poison the shared pool for everyone else.
+            return
+        log.warning('Static-art conversion failed for %s (%s); keeping the video',
+                    song_name, result['detail'])
 
     # offset was measured against `url`. if a fallback candidate downloaded
     # instead, that offset is for a different video, so drop it and don't report
