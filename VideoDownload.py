@@ -840,13 +840,28 @@ def process_download(folder, song_name, quality, sync_ready, replace):
 def process_resync(folder, song_name, sync_ready):
     """Re-fingerprint an existing video to fix its timing.
 
-    Prefers the video file already on disk: ffmpeg decodes its audio track
-    directly (compute_offset_ms/_decode don't care whether the input is a
-    dedicated audio file or a muxed video), so the common case -- the video
-    hasn't changed, only its stored timing needs a recheck -- costs zero
-    network requests. Falls back to the stored YouTube source, then a fresh
-    search, exactly as before, for a local video that's missing, corrupted,
-    or genuinely no longer fingerprint-matches.
+    Uses the video file already on disk WHEN IT HAS AN AUDIO TRACK: ffmpeg can
+    decode that directly, so the recheck costs zero network requests.
+
+    Measured against a real library (2026-07-19), because the original claim
+    here was that this covered "the common case" -- it does not, and the
+    opposite is true for anything this app downloaded:
+
+        downloaded by this app :   0 with audio,  87 without
+        left by the predecessor:  33 with audio,   0 without
+
+    quality_format() asks for `bestvideo[...]` first, which is a video-only
+    stream, so a successful download normally has no audio at all. The
+    optimisation therefore only ever applies to videos that came from
+    somewhere else. It was verified originally by muxing synthetic audio into
+    a test MP4 -- a file shaped unlike anything the downloader produces, which
+    is why the gap survived a green suite.
+
+    Checking for the audio stream up front rather than letting the decode fail
+    matters at library scale: without it, every resync of an app-downloaded
+    video hands a 60MB file to ffmpeg only to be told there is nothing to
+    decode. Falls back to the stored YouTube source, then a fresh search,
+    exactly as before.
 
     Returns 'skipped' for a song this pass deliberately left alone.
     """
@@ -872,7 +887,7 @@ def process_resync(folder, song_name, sync_ready):
     artist, title = read_metadata(folder)
 
     local_video = os.path.join(folder, 'video.mp4')
-    if os.path.exists(local_video):
+    if os.path.exists(local_video) and _has_audio_stream(local_video):
         print('\nRe-syncing: ' + build_query(artist, title) + '  (from local video, no download)')
         ms, info, _ = audiosync.compute_offset_ms(folder, local_video)
         if ms is not None and set_ini_values(folder, {'video_start_time': str(ms),
@@ -934,6 +949,25 @@ def _read_ini_value(folder, key):
         if sec.lower() == 'song':
             return cp.get(sec, key, fallback='').strip() or None
     return None
+
+
+def _has_audio_stream(path):
+    """True if this file carries an audio track ffmpeg could decode.
+
+    Fails CLOSED on any probe error: the only caller uses this to decide
+    whether to bother trying a local fingerprint, and "couldn't tell" should
+    fall through to the network path that works rather than attempt a decode
+    that is about to fail anyway.
+    """
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', str(path)],
+            capture_output=True, timeout=15, creationflags=NO_WINDOW,
+            **library_common.TEXT_UTF8)
+        return 'audio' in (result.stdout or '')
+    except Exception:
+        return False
 
 
 def get_stored_source(folder):

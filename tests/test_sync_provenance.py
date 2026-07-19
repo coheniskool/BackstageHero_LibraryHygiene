@@ -186,6 +186,10 @@ def test_a_non_manual_song_is_still_resynced(tmp_path, monkeypatch):
         '[song]\nname = Test\nartist = Someone\n'
         f'backstagehero_sync = {vd.SYNC_GUESS}\n', encoding='utf-8')
     (tmp_path / 'video.mp4').write_bytes(b'not really a video')
+    # a stub file has no decodable audio stream, so the local-video path is
+    # correctly skipped -- say which case this test is exercising rather than
+    # letting it silently drift onto the network fallback
+    monkeypatch.setattr(vd, '_has_audio_stream', lambda path: True)
     monkeypatch.setattr(vd.audiosync, 'compute_offset_ms',
                         lambda f, a: (7200, 'matched', 0.95))
     written = _capture_ini(monkeypatch)
