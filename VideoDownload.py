@@ -1,13 +1,27 @@
+import os
+import sys
+
+# A console-less launch (pythonw.exe, or a --noconsole frozen build without
+# the bootloader's own stdio shim covering every case) sets sys.stdout/
+# stderr to None, not just closed -- the first print() or warnings.warn()
+# anywhere in this module or a dependency then crashes immediately with no
+# visible error. This is the file build.py's PyInstaller invocation
+# actually targets, so the guard belongs here, not only in gui.py. Must run
+# before any other import.
+# The guard itself lives in library_common so it can be unit-tested -- inline
+# import-time code here is unreachable under pytest, so its removal would not
+# fail a single test. library_common imports only stdlib and prints nothing.
+import library_common
+library_common.ensure_stdio_not_none()
+
 import configparser
 import glob
 import logging
 import logging.handlers
-import os
 import random
 import re
 import shutil
 import subprocess
-import sys
 import time
 
 # updater goes first so a cached newer yt-dlp gets onto sys.path before yt_dlp loads
@@ -45,6 +59,8 @@ import yt_dlp
 from tqdm import tqdm
 
 import resolver_client
+import static_art
+import video_repair
 
 __version__ = '2.2.0'
 
@@ -82,9 +98,104 @@ TEMP_ARTIFACTS = [
     'song.ini.tmp',
 ]
 
-# how many search results to pull, and how many to fingerprint-test before falling back
-SEARCH_RESULTS = 5
+# how many search results to pull, and how many to fingerprint-test before falling back.
+# Pulling more than we gate on is deliberate: ranking (duration, then what KIND
+# of video the title says it is) needs somewhere to demote the junk TO. The
+# extra results cost one search call and no extra audio downloads.
+SEARCH_RESULTS = 8
 GATE_CANDIDATES = 3
+
+# What the candidate's own title says it is.
+#
+# Fingerprinting confirms the AUDIO matches the chart. It is completely blind to
+# what is on screen -- a lyric video, a Guitar Hero playthrough and the official
+# music video all carry identical audio, so audiosync confirms all three with
+# equal confidence and writes `measured` for each. Found in a real playtest
+# (2026-07-19): almost every fingerprint-confirmed video in a 5,130-song library
+# was a lyric video or Rock Band / Guitar Hero gameplay footage. The offsets were
+# right; the videos were simply not what anyone wanted to watch.
+#
+# The candidate title comes back free with the flat search and was previously
+# only ever printed. Matching on it is the one signal available that can tell
+# these apart at all, before any download happens.
+#
+# Deliberately demote rather than exclude: for an obscure custom chart a lyric
+# video may be the only thing that exists, and this project's own rule is that a
+# video is worth having unless it is confidently wrong. A real video simply wins
+# whenever one is present.
+# Plain substrings are enough for the unambiguous ones.
+_GAMEPLAY_MARKERS = (
+    'guitar hero', 'rock band', 'rockband', 'clone hero', 'rocksmith',
+    'playthrough', 'play through', 'gameplay', 'sightread', 'sight read',
+    'chart preview', 'custom chart', 'drum chart', 'note chart', 'notes chart',
+    'expert+', 'expert +', '100% fc', 'full combo', 'beat saber',
+    # The Rock Band Network naming convention, which is what this library is
+    # actually full of: "<Song> by <Artist> Full Band FC #123". Measured on 42
+    # real fingerprint-confirmed songs -- the first version of this list caught
+    # 8 of them, because it looked for the words a person would use to describe
+    # gameplay rather than the words these uploads actually use.
+    'full band', 'expert guitar', 'expert bass', 'expert drums',
+    'expert vocals', 'pro drums', 'pro guitar', 'harmonies',
+)
+
+# Short, collision-prone tokens: matched on word boundaries so 'rbn' does not
+# fire inside an ordinary word and 'fc' does not fire inside 'fcuk'.
+# rbn\d* rather than rbn: the real library contains "RBN2 EA - Calling to
+# Dance", which \brbn\b cannot match because RBN2 is a single word.
+_GAMEPLAY_TOKEN_RE = re.compile(
+    r'\b(rbn\d*|rb[123]|gh[1235]|fc\s*#?\d*|dc\d+)\b', re.I)
+_LYRIC_MARKERS = (
+    'lyric', 'karaoke', 'sing along', 'singalong', 'sing-along',
+)
+_AUDIO_ONLY_MARKERS = (
+    'official audio', 'full album', 'audio only', '(audio)', '[audio]',
+    'visualizer', 'visualiser',
+)
+# "official video" alone missed most of the real thing. Measured against 216
+# titles this classifier had called 'unknown': "Official HD Video" does not
+# contain the substring "official video", and plenty of genuine uploads say
+# only "Music Video", "(the music video)" or "Promovideo". Since the lyric and
+# gameplay checks run first, "Official Lyric Video" is still a lyric video --
+# these markers only ever get to promote something nothing else objected to.
+_OFFICIAL_MARKERS = (
+    'music video', 'promovideo', 'promo video', 'officialvideo',
+)
+
+# "official <anything> video" -- HD, 4K, HQ, music, live clip. Enumerating the
+# variants was the wrong shape: the real library had "Official HD Video" and
+# "Official 4K Video", and the next one would have been missed too.
+_OFFICIAL_RE = re.compile(r'official\s+(?:\w+\s+){0,2}(?:video|clip)', re.I)
+
+
+def classify_candidate_title(title):
+    """What kind of video this title claims to be.
+
+    Returns 'official', 'gameplay', 'lyric', 'audio_only' or 'unknown'.
+    Checked most-specific first: a title can say both "official video" and
+    "lyrics", and the strongest negative signal should win, because being wrong
+    in the direction of keeping junk is what this exists to stop.
+    """
+    low = (title or '').lower()
+    if any(m in low for m in _GAMEPLAY_MARKERS) or _GAMEPLAY_TOKEN_RE.search(low):
+        return 'gameplay'
+    if any(m in low for m in _LYRIC_MARKERS):
+        return 'lyric'
+    if any(m in low for m in _AUDIO_ONLY_MARKERS):
+        return 'audio_only'
+    if any(m in low for m in _OFFICIAL_MARKERS) or _OFFICIAL_RE.search(low):
+        return 'official'
+    return 'unknown'
+
+
+# Lower sorts earlier. 'unknown' beats a self-declared lyric video, because an
+# ordinary upload of a real video usually says nothing special about itself.
+CANDIDATE_KIND_RANK = {
+    'official': 0,
+    'unknown': 1,
+    'audio_only': 2,
+    'lyric': 3,
+    'gameplay': 4,
+}
 
 # random pause between songs so it doesn't look like a bot hammering the API
 SONG_DELAY_MIN = 1.0
@@ -95,6 +206,20 @@ BOT_BACKOFF_SECONDS = [60, 180, 420]
 
 # default lead-in when we can't fingerprint-match - most music videos have a few seconds of intro
 DEFAULT_START_TIME = -3000
+
+# How the video_start_time we wrote was arrived at, recorded alongside it as
+# `backstagehero_sync`. Without this, a written offset is unfalsifiable: a real
+# measurement that happens to land near the default is byte-identical to a pure
+# guess, so there's no way to tell which songs are actually synced and which are
+# just running on DEFAULT_START_TIME. (Found the hard way -- a song reported as
+# out of sync turned out to have never been matched at all; its -3000 was the
+# fallback constant, indistinguishable from a measured value on inspection.)
+# Deliberately kept separate from the offset itself so playback is unaffected:
+# the guess is still the best guess, it's just now labelled as one.
+SYNC_MEASURED  = 'measured'    # audiosync fingerprint-matched this exact video
+SYNC_COMMUNITY = 'community'   # offset came from the resolver pool, not measured here
+SYNC_GUESS     = 'guess'       # never measured - DEFAULT_START_TIME fallback
+SYNC_MANUAL    = 'manual'      # user set it by hand in the sync editor
 
 _BOT_SIGNS = ('sign in to confirm', "you're not a bot", 'not a bot',
               'http error 429', 'too many requests')
@@ -351,8 +476,8 @@ def _chart_duration(folder):
                 None) or max(stems, key=os.path.getsize)
     try:
         r = subprocess.run(['ffmpeg', '-hide_banner', '-i', pick],
-                           capture_output=True, text=True, timeout=10,
-                           creationflags=NO_WINDOW)
+                           capture_output=True, timeout=10,
+                           creationflags=NO_WINDOW, **library_common.TEXT_UTF8)
         m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr)
         if m:
             return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
@@ -430,43 +555,109 @@ def download_video(folder, url, quality, info=None):
         os.replace(tmp, final)
         print('  Video ready')
 
+    # VFR source video causes progressive audio/video desync that a single
+    # static video_start_time offset can't fix -- BackstageHero's own remux
+    # step above doesn't touch frame timing, only the container.
+    repair = video_repair.ensure_playable(final, allow_codec_removal=False)
+    if repair['status'] == 'reencoded_cfr':
+        print('  Video was variable-frame-rate; re-encoded to constant frame rate for sync accuracy')
+    elif repair['status'] == 'reencode_failed':
+        log.warning('CFR re-encode failed for %s', final)
+
 
 def select_video(folder, candidates, sync_ready, target_h=0):
     """Pick the right candidate. With sync available, fingerprints each one against
     the chart audio until we get a confident match.
     Returns (url, title, offset_ms, matched, confidence, info_dict) - info_dict
     is the winner's cached extraction so the download can reuse it, or None.
+    url is None if nothing fingerprint-confirmed AND even the best
+    duration-ranked candidate is implausible for this chart's length -- the
+    caller should leave the song without a video rather than attach a
+    confidently-wrong one. (Real case found in testing: with no confirmed
+    match, the old fallback used the raw top search result with zero
+    duration check at all, and attached a completely unrelated video -- a
+    different artist's static album-art upload -- to a chart it shares no
+    content with.)
 
     target_h is the resolution the user asked for. Among the candidates that
     match the song, a match that actually has that resolution wins; if the first
     match is lower-res we keep looking for a better one and only settle for it
     if nothing higher turns up. Stops as soon as a match meets the target, so a
     good first hit costs nothing extra."""
-    if not sync_ready:
-        url, title = candidates[0][0], candidates[0][1]
-        return url, title, DEFAULT_START_TIME, False, 0.0, None
+    # Drop anything the user has already thrown away for this song. Done first
+    # so every path below -- the fingerprint gate, the duration ranking and the
+    # final fallback alike -- is working from candidates that are actually
+    # allowed, rather than each having to remember to re-check.
+    rejected = get_rejected_sources(folder)
+    if rejected:
+        allowed = [c for c in candidates if video_id_of(c[0]) not in rejected]
+        if not allowed:
+            print(f'  Every result was previously dumped for this song '
+                  f'({len(rejected)} rejected) - leaving without a video')
+            return None, None, DEFAULT_START_TIME, False, 0.0, None
+        if len(allowed) != len(candidates):
+            print(f'  Skipping {len(candidates) - len(allowed)} previously dumped result(s)')
+        candidates = allowed
 
-    # no stems in this folder = nothing to fingerprint against, so don't waste
-    # audio downloads finding that out the hard way
-    if audiosync is None or not audiosync.chart_stems(folder):
-        url, title = candidates[0][0], candidates[0][1]
-        return url, title, DEFAULT_START_TIME, False, 0.0, None
-
+    # Rank BEFORE the early returns below, not after.
+    #
+    # Those two paths -- no ffmpeg, or a song with no stems to fingerprint
+    # against -- used to hand back candidates[0]: raw YouTube search order,
+    # with no duration check and no look at what the video even was. On a
+    # library of Guitar Hero charts the top result for a song is very often a
+    # Rock Band playthrough, so the one path with no fingerprint to protect it
+    # was also the one path doing no filtering at all.
+    #
     # rank by plausible length before spending downloads. the song has to fit
     # inside the video, plus some intro/outro, so a 30s short or a 20min live
     # set can't be it. unknown durations aren't punished. doesn't exclude
     # anything outright, just tries the believable ones first.
     chart_dur = _chart_duration(folder)
     if chart_dur:
+        def is_plausible(dur):
+            return dur is None or (chart_dur - 25) <= dur <= (chart_dur + 150)
+
+        # Three tiers, not two. An unknown duration still isn't punished --
+        # it stays eligible, and the floor below still lets it through, since
+        # "no duration data" is no evidence of a mismatch. But it must not
+        # outrank a candidate we have positively confirmed fits: with two
+        # tiers, unknown and confirmed-fitting shared tier 0 and ties broke on
+        # search order, so a duration-less result could take ordered[0] ahead
+        # of a verified one and sail past the floor on its behalf.
         def rank(item):
-            i, (_, _, dur) = item
+            i, (_url, title, dur) = item
             if dur is None:
-                return (0, i)
-            plausible = (chart_dur - 25) <= dur <= (chart_dur + 150)
-            return (0 if plausible else 1, i)
+                tier = 1                     # unknown: eligible, but never preferred
+            elif is_plausible(dur):
+                tier = 0                     # confirmed to fit this chart
+            else:
+                tier = 2                     # known not to fit
+            # Duration first: a wrong-length result is the wrong SONG, which
+            # matters more than what kind of video it is. Kind then decides
+            # between candidates that all fit, which is where lyric videos and
+            # gameplay footage were quietly winning on search rank alone.
+            return (tier, CANDIDATE_KIND_RANK.get(
+                classify_candidate_title(title), 1), i)
         ordered = [c for _, c in sorted(enumerate(candidates), key=rank)]
     else:
-        ordered = list(candidates)
+        # No chart duration to judge against, but the titles are still readable,
+        # so the kind preference still applies here rather than falling back to
+        # raw search order.
+        is_plausible = None
+        ordered = [c for _, c in sorted(
+            enumerate(candidates),
+            key=lambda item: (CANDIDATE_KIND_RANK.get(
+                classify_candidate_title(item[1][1]), 1), item[0]))]
+
+    if not sync_ready:
+        url, title = ordered[0][0], ordered[0][1]
+        return url, title, DEFAULT_START_TIME, False, 0.0, None
+
+    # no stems in this folder = nothing to fingerprint against, so don't waste
+    # audio downloads finding that out the hard way
+    if audiosync is None or not audiosync.chart_stems(folder):
+        url, title = ordered[0][0], ordered[0][1]
+        return url, title, DEFAULT_START_TIME, False, 0.0, None
 
     best = None   # (url, title, ms, height, conf, vinfo) - best match so far
     for url, title, _ in ordered[:GATE_CANDIDATES]:
@@ -497,10 +688,19 @@ def select_video(folder, candidates, sync_ready, target_h=0):
         print(f'  Using best available match ({best[3]}p)')
         return best[0], best[1], best[2], True, best[4], best[5]
 
-    # nothing matched - use top result with default offset
-    url, title = candidates[0][0], candidates[0][1]
-    print('  No confident match - using top result with default offset')
-    return url, title, DEFAULT_START_TIME, False, 0.0, None
+    # nothing fingerprint-confirmed -- fall back to the best duration-ranked
+    # candidate rather than the raw top search result (ordered already puts
+    # a plausible-length candidate first when duration data exists), but
+    # refuse entirely if even that one is implausible: a confidently-wrong
+    # video is worse than no video at all.
+    top_url, top_title, top_dur = ordered[0]
+    if chart_dur and not is_plausible(top_dur):
+        print(f'  No plausible match (best candidate is {top_dur}s vs chart ~{chart_dur:.0f}s) '
+              '- leaving without a video')
+        return None, None, DEFAULT_START_TIME, False, 0.0, None
+
+    print('  No confident match - using best duration-ranked result with default offset')
+    return top_url, top_title, DEFAULT_START_TIME, False, 0.0, None
 
 
 def download_with_fallback(folder, primary_url, candidates, quality, info=None):
@@ -530,11 +730,26 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     if not replace and os.path.exists(os.path.join(folder, 'video.mp4')):
         return 'skipped'
 
+    # a song deliberately left without a video is done, not still missing one.
+    # without this the static-art conversion defeats itself: every run would
+    # re-download the same album-art upload, re-detect it, and delete it again,
+    # forever. treated exactly like an existing video.mp4 above, including
+    # honouring replace=True.
+    if not replace and _read_ini_value(folder, static_art.VIDEO_MARKER_KEY) == \
+            static_art.VIDEO_MARKER_STATIC_ART:
+        return 'skipped'
+
     artist, title = read_metadata(folder)
     ch = resolver_client.chart_hash(folder) if resolver_client.enabled() else None
 
-    # check the community resolver first - skips the YouTube search entirely for known charts
+    # check the community resolver first - skips the YouTube search entirely for known charts.
+    # A video this user has dumped is not acceptable just because the pool
+    # likes it: their rejection is about this library, and overriding it would
+    # make the dump silently useless for exactly the songs it matters on.
     hit = resolver_client.resolve(ch)
+    if hit and hit.get('video_id') in get_rejected_sources(folder):
+        print('  Community video for this chart was previously dumped here - searching instead')
+        hit = None
     if hit and hit.get('video_id'):
         url = 'https://www.youtube.com/watch?v=' + hit['video_id']
         print('\nResolved (community-confirmed): ' + (build_query(artist, title) or song_name))
@@ -544,8 +759,12 @@ def process_download(folder, song_name, quality, sync_ready, replace):
                 print('  Phase Shift converter file detected - video kept, timing left as-is')
                 return
             offset = hit.get('start_ms')
+            # a resolver hit without a start_ms is a known video but an unknown
+            # offset - the video is trustworthy, the timing is still a guess
+            how = SYNC_COMMUNITY if offset is not None else SYNC_GUESS
             offset = DEFAULT_START_TIME if offset is None else offset
             if not set_ini_values(folder, {'video_start_time': str(offset),
+                                            'backstagehero_sync': how,
                                             'backstagehero_source': hit['video_id']}):
                 raise Exception('song.ini missing [song] section')
             _probe_and_store_resolution(folder)
@@ -569,6 +788,9 @@ def process_download(folder, song_name, quality, sync_ready, replace):
     target_h = int(m.group(1)) if m else 0
     url, vid_title, offset, matched, conf, vinfo = select_video(
         folder, candidates, sync_ready, target_h)
+    if url is None:
+        print('  No video attached - nothing plausible found. Will try again next run.')
+        return
     print('Downloading: ' + vid_title)
 
     # old video stays until new one is fully downloaded, so nothing is left half-done
@@ -578,6 +800,21 @@ def process_download(folder, song_name, quality, sync_ready, replace):
         print('  Phase Shift converter file detected - video kept, timing left as-is')
         return
 
+    # some "videos" are just the album cover held for the length of the song.
+    # the duration floor in select_video can't catch those - a static upload of
+    # the right song is exactly the right length - so judge the file we just
+    # downloaded on its contents. only a strict-tier match converts; anything
+    # uncertain keeps the video and carries on as normal.
+    if static_art.probe_static_video(os.path.join(folder, 'video.mp4')) == 'static':
+        result = static_art.convert_to_album_art(folder)
+        if result['status'] == 'converted':
+            print('  ' + result['detail'])
+            # no resolver report: there's no video match to contribute here,
+            # and reporting one would poison the shared pool for everyone else.
+            return
+        log.warning('Static-art conversion failed for %s (%s); keeping the video',
+                    song_name, result['detail'])
+
     # offset was measured against `url`. if a fallback candidate downloaded
     # instead, that offset is for a different video, so drop it and don't report
     # it (otherwise we feed the community a bogus match).
@@ -586,7 +823,18 @@ def process_download(folder, song_name, quality, sync_ready, replace):
         offset, matched = DEFAULT_START_TIME, False
 
     vid = video_id_of(used_url)
-    values = {'video_start_time': str(offset), 'backstagehero_source': vid}
+    # Record what we actually attached, by name. Only the video ID was stored
+    # before, which meant a library full of lyric videos and gameplay footage
+    # was indistinguishable from a library of real ones without re-querying
+    # YouTube for every song. The title is the one thing that tells them apart,
+    # and it costs nothing to keep. Titles come from a search result, so a fall
+    # back to a different candidate must report THAT one's title, not the
+    # originally-selected one.
+    used_title = next((c[1] for c in candidates if c[0] == used_url), vid_title)
+    values = {'video_start_time': str(offset),
+              'backstagehero_sync': SYNC_MEASURED if matched else SYNC_GUESS,
+              'backstagehero_source': vid,
+              'backstagehero_video_title': used_title or ''}
     if set_ini_values(folder, values):
         note = 'auto-synced' if matched else 'default offset'
         _probe_and_store_resolution(folder)
@@ -603,13 +851,63 @@ def process_download(folder, song_name, quality, sync_ready, replace):
 
 
 def process_resync(folder, song_name, sync_ready):
-    """Re-fingerprint an existing video to fix its timing."""
+    """Re-fingerprint an existing video to fix its timing.
+
+    Uses the video file already on disk WHEN IT HAS AN AUDIO TRACK: ffmpeg can
+    decode that directly, so the recheck costs zero network requests.
+
+    Measured against a real library (2026-07-19), because the original claim
+    here was that this covered "the common case" -- it does not, and the
+    opposite is true for anything this app downloaded:
+
+        downloaded by this app :   0 with audio,  87 without
+        left by the predecessor:  33 with audio,   0 without
+
+    quality_format() asks for `bestvideo[...]` first, which is a video-only
+    stream, so a successful download normally has no audio at all. The
+    optimisation therefore only ever applies to videos that came from
+    somewhere else. It was verified originally by muxing synthetic audio into
+    a test MP4 -- a file shaped unlike anything the downloader produces, which
+    is why the gap survived a green suite.
+
+    Checking for the audio stream up front rather than letting the decode fail
+    matters at library scale: without it, every resync of an app-downloaded
+    video hands a 60MB file to ffmpeg only to be told there is nothing to
+    decode. Falls back to the stored YouTube source, then a fresh search,
+    exactly as before.
+
+    Returns 'skipped' for a song this pass deliberately left alone.
+    """
     if not sync_ready:
         return
     if is_converted(folder):
         return
 
+    # a hand-set offset outranks anything automatic. the sync editor writes
+    # SYNC_MANUAL for exactly this check -- without it, "Auto-sync" over a
+    # checked library silently re-breaks the songs the user already fixed by
+    # hand, which are by definition the ones audiosync got wrong the first
+    # time. The way back, if the user does want this song re-synced
+    # automatically: re-download it (select it and confirm the re-download
+    # prompt, which passes replace=True). process_download does not consult
+    # this marker, because a new video makes the old hand-set offset
+    # meaningless anyway. There is deliberately no "clear the marker" control
+    # -- the sync editor only ever writes SYNC_MANUAL, never clears it.
+    if _read_ini_value(folder, 'backstagehero_sync') == SYNC_MANUAL:
+        print('  Manually synced - leaving as-is')
+        return 'skipped'
+
     artist, title = read_metadata(folder)
+
+    local_video = os.path.join(folder, 'video.mp4')
+    if os.path.exists(local_video) and _has_audio_stream(local_video):
+        print('\nRe-syncing: ' + build_query(artist, title) + '  (from local video, no download)')
+        ms, info, _ = audiosync.compute_offset_ms(folder, local_video)
+        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms),
+                                                      'backstagehero_sync': SYNC_MEASURED}):
+            print('  Re-synced: ' + info)
+            return
+        print('  Could not confirm sync from the local video - falling back to source lookup')
 
     source = get_stored_source(folder)
 
@@ -622,18 +920,30 @@ def process_resync(folder, song_name, sync_ready):
                            if audio else (None, 'no audio', 0.0))
         finally:
             cleanup_temp_files(folder)
-        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms)}):
+        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms),
+                                                      'backstagehero_sync': SYNC_MEASURED}):
             _probe_and_store_resolution(folder)
             print('  Re-synced: ' + info)
             return
         print('  Known source no longer matches - falling back to search')
 
+    # Last resort: search for a candidate that matches the chart. Note what this
+    # can and cannot tell us -- we only get here because the video actually on
+    # disk did NOT fingerprint-match. A fresh candidate matching the chart says
+    # nothing about the local file's timing, so its offset must not be written
+    # over the local video's: that would store a measurement of a video the user
+    # doesn't have, and (worse) stamp it SYNC_MEASURED, manufacturing exactly the
+    # false "this one is trustworthy" signal the provenance marker exists to
+    # prevent. Report the mismatch and leave the timing alone; fixing it needs a
+    # re-download, which is Search & Download's job, not Auto-sync's.
     query = build_query(artist, title)
     print('\nRe-syncing: ' + query)
     candidates = search_candidates(query)
-    _, vid_title, offset, matched, _, _ = select_video(folder, candidates, sync_ready)
-    if matched and set_ini_values(folder, {'video_start_time': str(offset)}):
-        print('  Re-synced against: ' + vid_title)
+    _, vid_title, _, matched, _, _ = select_video(folder, candidates, sync_ready)
+    if matched:
+        print('  The video on disk no longer matches this chart (a different '
+              'upload does: ' + vid_title + ').')
+        print('  Timing left unchanged - re-download the song to fix it.')
     else:
         print('  No confident match - timing left unchanged')
 
@@ -654,9 +964,107 @@ def _read_ini_value(folder, key):
     return None
 
 
+def _has_audio_stream(path):
+    """True if this file carries an audio track ffmpeg could decode.
+
+    Fails CLOSED on any probe error: the only caller uses this to decide
+    whether to bother trying a local fingerprint, and "couldn't tell" should
+    fall through to the network path that works rather than attempt a decode
+    that is about to fail anyway.
+    """
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', str(path)],
+            capture_output=True, timeout=15, creationflags=NO_WINDOW,
+            **library_common.TEXT_UTF8)
+        return 'audio' in (result.stdout or '')
+    except Exception:
+        return False
+
+
 def get_stored_source(folder):
     """The backstagehero_source video ID stored in song.ini, or None."""
     return _read_ini_value(folder, 'backstagehero_source')
+
+
+# Uploads the user has thrown away for this song, comma-separated in song.ini.
+#
+# Deleting a bad video is not enough on its own: the YouTube search is
+# effectively deterministic, so the very next run finds the same wrong upload,
+# downloads it again, and the user is back where they started. Remembering
+# what was rejected is what makes "dump this video" actually mean something.
+REJECTED_KEY = 'backstagehero_rejected'
+
+
+def get_rejected_sources(folder):
+    """Video IDs the user has dumped for this song, as a set."""
+    raw = _read_ini_value(folder, REJECTED_KEY) or ''
+    return {part.strip() for part in raw.split(',') if part.strip()}
+
+
+def dump_video(folder):
+    """Throw away this song's video and remember not to fetch it again.
+
+    Returns {'status', 'detail'}. Statuses: 'dumped', 'nothing_to_dump',
+    'failed'.
+
+    Ordered so the song is never left in a state that hides the problem: the
+    rejection is recorded BEFORE the file is removed, because a delete that
+    succeeds without a recorded rejection is the one outcome that guarantees
+    the same wrong video comes straight back.
+    """
+    folder = str(folder)
+    video_path = os.path.join(folder, 'video.mp4')
+    marker = _read_ini_value(folder, static_art.VIDEO_MARKER_KEY)
+    was_converted = marker == static_art.VIDEO_MARKER_STATIC_ART
+    if not os.path.exists(video_path) and not was_converted:
+        return {'status': 'nothing_to_dump', 'detail': 'this song has no video'}
+
+    vid = get_stored_source(folder)
+    values = {'backstagehero_source': ''}
+    if vid:
+        rejected = get_rejected_sources(folder)
+        rejected.add(vid)
+        values[REJECTED_KEY] = ','.join(sorted(rejected))
+    if was_converted:
+        # the static-art pass turned this upload into album art. Dumping it
+        # has to undo that too, or the song stays permanently skipped and the
+        # picture the user didn't want stays on disk.
+        values[static_art.VIDEO_MARKER_KEY] = ''
+
+    if not set_ini_values(folder, values):
+        return {'status': 'failed',
+                'detail': 'song.ini has no [song] section - nothing was removed'}
+
+    removed = []
+    if os.path.exists(video_path):
+        try:
+            os.remove(video_path)
+            removed.append('video.mp4')
+        except OSError as e:
+            log.error('could not remove dumped video %s: %s', video_path, e)
+            return {'status': 'failed',
+                    'detail': f'video.mp4 could not be removed ({e}); '
+                              f'the upload is recorded as rejected either way'}
+    if was_converted:
+        # only art this app extracted -- the marker is what says so. A user's
+        # own album art was never touched by the conversion and isn't now.
+        art = os.path.join(folder, 'album.png')
+        if os.path.exists(art):
+            try:
+                os.remove(art)
+                removed.append('album.png')
+            except OSError as e:
+                log.warning('could not remove extracted album art %s: %s', art, e)
+
+    note = ' and '.join(removed) if removed else 'nothing on disk'
+    detail = f'removed {note}'
+    if vid:
+        detail += f'; {vid} will be skipped in future searches'
+    else:
+        detail += '; no source ID was stored, so it cannot be excluded by ID'
+    return {'status': 'dumped', 'detail': detail}
 
 
 def get_stored_resolution(folder):
@@ -676,8 +1084,8 @@ def probe_resolution(folder):
     try:
         r = subprocess.run(
             ['ffmpeg', '-hide_banner', '-i', video],
-            capture_output=True, text=True, timeout=10,
-            creationflags=NO_WINDOW)
+            capture_output=True, timeout=10,
+            creationflags=NO_WINDOW, **library_common.TEXT_UTF8)
         # Search only the Video: stream line so an embedded cover-art stream
         # (e.g. mjpeg 640x640) doesn't shadow the real video dimensions.
         video_line = next((l for l in r.stderr.splitlines() if 'Video:' in l), '')
@@ -931,7 +1339,8 @@ def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resyn
     for attempt in range(len(BOT_BACKOFF_SECONDS) + 1):
         try:
             if resync:
-                process_resync(folder, song_name, sync_ready)
+                if process_resync(folder, song_name, sync_ready) == 'skipped':
+                    return 'skipped'
             else:
                 if process_download(folder, song_name, quality, sync_ready,
                                     replace) == 'skipped':

@@ -3,6 +3,26 @@
 
 import os
 import sys
+
+# pythonw.exe (no console attached -- a plain double-click launch, or this
+# project's own "Launch BackstageHero.bat") sets sys.stdout/stderr to None,
+# not just closed. The first print() or warnings.warn() call anywhere in
+# this app or a dependency then crashes immediately with no visible error,
+# no window, nothing -- confirmed the hard way (2026-07-18): it looked fine
+# invoked through a shell that happened to inherit real stdio handles, but
+# failed silently on a genuine Explorer double-click. Redirect to a discard
+# sink before any other import runs, matching this codebase's own existing
+# assumption that print() "goes nowhere" without a console (see
+# VideoDownload._setup_logging()) -- true for a frozen --noconsole build,
+# but not for plain pythonw without this guard.
+# The guard itself lives in library_common so it can actually be unit-tested;
+# as inline import-time code here it was unreachable under pytest, so nothing
+# in the suite would have caught its removal. library_common imports only
+# stdlib and prints nothing, so it is safe to load before the redirect.
+import library_common
+library_common.ensure_stdio_not_none()
+
+import csv
 import glob
 import logging
 import random
@@ -24,10 +44,16 @@ from VideoDownload import (
     ffmpegAvailable, ffplayPath, audiosync, __version__,
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
     SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution, scan_song,
+    SYNC_MANUAL, dump_video, get_rejected_sources, classify_candidate_title,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
 import resolver_client
+import video_repair
+import chart_rename
+import metadata_enrichment
+import dedupe_report
+import static_art
 
 log = logging.getLogger('backstagehero')
 
@@ -172,6 +198,52 @@ def _open_in_file_manager(path):
         log.warning('Could not open folder: %s', path)
 
 
+def _video_status(song):
+    """What the 'Has video' column should say.
+
+    The app counts only video.mp4 as a video -- that is deliberate, since a
+    video.webm left by another tool is usually VP9, which this Clone Hero
+    build cannot decode, so the song is meant to re-download. But writing a
+    bare 'no' next to a folder that visibly contains a video file reads as a
+    bug in the export. Name the file instead, so the row explains itself.
+    """
+    if song.has_video:
+        return 'yes'
+    for name in library_common.VIDEO_NAMES:
+        if name != 'video.mp4' and os.path.exists(os.path.join(song.folder, name)):
+            return f'no ({name} present, not playable - will re-download)'
+    return 'no'
+
+
+def _video_kind(folder):
+    """'lyric', 'gameplay', 'official'... for the attached video, or ''.
+
+    Derived from the stored title rather than stored separately, so there is
+    one fact on disk and no chance of the two disagreeing. Blank for anything
+    downloaded before titles were recorded -- those can only be identified by
+    re-querying YouTube, which is a deliberate opt-in, not something a library
+    scan should do 376 times unprompted.
+    """
+    title = _read_song_value(folder, 'backstagehero_video_title')
+    if not title:
+        return ''
+    kind = classify_candidate_title(title)
+    return '' if kind == 'unknown' else kind
+
+
+def _read_song_value(folder, key):
+    """One [song] value from a song.ini, or '' -- for building the CSV.
+
+    Thin wrapper over VideoDownload's reader rather than a second parser, so
+    the export can never disagree with what the app itself reads.
+    """
+    try:
+        from VideoDownload import _read_ini_value
+        return _read_ini_value(folder, key) or ''
+    except Exception:
+        return ''
+
+
 def _scan_library(songs_folder, progress=None):
     """Return a list[Song] for the folder, sorted alphabetically.
     progress(count) is called periodically so the UI can show a live tally."""
@@ -203,8 +275,19 @@ class SyncEditor(ctk.CTkToplevel):
     slider shifts the audio against it live, with no respawn. Otherwise it
     falls back to launching ffplay for a one-shot preview."""
 
-    _MS_MIN = -30_000
-    _MS_MAX =  90_000
+    # The slider's STARTING window, not a limit on the offset itself.
+    #
+    # These used to be hard bounds, clamped by both the slider and the
+    # fine-tune buttons, so a chart genuinely needing -78s could not be set at
+    # all -- it snapped back to -30s and silently stayed wrong. A real
+    # video_start_time has no natural bound (a long intro, a compilation
+    # upload, a chart cut from the middle of a set), so the window now grows to
+    # fit whatever is needed and the numeric box below accepts any value.
+    _MS_MIN_DEFAULT = -30_000
+    _MS_MAX_DEFAULT = 90_000
+    # how much headroom to add past the value when the window has to grow, so
+    # dragging to the end doesn't immediately need another resize
+    _MS_WINDOW_PAD = 30_000
 
     def __init__(self, parent, song: Song, on_save=None):
         super().__init__(parent)
@@ -223,6 +306,12 @@ class SyncEditor(ctk.CTkToplevel):
 
         self._ms    = tk.IntVar(value=self._read_offset())
         self._share = tk.BooleanVar(value=True)
+        # widen the initial window if this song's stored offset already sits
+        # outside it -- otherwise opening the editor would misrepresent the
+        # value it is supposed to be showing
+        self._ms_min = self._MS_MIN_DEFAULT
+        self._ms_max = self._MS_MAX_DEFAULT
+        self._grow_window_for(self._ms.get())
 
         self.title('Sync Editor')
         self.geometry('640x760' if self._embedded else '500x470')
@@ -294,20 +383,39 @@ class SyncEditor(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), text_color=_SUBTEXT)
         self._desc_lbl.pack(pady=(2, 12))
 
-        # Slider
+        # Slider. Its ends are labelled from the live window, not hard-coded,
+        # because the window grows to whatever this song actually needs.
         sf = ctk.CTkFrame(self, fg_color='transparent')
         sf.pack(fill='x', padx=20, pady=(14, 0))
-        ctk.CTkLabel(sf, text='-30s', font=ctk.CTkFont(size=10),
-                     text_color=_SUBTEXT).pack(side='left')
-        ctk.CTkLabel(sf, text='+90s', font=ctk.CTkFont(size=10),
-                     text_color=_SUBTEXT).pack(side='right')
+        self._min_lbl = ctk.CTkLabel(sf, text='', font=ctk.CTkFont(size=10),
+                                     text_color=_SUBTEXT)
+        self._min_lbl.pack(side='left')
+        self._max_lbl = ctk.CTkLabel(sf, text='', font=ctk.CTkFont(size=10),
+                                     text_color=_SUBTEXT)
+        self._max_lbl.pack(side='right')
         self._slider = ctk.CTkSlider(
-            sf, from_=self._MS_MIN, to=self._MS_MAX,
+            sf, from_=self._ms_min, to=self._ms_max,
             command=self._on_slider, height=16,
             button_color=_BLUE, button_hover_color='#7aaef8',
             progress_color=_BLUE)
         self._slider.set(self._ms.get())
         self._slider.pack(fill='x', padx=8)
+        self._sync_slider_range()
+
+        # Exact-value entry, so an offset can be typed rather than dragged to.
+        ef = ctk.CTkFrame(self, fg_color='transparent')
+        ef.pack(fill='x', padx=20, pady=(8, 0))
+        ctk.CTkLabel(ef, text='Exact offset (ms):', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).pack(side='left', padx=(8, 6))
+        self._ms_entry = ctk.CTkEntry(ef, width=110, height=26,
+                                      font=ctk.CTkFont(size=11))
+        self._ms_entry.pack(side='left')
+        self._ms_entry.bind('<Return>', self._on_entry_commit)
+        self._ms_entry.bind('<FocusOut>', self._on_entry_commit)
+        ctk.CTkButton(ef, text='Set', width=46, height=26,
+                      fg_color='#2a2a3e', hover_color='#383858',
+                      text_color=_TEXT, font=ctk.CTkFont(size=10),
+                      command=self._on_entry_commit).pack(side='left', padx=6)
 
         # Fine-tune buttons
         bf = ctk.CTkFrame(self, fg_color='transparent')
@@ -401,10 +509,55 @@ class SyncEditor(ctk.CTkToplevel):
             pass
         return DEFAULT_START_TIME
 
+    def _grow_window_for(self, ms):
+        """Widen the slider window so `ms` is representable. Returns True if it
+        changed. Only ever grows -- shrinking mid-edit would yank the handle."""
+        changed = False
+        if ms < self._ms_min:
+            self._ms_min = ms - self._MS_WINDOW_PAD
+            changed = True
+        if ms > self._ms_max:
+            self._ms_max = ms + self._MS_WINDOW_PAD
+            changed = True
+        return changed
+
+    def _sync_slider_range(self):
+        self._slider.configure(from_=self._ms_min, to=self._ms_max)
+        self._min_lbl.configure(text=f'{self._ms_min / 1000:g}s')
+        self._max_lbl.configure(text=f'+{self._ms_max / 1000:g}s'
+                                if self._ms_max > 0 else f'{self._ms_max / 1000:g}s')
+
+    def _set_ms(self, new):
+        """The single place the offset changes. No clamping: the window moves
+        to fit the value, never the other way round."""
+        new = int(new)
+        if self._grow_window_for(new):
+            self._sync_slider_range()
+        self._ms.set(new)
+        self._slider.set(new)
+        self._refresh()
+        self._apply_live_delay()
+
+    def _on_entry_commit(self, event=None):
+        raw = self._ms_entry.get().strip().replace(',', '')
+        if not raw:
+            self._refresh()
+            return
+        try:
+            self._set_ms(int(float(raw)))
+        except ValueError:
+            self._refresh()      # unparseable: put the real value back
+
     def _refresh(self):
         ms = self._ms.get()
         sign = '+' if ms > 0 else ''
         self._ms_lbl.configure(text=f'{sign}{ms:,} ms' if ms != 0 else '0 ms')
+        if getattr(self, '_ms_entry', None) is not None:
+            # keep the box in step with the slider, but don't fight the user
+            # while they are typing in it
+            if self.focus_get() is not self._ms_entry:
+                self._ms_entry.delete(0, 'end')
+                self._ms_entry.insert(0, str(ms))
         s = abs(ms) / 1000.0
         if ms < -50:
             desc = f'Video has a {s:.1f}s intro before the song starts'
@@ -415,16 +568,16 @@ class SyncEditor(ctk.CTkToplevel):
         self._desc_lbl.configure(text=desc)
 
     def _on_slider(self, value):
+        # no _set_ms here: the handle is already where the user put it, and
+        # re-setting it mid-drag fights the widget
         self._ms.set(int(round(value)))
         self._refresh()
         self._apply_live_delay()
 
     def _nudge(self, delta):
-        new = max(self._MS_MIN, min(self._MS_MAX, self._ms.get() + delta))
-        self._ms.set(new)
-        self._slider.set(new)
-        self._refresh()
-        self._apply_live_delay()
+        # deliberately unclamped -- the window grows instead. Clamping here was
+        # half of why an offset past -30s could not be reached.
+        self._set_ms(self._ms.get() + delta)
 
     def _audio_delay(self):
         """mpv audio-delay (seconds) for the current offset. A negative
@@ -747,6 +900,282 @@ class UpdateDialog(ctk.CTkToplevel):
                           fg_color='#313244', hover_color='#414160').pack(pady=(8, 0))
 
 
+# (key, label, description) -- each tool scans the whole library and
+# supports dry-run; the description is shown verbatim in the dialog.
+_LIBRARY_TOOLS = (
+    ('repair_videos', 'Repair videos',
+     'Detects variable-frame-rate video and re-encodes it to a constant '
+     'frame rate. Also removes unsupported (non-VP8) WebM files left by '
+     'other tools -- the song then re-downloads on the next run.'),
+    ('fix_chart_names', 'Fix chart names',
+     'Renames ID-suffixed song.ini/notes.chart/audio-stem/album-art files, '
+     'verifying content matches first. Anything unconfirmed is moved to '
+     '_needs_review/, never guessed at.'),
+    ('enrich_metadata', 'Enrich metadata',
+     'Fills blank song.ini fields (year/genre/charter/album) from a '
+     'confident Chorus Encore match. Never overwrites an existing value.'),
+    ('find_duplicates', 'Find duplicates',
+     'Finds duplicate charts of the same song, scores each copy, and moves '
+     'everything but the best-scoring keeper to _duplicates_review/. Never '
+     'deletes anything.'),
+    ('find_static_art', 'Find static album-art videos',
+     'Detects videos that are just an album cover held for the whole song, '
+     'converts them to album art, and removes the video. Anything uncertain '
+     '-- a slow zoom, a visualizer -- is only reported, never acted on.'),
+    ('migrate_review_folders', 'Move old review folders out of the library',
+     'Earlier versions put _needs_review inside your Songs folder, where Clone '
+     'Hero still loads them and this app still downloads videos for them, but '
+     'no repair scan can find them again. Moves any it finds to a folder '
+     'alongside your library instead. Nothing is deleted.'),
+)
+
+
+class LibraryToolsDialog(ctk.CTkToplevel):
+    """Library-wide hygiene scans: video repair, chart-name fixes, metadata
+    enrichment, duplicate detection.
+
+    Each runs the whole library in a background thread so the window stays
+    responsive; the summary shown when it finishes is built from the scan's
+    own returned counts dict, not parsed console output. Only one tool runs
+    at a time -- fix_chart_names and find_duplicates both read/write the
+    same per-folder chart_rename_status, so overlapping runs could race.
+    """
+
+    def __init__(self, parent, songs_folder, on_close=None, on_run_state=None):
+        super().__init__(parent)
+        self._songs_folder = songs_folder
+        self._on_close = on_close
+        # Told when a tool starts and stops, so the main window can stay
+        # locked for the worker's real lifetime rather than the dialog's --
+        # closing this window does not stop the thread (there is no Stop
+        # button to offer, and killing a scan mid-rename would be worse than
+        # letting it finish).
+        self._on_run_state = on_run_state
+        self._running_key = None
+        self._dry_run_vars = {}
+        self._status_labels = {}
+        self._run_buttons = {}
+
+        self.title('Library Tools')
+        self.geometry('600x620')
+        self.minsize(480, 380)
+        self.resizable(True, True)
+        self.configure(fg_color=_BG)
+        self.grab_set()
+        self.protocol('WM_DELETE_WINDOW', self._close)
+        try:
+            ico = _asset_path('icon.ico')
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+
+        self._build()
+        self.after(50, self._center)
+
+    def _build(self):
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self, fg_color='transparent')
+        header.grid(row=0, column=0, sticky='ew')
+        ctk.CTkLabel(header, text='Library Tools',
+                     font=ctk.CTkFont(size=16, weight='bold'),
+                     text_color=_TEXT).pack(padx=20, pady=(18, 2), anchor='w')
+        ctk.CTkLabel(
+            header,
+            text='Each tool scans your whole library. Dry run previews what '
+                 'would happen without changing anything on disk.',
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            wraplength=530, justify='left').pack(padx=20, anchor='w')
+
+        # Scrollable so the window can be resized smaller (or run at a
+        # higher OS text-scaling setting) without any card's content or the
+        # Close button getting clipped off-screen.
+        scroll = ctk.CTkScrollableFrame(self, fg_color='transparent')
+        scroll.grid(row=1, column=0, sticky='nsew', padx=8, pady=(8, 0))
+
+        for key, label, desc in _LIBRARY_TOOLS:
+            card = ctk.CTkFrame(scroll, fg_color='#252540', corner_radius=10)
+            card.pack(fill='x', padx=12, pady=(10, 0))
+
+            top = ctk.CTkFrame(card, fg_color='transparent')
+            top.pack(fill='x', padx=16, pady=(12, 2))
+            ctk.CTkLabel(top, text=label, font=ctk.CTkFont(size=13, weight='bold'),
+                         text_color=_TEXT).pack(side='left')
+
+            dry_var = tk.BooleanVar(value=True)
+            self._dry_run_vars[key] = dry_var
+            ctk.CTkCheckBox(top, text='Dry run', variable=dry_var,
+                            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+                            checkbox_width=16, checkbox_height=16,
+                            checkmark_color=_BG, fg_color=_BLUE,
+                            hover_color='#7aaef8').pack(side='right')
+
+            ctk.CTkLabel(card, text=desc, font=ctk.CTkFont(size=10),
+                         text_color=_SUBTEXT, wraplength=480, justify='left',
+                         anchor='w').pack(fill='x', padx=16, anchor='w')
+
+            row = ctk.CTkFrame(card, fg_color='transparent')
+            row.pack(fill='x', padx=16, pady=(10, 12))
+            status_lbl = ctk.CTkLabel(row, text='Ready', font=ctk.CTkFont(size=10),
+                                      text_color=_SUBTEXT, anchor='w')
+            status_lbl.pack(side='left', fill='x', expand=True)
+            self._status_labels[key] = status_lbl
+
+            run_btn = ctk.CTkButton(row, text='Run', width=90, height=28,
+                                    font=ctk.CTkFont(size=11),
+                                    fg_color='#313244', hover_color='#414160',
+                                    command=lambda k=key: self._run_tool(k))
+            run_btn.pack(side='right')
+            self._run_buttons[key] = run_btn
+
+        ctk.CTkButton(self, text='Close', width=100,
+                      fg_color='transparent', border_width=1,
+                      border_color=_BORDER, hover_color='#30304a',
+                      text_color=_SUBTEXT, font=ctk.CTkFont(size=12),
+                      command=self._close).grid(row=2, column=0, pady=18)
+
+    def _run_tool(self, key):
+        if self._running_key is not None:
+            return
+        dry_run = self._dry_run_vars[key].get()
+        self._running_key = key
+        self._dry_run_of_current = dry_run
+        self._notify_run_state(True)
+        for btn in self._run_buttons.values():
+            btn.configure(state='disabled')
+        self._status_labels[key].configure(text='Running...', text_color=_BLUE)
+        threading.Thread(target=self._worker, args=(key, dry_run), daemon=True).start()
+
+    def _notify_run_state(self, running):
+        """Tell the main window a worker started or stopped.
+
+        Called straight from the worker thread, deliberately NOT marshalled
+        through self.after(): this dialog may already be destroyed by the time
+        a scan ends, and that is precisely when the main window most needs the
+        news. The receiver owns its own thread-safety (it sets a plain flag
+        first, then schedules its own UI refresh) -- see App._set_tool_running.
+        """
+        if self._on_run_state is None:
+            return
+        try:
+            self._on_run_state(running)
+        except Exception:
+            log.exception('Failed to report library-tool run state (running=%s)', running)
+
+    def _worker(self, key, dry_run):
+        try:
+            if key == 'repair_videos':
+                counts = video_repair.scan_and_repair_video_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'fix_chart_names':
+                counts = chart_rename.scan_and_fix_chart_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'enrich_metadata':
+                counts = metadata_enrichment.enrich_song_ini_metadata_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'find_duplicates':
+                counts = dedupe_report.generate_dedupe_report(self._songs_folder, dry_run=dry_run)
+            elif key == 'find_static_art':
+                counts = static_art.scan_and_convert_static_art_library(self._songs_folder, dry_run=dry_run)
+            elif key == 'migrate_review_folders':
+                counts = library_common.migrate_legacy_review_folders(self._songs_folder, dry_run=dry_run)
+            else:
+                counts = {}
+            text = self._format_summary(key, counts, dry_run)
+            color = _GREEN
+        except Exception as e:
+            log.exception('Library tool %s failed', key)
+            text = f'Error: {e}'
+            color = _RED
+        # unlock the main window on the parent's loop, which is still alive
+        # whether or not this dialog is -- must happen before the _finish
+        # attempt below, since that one legitimately fails on a closed dialog
+        self._notify_run_state(False)
+        try:
+            # the dialog may have been closed while the scan was running --
+            # scheduling on a destroyed Toplevel raises, so this is a no-op
+            # in that case rather than a crash
+            self.after(0, lambda: self._finish(key, text, color))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_summary(key, counts, dry_run):
+        suffix = ' (dry run)' if dry_run else ''
+        if key == 'repair_videos':
+            body = (f"{counts.get('ok', 0)} ok, {counts.get('reencoded_cfr', 0)} re-encoded, "
+                    f"{counts.get('removed_unsupported_codec', 0)} removed, "
+                    f"{counts.get('reencode_failed', 0)} failed")
+        elif key == 'fix_chart_names':
+            body = (f"{counts.get('confirmed_ok', 0)} confirmed, "
+                    f"{counts.get('needs_review', 0)} need review, "
+                    f"{counts.get('skipped_settled', 0)} already settled")
+        elif key == 'enrich_metadata':
+            body = (f"{counts.get('filled', 0)} filled, {counts.get('no_change', 0)} no change, "
+                    f"{counts.get('no_match', 0)} no match, {counts.get('error', 0)} error(s)")
+        elif key == 'find_duplicates':
+            body = (f"{counts.get('resolved', 0)} resolved, "
+                    f"{counts.get('skipped_all_ineligible', 0)} unscanned, "
+                    f"{counts.get('skipped_not_confirmed', 0)} unconfirmed")
+        elif key == 'find_static_art':
+            body = (f"{counts.get('converted', 0)} converted, "
+                    f"{counts.get('near_static', 0)} near-static (reported), "
+                    f"{counts.get('ok', 0)} real videos left alone")
+        elif key == 'migrate_review_folders':
+            if not counts:
+                body = 'nothing to migrate - no old review folders inside your library'
+            else:
+                # past tense on a dry run would read as if files had moved
+                moved = counts.get('would_move', 0) if dry_run else counts.get('moved', 0)
+                body = (f"{moved} folder(s) would move out" if dry_run
+                        else f"{moved} folder(s) moved out")
+                if counts.get('conflict'):
+                    body += f", {counts['conflict']} already existed (left in place)"
+                if counts.get('failed'):
+                    body += f", {counts['failed']} failed (details in log)"
+        else:
+            body = str(counts)
+        return body + suffix
+
+    def _finish(self, key, text, color):
+        self._running_key = None
+        if not self.winfo_exists():
+            return
+        for btn in self._run_buttons.values():
+            btn.configure(state='normal')
+        self._status_labels[key].configure(text=text, text_color=color)
+
+    def _close(self):
+        # Closing does not stop the worker. Say so plainly: the thread keeps
+        # renaming and relocating files, and the previous version released the
+        # modal grab silently -- leaving the user free to press Start and race
+        # a download against a scan still mutating the same folders.
+        if self._running_key is not None:
+            tool = next((label for k, label, _ in _LIBRARY_TOOLS
+                         if k == self._running_key), self._running_key)
+            verb = 'previewing' if getattr(self, '_dry_run_of_current', True) else 'changing files in'
+            if not messagebox.askokcancel(
+                    'Scan still running',
+                    f'"{tool}" is still {verb} your library.\n\n'
+                    'Closing this window will not stop it. The scan finishes on its own, '
+                    'and the main window stays locked until it does.\n\nClose anyway?',
+                    parent=self):
+                return
+        self.grab_release()
+        self.destroy()
+        # Skip the caller's library reload while a scan is still running -- it
+        # would read a folder tree being rewritten underneath it. The run-state
+        # callback reloads once the worker actually finishes.
+        if self._on_close and self._running_key is None:
+            self._on_close()
+
+    def _center(self):
+        self.update_idletasks()
+        pw = self.master.winfo_x() + self.master.winfo_width() // 2
+        ph = self.master.winfo_y() + self.master.winfo_height() // 2
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f'+{pw - w // 2}+{ph - h // 2}')
+
+
 class App(ctk.CTk):
 
     def __init__(self):
@@ -773,6 +1202,12 @@ class App(ctk.CTk):
         self._sort_asc    : bool = True
         self._filter_mode : str  = 'missing'
         self._running     : bool = False
+        self._resync_run  : bool = False   # is the active run Auto-sync, not download?
+        # A Library Tools worker can outlive its dialog, so this tracks the
+        # THREAD, not the window. Without it, closing that dialog mid-scan
+        # freed the user to start a download into the same folders a rename
+        # sweep was still working through.
+        self._tool_running: bool = False
         self._polling     : bool = False
         self._stop_evt    = threading.Event()
         self._queue       : queue.Queue = queue.Queue()
@@ -832,9 +1267,13 @@ class App(ctk.CTk):
             folder_row, text='No folder selected',
             font=ctk.CTkFont(size=11), text_color=_SUBTEXT, anchor='e')
         self._folder_lbl.grid(row=0, column=0, padx=(0, 10), sticky='e')
+        ctk.CTkButton(folder_row, text='Library Tools',
+                      width=110, height=28, font=ctk.CTkFont(size=11),
+                      fg_color='#313244', hover_color='#414160',
+                      command=self._open_library_tools).grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(folder_row, text='Change folder',
                       width=115, height=28, font=ctk.CTkFont(size=11),
-                      command=self._pick_folder).grid(row=0, column=1)
+                      command=self._pick_folder).grid(row=0, column=2)
 
         # Filter / search bar
         fbar = ctk.CTkFrame(self, fg_color=_SURFACE, corner_radius=0, height=50)
@@ -1144,7 +1583,54 @@ class App(ctk.CTk):
         else:
             self._status_lbl.configure(
                 text=f'{n} song{"s" if n != 1 else ""} found')
+        self._export_library_csv()
         self._update_buttons()
+
+    CSV_NAME = 'backstagehero_library.csv'
+
+    def _export_library_csv(self):
+        """Write a spreadsheet of the library next to the songs themselves.
+
+        Rewritten after every scan so it never quietly goes stale. Failure is
+        logged and otherwise ignored on purpose -- a read-only or full drive
+        should cost the user a convenience file, not the ability to use the
+        app. Clone Hero ignores a loose .csv in the Songs root.
+        """
+        if not self._songs_folder or not self._songs:
+            return
+        path = os.path.join(self._songs_folder, self.CSV_NAME)
+        try:
+            # newline='' is required by csv on Windows, otherwise every row is
+            # written with a blank line between it and the next
+            with open(path, 'w', newline='', encoding='utf-8-sig') as fh:
+                w = csv.writer(fh)
+                w.writerow(['Song', 'Artist', 'Title', 'Has video', 'Resolution',
+                            'Offset (ms)', 'Offset source', 'Video kind',
+                            'Video title', 'Video ID', 'Dumped videos', 'Folder'])
+                for s in sorted(self._songs, key=lambda x: x.key):
+                    artist, title = read_metadata(s.folder)
+                    w.writerow([
+                        s.label,
+                        artist or '',
+                        title or '',
+                        _video_status(s),
+                        s.res if s.has_video else '',
+                        _read_song_value(s.folder, 'video_start_time'),
+                        # the provenance marker, so a spreadsheet sort shows at
+                        # a glance which songs were never actually measured
+                        _read_song_value(s.folder, 'backstagehero_sync'),
+                        # what KIND of video it is -- sorting on this column is
+                        # how you find every lyric video and gameplay capture
+                        # in one pass. Fingerprinting cannot tell these apart,
+                        # because their audio is identical to the real thing.
+                        _video_kind(s.folder),
+                        _read_song_value(s.folder, 'backstagehero_video_title'),
+                        _read_song_value(s.folder, 'backstagehero_source'),
+                        ' '.join(sorted(get_rejected_sources(s.folder))),
+                        s.folder,
+                    ])
+        except OSError as e:
+            log.warning('Could not write %s: %s', path, e)
 
     def _probe_resolutions(self, songs, total_songs):
         """Background thread: probe resolutions for unprobed videos, a few in
@@ -1165,6 +1651,10 @@ class App(ctk.CTk):
                 self._queue.put(('res_update', s,
                                  f'{total_songs} songs found, reading resolutions ({remaining} left)...'
                                  if remaining else f'{total_songs} songs found'))
+        # rewrite the CSV once resolutions are known -- the copy written right
+        # after the scan has '...' placeholders in that column
+        if not self._stop_evt.is_set():
+            self._queue.put(('csv_refresh',))
 
     def _set_filter(self, mode):
         self._filter_mode = mode
@@ -1304,6 +1794,8 @@ class App(ctk.CTk):
         if s.has_video:
             menu.add_command(label='Adjust sync offset',
                              command=lambda: self._open_sync_editor(s))
+            menu.add_command(label='Dump this video (wrong video?)',
+                             command=lambda: self._dump_video(s))
             menu.add_separator()
         menu.add_command(label='Open folder',
                          command=lambda: _open_in_file_manager(s.folder))
@@ -1312,9 +1804,48 @@ class App(ctk.CTk):
         finally:
             menu.grab_release()
 
+    def _dump_video(self, song: Song):
+        """Throw away a video that turned out to be the wrong thing entirely.
+
+        Confirmed first: this deletes a file and is not undoable from inside
+        the app. The rejection it records is what stops the next run simply
+        fetching the same upload again.
+        """
+        if self._running or self._tool_running:
+            messagebox.showinfo('Busy', 'Wait for the current run to finish first.')
+            return
+        if not messagebox.askokcancel(
+                'Dump this video?',
+                f'{song.label}\n\n'
+                'Deletes the downloaded video and remembers this particular '
+                'upload so it is skipped next time.\n\n'
+                'The song will be downloaded again on the next run, and should '
+                'pick something different.'):
+            return
+
+        result = dump_video(song.folder)
+        if result['status'] == 'failed':
+            messagebox.showerror('Could not dump the video', result['detail'])
+            return
+        if result['status'] == 'nothing_to_dump':
+            messagebox.showinfo('Nothing to dump', result['detail'])
+            return
+
+        song.has_video = False
+        song.res       = '-'
+        song.status    = 'Dumped - will re-download'
+        song.stag      = 'dim'
+        self._update_row(song)
+        self._apply_filter()
+        self._export_library_csv()
+        self._status_lbl.configure(text=f'Dumped: {result["detail"]}')
+
     def _open_sync_editor(self, song: Song):
         def on_save(ms: int, share: bool):
-            set_ini_values(song.folder, {'video_start_time': str(ms)})
+            # a hand-set offset outranks anything automatic - mark it so a later
+            # re-sync sweep can be told to leave the user's own work alone
+            set_ini_values(song.folder, {'video_start_time': str(ms),
+                                         'backstagehero_sync': SYNC_MANUAL})
             s_abs = abs(ms) / 1000.0
             if ms < -50:
                 song.status = f'Synced  (−{s_abs:.1f}s intro)'
@@ -1332,12 +1863,56 @@ class App(ctk.CTk):
                     resolver_client.report(ch, vid, ms, 0.5, artist, title)
         SyncEditor(self, song, on_save=on_save)
 
+    def _open_library_tools(self):
+        if self._running:
+            messagebox.showinfo('Busy', 'Wait for the current download/sync run to finish first.')
+            return
+        if self._tool_running:
+            # a worker from a previously-closed dialog is still going; a second
+            # dialog would happily start a second tool over the same library
+            messagebox.showinfo(
+                'Busy', 'A library scan is still running. Wait for it to finish first.')
+            return
+        if not self._songs_folder:
+            messagebox.showinfo('No folder selected', 'Pick your Songs folder first.')
+            return
+        LibraryToolsDialog(self, self._songs_folder,
+                            on_close=lambda: self._load_library(self._songs_folder),
+                            on_run_state=self._set_tool_running)
+
+    def _set_tool_running(self, running):
+        """Called FROM THE WORKER THREAD when a Library Tools scan starts/stops.
+
+        The flag assignment is what actually guards the library, so it happens
+        here and now -- a bare attribute write, atomic under the GIL, with no
+        Tk involved. Only the UI refresh is marshalled onto the main loop, and
+        if that scheduling fails the guard is still correct: worst case the
+        buttons look stale, rather than the window staying locked forever with
+        no way back.
+        """
+        self._tool_running = running
+        try:
+            self.after(0, lambda: self._on_tool_state_changed(running))
+        except Exception:
+            log.exception('Could not schedule UI refresh after tool state change')
+
+    def _on_tool_state_changed(self, running):
+        self._update_buttons()
+        if not running and self._songs_folder:
+            # the scan has genuinely finished, so reloading reads a settled
+            # tree. Covers the case where the dialog was closed mid-run and its
+            # own on_close reload was deliberately skipped for that reason.
+            self._load_library(self._songs_folder)
+
     def _update_buttons(self):
         checked    = [s for s in self._songs if s.checked]
         n          = len(checked)
         has_vid    = [s for s in checked if s.has_video]
-        can_start  = n > 0 and not self._running
-        can_resync = len(has_vid) > 0 and not self._running and self._sync_ready
+        # _tool_running blocks both: a Library Tools scan and a download run
+        # are two independent mutation paths over one library
+        can_start  = n > 0 and not self._running and not self._tool_running
+        can_resync = (len(has_vid) > 0 and not self._running
+                      and not self._tool_running and self._sync_ready)
 
         self._start_btn.configure(
             text=f'▶  Search & Download ({n})' if n else '▶  Search & Download',
@@ -1416,6 +1991,10 @@ class App(ctk.CTk):
         quality = quality_format(1080 if self._quality_var.get() == '1080p' else 720)
 
         self._running = True
+        # what "skipped" means differs by run type: a download run skips songs
+        # that already have a video, a resync run skips ones the user synced by
+        # hand. Set before the worker starts and only read on the main thread.
+        self._resync_run = resync
         self._stop_evt.clear()
         self._progress.set(0)
         self._update_buttons()
@@ -1495,11 +2074,13 @@ class App(ctk.CTk):
 
         self._queue.put(('finished', total, done, skipped, errors))
 
-    @staticmethod
-    def _run_summary(done, skipped, errors):
+    def _run_summary(self, done, skipped, errors):
         parts = []
-        if done:    parts.append(f'{done} downloaded')
-        if skipped: parts.append(f'{skipped} already had video')
+        if done:
+            parts.append(f'{done} re-synced' if self._resync_run else f'{done} downloaded')
+        if skipped:
+            parts.append(f'{skipped} manually synced, left alone' if self._resync_run
+                         else f'{skipped} already had video')
         if errors:  parts.append(f'{errors} failed (details in log)')
         return ', '.join(parts) if parts else 'nothing to do'
 
@@ -1541,7 +2122,8 @@ class App(ctk.CTk):
 
         elif kind == 'song_skipped':
             _, s, i, total = msg
-            s.status    = '✔  Already had video'
+            s.status    = ('✔  Manually synced' if self._resync_run
+                           else '✔  Already had video')
             s.stag      = 'dim'
             s.has_video = True
             self._update_row(s)
@@ -1597,6 +2179,9 @@ class App(ctk.CTk):
             self._update_row(s)
             if not self._running:
                 self._status_lbl.configure(text=status_text)
+
+        elif kind == 'csv_refresh':
+            self._export_library_csv()
 
         elif kind == 'app_update_available':
             _, latest, asset, sha = msg

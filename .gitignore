@@ -20,6 +20,13 @@ mpv-2.dll
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+
+# Local runtime and tooling artifacts - never part of the source
+# launch_log.txt is rewritten by "Launch BackstageHero.bat" on every launch.
+# HANDOFF.md is dropped here by the Captain's Log Stop hook and is not ours.
+launch_log.txt
+HANDOFF.md
 
 # Resolver runtime secrets and data - must never be committed
 resolver/.env
