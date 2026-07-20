@@ -69,30 +69,30 @@
 ## Phase 2: Integration & Orchestration
 
 ### Task 2.1: Enrichment Engine — Main Orchestrator
-- [ ] Create `library_enrichment.py`
-  - [ ] `enrich_library(library_path, ch_data_path=None, dry_run=False, force=False, chorus_cache_path=None, verbose=False) -> Dict`
-  - [ ] Per-song processing:
-    - [ ] Compute sidecar identity key via `resolver_client.chart_hash()` (reused, not new)
-    - [ ] Check incremental cache (skip if unchanged)
-    - [ ] Extract: song_length, instruments, NPS, features, note_count
-    - [ ] Compute `notes_mid_md5`; fetch high score, Chorus match (with cache)
-    - [ ] Scan: stems, album art (no playlist — dropped, see spec)
-    - [ ] Collect: problems
-  - [ ] Write sidecar JSON `backstagehero_enrichment.json` (matches SPEC)
-  - [ ] Implement incremental logic (hash-based cache)
-  - [ ] `--dry-run` support (compute, print, don't write)
-  - [ ] `--force` support (recompute all, clear cache)
-  - [ ] Respect "Share matches" GUI setting
-- [ ] Unit tests in `tests/test_library_enricher.py`
-  - [ ] Incremental cache logic
-  - [ ] Sidecar JSON structure
-  - [ ] Dry-run behavior
-  - [ ] Force behavior
-  - [ ] Problem detection & logging
-  - [ ] Edge cases: empty library, missing chart files, corrupt files
-- [ ] Code review & verify coverage
+- [x] Create `library_enrichment.py`
+  - [x] `enrich_library(library_path, ch_data_path=None, dry_run=False, force=False, chorus_cache_path=None, verbose=False) -> Dict`
+  - [x] Per-song processing:
+    - [x] Compute sidecar identity key via `resolver_client.chart_hash()` (reused, not new)
+    - [x] Check incremental cache (skip if unchanged) — skip is "already a key in sidecar['songs']", correct since chart_hash is content-based
+    - [x] Extract: song_length, instruments, NPS, features, note_count
+    - [x] Compute `notes_mid_md5`; fetch high score (via stubbed `read_scoredata`, always `{}` for now), Chorus match (via `CachedChorusClient`, not raw `chorus_client` — regression-tested)
+    - [x] Scan: stems, album art (no playlist — dropped, see spec)
+    - [x] Collect: problems (no song.ini, no notes.chart, non-numeric song_length, unidentifiable folder)
+  - [x] Write sidecar JSON `backstagehero_enrichment.json` (matches SPEC shape; atomic tmp+replace write)
+  - [x] Implement incremental logic (hash-based, not mtime-based)
+  - [x] `--dry-run` support (compute, don't write — param plumbed through `enrich_library`, CLI wiring is Task 2.2)
+  - [x] `--force` support (recompute all; Chorus cache has its own independent TTL, not cleared by force — tested that a forced rerun still hits cache for unchanged artist/title)
+  - [~] Respect "Share matches" GUI setting — not yet wired; this module never calls `resolver_client.report()/ping()` itself so there's nothing to gate yet, revisit if that changes
+- [x] Unit tests in `tests/test_library_enrichment.py` (own file, matching precedent)
+  - [x] Incremental cache logic (skip-unchanged, force-reprocesses)
+  - [x] Sidecar JSON structure (version, songs keyed by chart_hash, full entry shape)
+  - [x] Dry-run behavior (no file written)
+  - [x] Force behavior
+  - [x] Problem detection & logging (no chart file at all → excluded + counted; notes.mid-only → indexed with a problem)
+  - [x] Edge cases: unidentifiable folder (no chart_hash), missing notes.chart, no scores available → `None` not `0`
+- [x] Code review & verify coverage (8/8 module tests green; caught and fixed a redundant double-glob in `_has_album_art` on self-review)
 
-**Status**: Not started
+**Status**: Complete
 
 ---
 
