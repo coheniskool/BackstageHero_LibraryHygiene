@@ -12,15 +12,14 @@
   - [x] `parse_chart_instruments(path) -> Dict[str, int]` (presence: 1/-1, not charter tier — see module docstring)
   - [x] `parse_chart_nps(path) -> Optional[float]` (Expert-only, tempo-map-aware; see module docstring for v1 scoping)
   - [x] `parse_chart_features(path) -> Dict[str, bool]` (has_lyrics, has_solos, has_open_notes, has_2x_kick, has_roll_lanes — grounded in TheNathannator/GuitarGame_ChartFormats docs, not guessed; solo is `E solo`/`E soloend`, NOT `S 2` which is Star Power)
-  - [ ] `parse_chart_features(path) -> Dict[str, bool]`
-  - [ ] `parse_chart_note_count(path) -> Optional[int]`
-- [ ] Byte-safe error handling (UTF-8 validation, graceful degradation)
-- [ ] Unit tests in `tests/test_library_enricher.py`
-  - [ ] Test with real notes.chart samples
-  - [ ] Edge cases: empty chart, corrupt section, missing [Song] block, non-existent file
-- [ ] Code review & verify coverage
+  - [x] `parse_chart_note_count(path) -> Optional[int]` (shares Expert-section selection with parse_chart_nps so both describe the same track)
+- [x] Byte-safe error handling (UTF-8 validation, graceful degradation) — all four functions return safe defaults (all-absent dict / None) on missing/unreadable files, never raise
+- [x] Unit tests in `tests/test_library_chart_parser.py` (25 tests, own file rather than the shared test_library_enricher.py — kept module-scoped since chart parsing is self-contained)
+  - [x] Test with hand-built notes.chart samples (hand-calculated NPS/tick-math values, not just presence/absence)
+  - [x] Edge cases: empty chart, corrupt/no [Song] block, non-existent file, chord-tick counting, solo-vs-soloend substring trap, S2-star-power-vs-solo trap
+- [x] Code review & verify coverage (348/348 full suite green, no regressions)
 
-**Status**: Not started
+**Status**: Complete
 
 ---
 

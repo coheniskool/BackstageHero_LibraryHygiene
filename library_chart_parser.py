@@ -202,22 +202,29 @@ def _extract_note_ticks(body):
     return sorted(int(tick) for tick in _NOTE_TICK_RE.findall(body))
 
 
+def _select_expert_note_ticks(text, minimum=1):
+    """Note ticks (including chord duplicates) from whichever instrument in
+    _EXPERT_SECTION_PRIORITY appears first with at least `minimum` notes, or
+    None if none qualify. Shared by parse_chart_nps and
+    parse_chart_note_count so both describe the same track."""
+    sections = dict(_SECTION_RE.findall(text))
+    for section_name in _EXPERT_SECTION_PRIORITY:
+        body = sections.get(section_name)
+        if body is None:
+            continue
+        candidate = _extract_note_ticks(body)
+        if len(candidate) >= minimum:
+            return candidate
+    return None
+
+
 def parse_chart_nps_from_text(text):
     """Average notes-per-second across the chart's Expert difficulty, using
     whichever instrument in _EXPERT_SECTION_PRIORITY appears first with two
     or more notes. None when no Expert section has enough notes to define a
     rate (fewer than 2), including when the file has no note sections at all.
     """
-    sections = dict(_SECTION_RE.findall(text))
-    ticks = None
-    for section_name in _EXPERT_SECTION_PRIORITY:
-        body = sections.get(section_name)
-        if body is None:
-            continue
-        candidate = _extract_note_ticks(body)
-        if len(candidate) >= 2:
-            ticks = candidate
-            break
+    ticks = _select_expert_note_ticks(text, minimum=2)
     if ticks is None:
         return None
 
@@ -241,3 +248,24 @@ def parse_chart_nps(path):
         log.warning('Could not read chart %s: %s', path, e)
         return None
     return parse_chart_nps_from_text(text)
+
+
+def parse_chart_note_count_from_text(text):
+    """Total note count (chords count each note individually) for the same
+    Expert-section selection parse_chart_nps uses -- the two are meant to be
+    read together (\"1247 notes, 7.3 NPS\"), so they must describe the same
+    track. None when no Expert section has any notes."""
+    ticks = _select_expert_note_ticks(text, minimum=1)
+    return len(ticks) if ticks is not None else None
+
+
+def parse_chart_note_count(path):
+    """Same as parse_chart_note_count_from_text, reading from a file path.
+    Missing or unreadable files return None rather than raising."""
+    try:
+        with open(path, encoding='utf-8-sig', errors='replace') as f:
+            text = f.read()
+    except OSError as e:
+        log.warning('Could not read chart %s: %s', path, e)
+        return None
+    return parse_chart_note_count_from_text(text)

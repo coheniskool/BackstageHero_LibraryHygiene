@@ -230,3 +230,38 @@ def test_parse_chart_features_none_present(tmp_path):
 def test_parse_chart_features_missing_file_returns_no_features(tmp_path):
     missing = tmp_path / 'does_not_exist.chart'
     assert lcp.parse_chart_features(missing) == NO_FEATURES
+
+
+# --- parse_chart_note_count --------------------------------------------------
+#
+# Same Expert-section selection as parse_chart_nps (see its comment above) --
+# note_count and avg_nps must describe the same track to be meaningful
+# together in the sidecar/booklet ("1247 notes, 7.3 NPS").
+
+def test_parse_chart_note_count_counts_all_note_lines_including_chords():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  0 = N 1 0\n  192 = N 2 0\n}\n'
+    )
+    # Tick 0 has a 2-note chord + one more note at 192 = 3 total notes.
+    assert lcp.parse_chart_note_count_from_text(text) == 3
+
+
+def test_parse_chart_note_count_matches_nps_selected_section():
+    assert lcp.parse_chart_note_count_from_text(CHART_CONSTANT_BPM) == 4
+
+
+def test_parse_chart_note_count_none_when_no_expert_section():
+    text = '[Song]\n{\n  Name = "Test"\n}\n'
+    assert lcp.parse_chart_note_count_from_text(text) is None
+
+
+def test_parse_chart_note_count_reads_from_file(tmp_path):
+    chart = tmp_path / 'notes.chart'
+    chart.write_text(CHART_CONSTANT_BPM, encoding='utf-8')
+    assert lcp.parse_chart_note_count(chart) == 4
+
+
+def test_parse_chart_note_count_missing_file_returns_none(tmp_path):
+    missing = tmp_path / 'does_not_exist.chart'
+    assert lcp.parse_chart_note_count(missing) is None
