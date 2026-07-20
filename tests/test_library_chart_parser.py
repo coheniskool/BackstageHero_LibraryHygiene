@@ -136,3 +136,97 @@ def test_parse_chart_nps_reads_from_file(tmp_path):
     chart = tmp_path / 'notes.chart'
     chart.write_text(CHART_CONSTANT_BPM, encoding='utf-8')
     assert lcp.parse_chart_nps(chart) == 2.0
+
+
+# --- parse_chart_features --------------------------------------------------
+#
+# Grounded in TheNathannator/GuitarGame_ChartFormats' documented .chart
+# format (docs/Chart-File-Formats/chart-format/Tracks/{5-Fret-Guitar,Drums,
+# Lyrics}.md), not guessed:
+#   - solos are the *local events* `E solo` / `E soloend`, NOT `S 2` --
+#     `S 2` is Star Power and would be a wrong-by-one-letter bug if used here.
+#   - open notes are note type 7, on 5-fret guitar-family sections only.
+#   - 2x kick is note type 32, on Drums sections only.
+#   - roll lanes are special-phrase types 65 (single) / 66 (double), on
+#     Drums sections only.
+#   - lyrics are `E "lyric <word>"` / `E lyric <word>` events in [Events].
+
+NO_FEATURES = {
+    'has_lyrics': False, 'has_solos': False,
+    'has_open_notes': False, 'has_2x_kick': False, 'has_roll_lanes': False,
+}
+
+
+def test_parse_chart_features_detects_solo_event_not_star_power():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  0 = S 2 192\n}\n'
+    )
+    # S 2 alone (Star Power) must NOT be mistaken for a solo.
+    assert lcp.parse_chart_features_from_text(text)['has_solos'] is False
+
+    text_with_solo = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  0 = E solo\n  192 = N 1 0\n  192 = E soloend\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text_with_solo)['has_solos'] is True
+
+
+def test_parse_chart_features_solo_event_survives_soloend_substring():
+    """'soloend' contains 'solo' as a substring -- a naive search must not
+    let it register as an (unstarted) solo on its own."""
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  192 = E soloend\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text)['has_solos'] is False
+
+
+def test_parse_chart_features_detects_open_note_on_guitar():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  192 = N 7 0\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text)['has_open_notes'] is True
+
+
+def test_parse_chart_features_detects_2x_kick_on_drums():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertDrums]\n{\n  0 = N 0 0\n  192 = N 32 0\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text)['has_2x_kick'] is True
+
+
+def test_parse_chart_features_detects_roll_lanes_on_drums():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertDrums]\n{\n  0 = N 1 0\n  0 = S 65 768\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text)['has_roll_lanes'] is True
+
+    text_double = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertDrums]\n{\n  0 = N 1 0\n  0 = S 66 768\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text_double)['has_roll_lanes'] is True
+
+
+def test_parse_chart_features_detects_lyrics():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[Events]\n{\n  576 = E "phrase_start"\n  768 = E "lyric This"\n  '
+        '1536 = E "phrase_end"\n}\n'
+    )
+    assert lcp.parse_chart_features_from_text(text)['has_lyrics'] is True
+
+
+def test_parse_chart_features_none_present(tmp_path):
+    chart = tmp_path / 'notes.chart'
+    chart.write_text(CHART_WITH_GUITAR_AND_BASS, encoding='utf-8')
+    assert lcp.parse_chart_features(chart) == NO_FEATURES
+
+
+def test_parse_chart_features_missing_file_returns_no_features(tmp_path):
+    missing = tmp_path / 'does_not_exist.chart'
+    assert lcp.parse_chart_features(missing) == NO_FEATURES

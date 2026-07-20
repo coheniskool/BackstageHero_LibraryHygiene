@@ -53,6 +53,74 @@ _EXPERT_SECTION_PRIORITY = (
     'ExpertDoubleRhythm', 'ExpertKeyboard', 'ExpertGHLGuitar',
 )
 
+# --- Feature detection -------------------------------------------------
+#
+# Grounded in TheNathannator/GuitarGame_ChartFormats' documented .chart
+# format (github.com/TheNathannator/GuitarGame_ChartFormats, docs/
+# Chart-File-Formats/chart-format/Tracks/{5-Fret-Guitar,Drums,Lyrics}.md).
+# Notably: solos are the LOCAL EVENTS `E solo`/`E soloend`, not the `S 2`
+# special phrase -- `S 2` is Star Power, a different, unrelated concept that
+# would have been a wrong-by-one-character bug if assumed instead of checked.
+
+# 5-fret guitar-family sections only -- open notes (note type 7) are a
+# 5-fret concept; GHLGuitar (6-fret) uses different note numbering entirely.
+_FIVE_FRET_SECTION_SUFFIXES = ('Single', 'DoubleGuitar', 'DoubleBass', 'DoubleRhythm', 'Keyboard')
+
+_SOLO_START_RE = re.compile(r'^\s*\d+\s*=\s*E\s+"?solo"?\s*$', re.MULTILINE)
+_LYRIC_EVENT_RE = re.compile(r'^\s*\d+\s*=\s*E\s+"?lyric\s', re.MULTILINE)
+_OPEN_NOTE_RE = re.compile(r'^\s*\d+\s*=\s*N\s+7\s+\d+\s*$', re.MULTILINE)
+_TWO_X_KICK_RE = re.compile(r'^\s*\d+\s*=\s*N\s+32\s+\d+\s*$', re.MULTILINE)
+_ROLL_LANE_RE = re.compile(r'^\s*\d+\s*=\s*S\s+6[56]\s+\d+\s*$', re.MULTILINE)
+
+
+def parse_chart_features_from_text(text):
+    """has_lyrics/has_solos/has_open_notes/has_2x_kick/has_roll_lanes, from
+    raw .chart text. Solos and lyrics are checked across the whole file
+    (both can appear on any instrument); open notes are scoped to 5-fret
+    guitar-family sections, 2x-kick and roll lanes to Drums sections --
+    matching where the format actually defines those note/phrase types.
+    """
+    sections = _SECTION_RE.findall(text)
+
+    has_open_notes = False
+    has_2x_kick = False
+    has_roll_lanes = False
+    for section_name, body in sections:
+        is_five_fret = any(section_name.endswith(suffix) for suffix in _FIVE_FRET_SECTION_SUFFIXES)
+        is_drums = section_name.endswith('Drums')
+        if is_five_fret and _OPEN_NOTE_RE.search(body):
+            has_open_notes = True
+        if is_drums and _TWO_X_KICK_RE.search(body):
+            has_2x_kick = True
+        if is_drums and _ROLL_LANE_RE.search(body):
+            has_roll_lanes = True
+
+    return {
+        'has_lyrics': bool(_LYRIC_EVENT_RE.search(text)),
+        'has_solos': bool(_SOLO_START_RE.search(text)),
+        'has_open_notes': has_open_notes,
+        'has_2x_kick': has_2x_kick,
+        'has_roll_lanes': has_roll_lanes,
+    }
+
+
+_NO_FEATURES = {
+    'has_lyrics': False, 'has_solos': False,
+    'has_open_notes': False, 'has_2x_kick': False, 'has_roll_lanes': False,
+}
+
+
+def parse_chart_features(path):
+    """Same as parse_chart_features_from_text, reading from a file path.
+    Missing or unreadable files return all-False rather than raising."""
+    try:
+        with open(path, encoding='utf-8-sig', errors='replace') as f:
+            text = f.read()
+    except OSError as e:
+        log.warning('Could not read chart %s: %s', path, e)
+        return dict(_NO_FEATURES)
+    return parse_chart_features_from_text(text)
+
 
 def _section_instrument(section_name):
     for prefix in _DIFFICULTY_PREFIXES:

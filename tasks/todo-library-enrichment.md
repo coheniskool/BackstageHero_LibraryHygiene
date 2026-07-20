@@ -11,6 +11,7 @@
 - [x] Create `library_chart_parser.py`
   - [x] `parse_chart_instruments(path) -> Dict[str, int]` (presence: 1/-1, not charter tier — see module docstring)
   - [x] `parse_chart_nps(path) -> Optional[float]` (Expert-only, tempo-map-aware; see module docstring for v1 scoping)
+  - [x] `parse_chart_features(path) -> Dict[str, bool]` (has_lyrics, has_solos, has_open_notes, has_2x_kick, has_roll_lanes — grounded in TheNathannator/GuitarGame_ChartFormats docs, not guessed; solo is `E solo`/`E soloend`, NOT `S 2` which is Star Power)
   - [ ] `parse_chart_features(path) -> Dict[str, bool]`
   - [ ] `parse_chart_note_count(path) -> Optional[int]`
 - [ ] Byte-safe error handling (UTF-8 validation, graceful degradation)
