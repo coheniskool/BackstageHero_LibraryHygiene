@@ -686,8 +686,18 @@ hypotheses.
   genuinely carries no signal; the rest may hide gameplay captures with plain titles.
 - **27 songs have no recoverable video id**, so they cannot be audited without re-downloading.
 - **266 videos predate this app** and were never filtered by anything.
-- **The new kind-ranking has never run a real download.** It is tested and measured against
-  real titles, but no song has been downloaded through it end to end.
+- ~~**The new kind-ranking has never run a real download.**~~ **CLOSED 2026-07-19.** A batch
+  of new songs was downloaded through it and played in-game. Result: *"some videos were
+  gameplay and all but one were synced well."* So the ranking demonstrably helps but does not
+  eliminate gameplay captures -- expected, and worth stating precisely: it **demotes** rather
+  than excludes (a lyric video is still better than no video for an obscure chart), and 199 of
+  358 known titles carry no signal either way, so a gameplay capture with a plain title still
+  wins on search rank. Improving this further needs a signal beyond the title -- the uploader
+  channel is the obvious candidate and is not implemented.
+- **`Red Barchetta` did not line up** in that same batch, and is uninvestigated. Unlike the
+  earlier `Learn to Live` case this one has *not* been hand-fixed, so the computed offset is
+  still on disk and the failure is reproducible -- the first `measured`-but-wrong case that
+  can actually be diagnosed. Deliberately left for after the PR.
 - **`fpcalc` is present but pyacoustid cannot load chromaprint** on this machine, so the
   dedupe confirm path has never executed. Its "fails closed" behaviour is environmental
   luck here, not a demonstrated guard.
