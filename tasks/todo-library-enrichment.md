@@ -26,18 +26,21 @@
 ### Task 1.2: Score Reader — scoredata.bin Parsing
 - [ ] **Spike first**: validate the clonehero-score-exporter format against a real Clone Hero install with known scores; confirm/deny `.chart`-only song coverage (resolves spec Open Question #6)
   - **Partial spike findings (2026-07-20, real install)**: the actual filename on a current Clone Hero install is **`scores.bin`**, not `scoredata.bin` (dir itself confirmed correct: `%USERPROFILE%\AppData\LocalLow\srylain Inc_\Clone Hero\`). Hex-dumped a real 358-byte `scores.bin`: it does NOT start with a raw 16-byte MD5 as clonehero-score-exporter's README described — the observed layout is a little-endian uint32 entry count, then per-entry a **1-byte length prefix (0x20=32) followed by 32 ASCII hex characters** (the MD5 as a *string*, not raw bytes), e.g. `20 '62057549D38DAFD406ECB76849290F4'`. This contradicts the assumed raw-bytes format and must be re-verified/re-derived before implementation — do not code against the raw-16-byte assumption. Test library location for a full end-to-end spike (real chart + real score) was not resolved this pass — the configured `F:\Clone Hero\Library\Songs` was empty at spike time.
-- [ ] Create `library_scores.py`
-  - [ ] `notes_mid_md5(song_folder) -> Optional[str]` — separate from `resolver_client.chart_hash()`
-  - [ ] `read_scoredata(ch_data_path) -> Dict[str, Dict[str, int]]` keyed by `notes_mid_md5`
-  - [ ] Auto-detect `scoredata.bin` via Unity `persistentDataPath` convention (not the old/wrong `%APPDATA%/Panda Cop/...` guess — see spec)
-  - [ ] Handle missing/corrupt/version-mismatched files gracefully
-  - [ ] `.chart`-only songs get `None`, not `0`, and are not flagged as a problem
-- [ ] Unit tests in `tests/test_library_enricher.py`
-  - [ ] Mock scoredata.bin fragment (built from the documented layout: instrument id/difficulty/percent/stars/score, little-endian)
-  - [ ] Version mismatch detection
-  - [ ] Missing/unreadable file scenarios
-  - [ ] `.chart`-only song → `None` score, no problem flagged
-- [ ] Code review & verify coverage
+- [x] Create `library_scores.py`
+  - [x] `notes_mid_md5(song_folder) -> Optional[str]` — separate from `resolver_client.chart_hash()`, confirmed different by test
+  - [~] `read_scoredata(ch_data_path) -> Dict[str, Dict[str, int]]` — **STUB, returns `{}` unconditionally**. Real-install spike found the file is `scores.bin` (not `scoredata.bin`) and entries are NOT the raw-16-byte-MD5 layout initially assumed (observed: length-prefixed ASCII hex string). Implementing the real parser against either the wrong or an unconfirmed layout risks silently wrong scores, which is worse than none — deferred until re-verified against a real chart+score pair (need: a populated library + a known score to check against; `F:\Clone Hero\Library\Songs` was empty at spike time)
+  - [ ] Auto-detect `scores.bin` via Unity `persistentDataPath` convention — not yet wired in since read_scoredata() doesn't parse anything yet
+  - [ ] Handle missing/corrupt/version-mismatched files gracefully — N/A until real parsing exists
+  - [x] `.chart`-only songs get `None` from `notes_mid_md5`, not `0`
+- [x] Unit tests in `tests/test_library_scores.py` (own file, matching precedent)
+  - [ ] Mock scoredata.bin fragment — blocked on confirming the real layout first
+  - [ ] Version mismatch detection — N/A until real parsing exists
+  - [x] Missing/unreadable file scenarios (for `notes_mid_md5` and the `read_scoredata` stub)
+  - [x] `.chart`-only song → `None` score via `notes_mid_md5`
+  - [x] `notes_mid_md5` confirmed distinct from `resolver_client.chart_hash()` by test
+- [x] Code review & verify coverage (6/6 module tests green; stub explicitly tested as a stub, not silently left uncovered)
+
+**Status**: Partial — `notes_mid_md5()` done; `read_scoredata()` stubbed pending real-install spike (needs a populated library + known score)
 
 **Status**: Not started
 
