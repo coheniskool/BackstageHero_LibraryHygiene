@@ -8,9 +8,9 @@
 ## Phase 1: Foundation Parsers
 
 ### Task 1.1: Chart Parser — notes.chart Parsing
-- [ ] Create `library_chart_parser.py`
-  - [ ] `parse_chart_instruments(path) -> Dict[str, int]`
-  - [ ] `parse_chart_nps(path) -> Optional[float]`
+- [x] Create `library_chart_parser.py`
+  - [x] `parse_chart_instruments(path) -> Dict[str, int]` (presence: 1/-1, not charter tier — see module docstring)
+  - [x] `parse_chart_nps(path) -> Optional[float]` (Expert-only, tempo-map-aware; see module docstring for v1 scoping)
   - [ ] `parse_chart_features(path) -> Dict[str, bool]`
   - [ ] `parse_chart_note_count(path) -> Optional[int]`
 - [ ] Byte-safe error handling (UTF-8 validation, graceful degradation)

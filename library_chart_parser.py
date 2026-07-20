@@ -38,6 +38,20 @@ _DIFFICULTY_PREFIXES = ('Easy', 'Medium', 'Hard', 'Expert')
 
 _SECTION_RE = re.compile(r'\[(\w+)\]\s*\{(.*?)\}', re.DOTALL)
 _NOTE_LINE_RE = re.compile(r'^\s*\d+\s*=\s*N\s+\d+\s+\d+\s*$', re.MULTILINE)
+_NOTE_TICK_RE = re.compile(r'^\s*(\d+)\s*=\s*N\s+\d+\s+\d+\s*$', re.MULTILINE)
+_BPM_EVENT_RE = re.compile(r'^\s*(\d+)\s*=\s*B\s+(\d+)\s*$', re.MULTILINE)
+_RESOLUTION_RE = re.compile(r'(?im)^\s*Resolution\s*=\s*(\d+)\s*$')
+
+_DEFAULT_RESOLUTION = 192
+_DEFAULT_BPM = 120.0
+
+# Expert-only difficulty priority for the single representative NPS figure a
+# booklet needs -- a deliberate v1 simplification (see module docstring),
+# not full per-difficulty NPS.
+_EXPERT_SECTION_PRIORITY = (
+    'ExpertSingle', 'ExpertDoubleBass', 'ExpertDrums',
+    'ExpertDoubleRhythm', 'ExpertKeyboard', 'ExpertGHLGuitar',
+)
 
 
 def _section_instrument(section_name):
@@ -79,3 +93,83 @@ def parse_chart_instruments(path):
         log.warning('Could not read chart %s: %s', path, e)
         return {name: -1 for name in INSTRUMENT_NAMES}
     return parse_chart_instruments_from_text(text)
+
+
+def _parse_resolution(text):
+    m = _RESOLUTION_RE.search(text)
+    return int(m.group(1)) if m else _DEFAULT_RESOLUTION
+
+
+def _parse_bpm_events(text):
+    """Sorted (tick, bpm) list from [SyncTrack]. BPM events store bpm*1000
+    as an integer, per the .chart format. Falls back to a single
+    (0, _DEFAULT_BPM) event when the sync track has none -- a malformed or
+    truncated chart still needs *some* tempo to convert ticks to seconds."""
+    events = [(int(tick), int(raw_bpm) / 1000.0)
+              for tick, raw_bpm in _BPM_EVENT_RE.findall(text)]
+    if not events:
+        return [(0, _DEFAULT_BPM)]
+    events.sort(key=lambda e: e[0])
+    if events[0][0] != 0:
+        events.insert(0, (0, _DEFAULT_BPM))
+    return events
+
+
+def _tick_to_seconds(tick, resolution, bpm_events):
+    """Integrate tempo changes to convert an absolute tick position to
+    elapsed seconds from the start of the chart."""
+    seconds = 0.0
+    for i, (event_tick, bpm) in enumerate(bpm_events):
+        segment_end = bpm_events[i + 1][0] if i + 1 < len(bpm_events) else tick
+        segment_end = min(segment_end, tick)
+        if segment_end <= event_tick:
+            continue
+        seconds += (segment_end - event_tick) / resolution * (60.0 / bpm)
+        if segment_end >= tick:
+            break
+    return seconds
+
+
+def _extract_note_ticks(body):
+    return sorted(int(tick) for tick in _NOTE_TICK_RE.findall(body))
+
+
+def parse_chart_nps_from_text(text):
+    """Average notes-per-second across the chart's Expert difficulty, using
+    whichever instrument in _EXPERT_SECTION_PRIORITY appears first with two
+    or more notes. None when no Expert section has enough notes to define a
+    rate (fewer than 2), including when the file has no note sections at all.
+    """
+    sections = dict(_SECTION_RE.findall(text))
+    ticks = None
+    for section_name in _EXPERT_SECTION_PRIORITY:
+        body = sections.get(section_name)
+        if body is None:
+            continue
+        candidate = _extract_note_ticks(body)
+        if len(candidate) >= 2:
+            ticks = candidate
+            break
+    if ticks is None:
+        return None
+
+    resolution = _parse_resolution(text)
+    bpm_events = _parse_bpm_events(text)
+    first_s = _tick_to_seconds(ticks[0], resolution, bpm_events)
+    last_s = _tick_to_seconds(ticks[-1], resolution, bpm_events)
+    span = last_s - first_s
+    if span <= 0:
+        return None
+    return (len(ticks) - 1) / span
+
+
+def parse_chart_nps(path):
+    """Same as parse_chart_nps_from_text, reading from a file path. Missing
+    or unreadable files return None rather than raising."""
+    try:
+        with open(path, encoding='utf-8-sig', errors='replace') as f:
+            text = f.read()
+    except OSError as e:
+        log.warning('Could not read chart %s: %s', path, e)
+        return None
+    return parse_chart_nps_from_text(text)

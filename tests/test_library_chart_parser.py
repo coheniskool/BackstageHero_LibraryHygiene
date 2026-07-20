@@ -1,5 +1,5 @@
 # tests/test_library_chart_parser.py
-# Covers library_chart_parser.parse_chart_instruments -- Task 1.1 of the
+# Covers library_chart_parser's notes.chart parsing -- Task 1.1 of the
 # library-enrichment plan. See tasks/plan-library-enrichment.md.
 
 import library_chart_parser as lcp
@@ -76,3 +76,63 @@ def test_parse_chart_instruments_multiple_difficulties_same_instrument(tmp_path)
     )
     result = lcp.parse_chart_instruments_from_text(text)
     assert result['guitar'] == 1
+
+
+# --- parse_chart_nps --------------------------------------------------
+#
+# avg_nps is defined as (note_count - 1) / (last_note_time - first_note_time)
+# over the chosen instrument's Expert difficulty -- an average rate between
+# the first and last note, the standard "notes per second" meaning. Chords
+# (multiple simultaneous notes on one tick) each count individually.
+#
+# Guitar Expert is used when present; otherwise the priority order in
+# _EXPERT_SECTION_PRIORITY is tried. Only Expert is considered -- a
+# deliberate v1 simplification (see module docstring), not an omission.
+
+CHART_CONSTANT_BPM = (
+    '[Song]\n{\n  Name = "Test"\n  Resolution = 192\n}\n'
+    '[SyncTrack]\n{\n  0 = TS 4\n  0 = B 120000\n}\n'
+    '[ExpertSingle]\n{\n  0 = N 0 0\n  192 = N 1 0\n  384 = N 2 0\n  576 = N 0 0\n}\n'
+)
+
+CHART_BPM_CHANGE = (
+    '[Song]\n{\n  Name = "Test"\n  Resolution = 192\n}\n'
+    '[SyncTrack]\n{\n  0 = TS 4\n  0 = B 120000\n  384 = B 240000\n}\n'
+    '[ExpertSingle]\n{\n  0 = N 0 0\n  192 = N 1 0\n  384 = N 2 0\n  576 = N 0 0\n}\n'
+)
+
+
+def test_parse_chart_nps_constant_bpm():
+    # 4 notes at 192-tick spacing, 120 BPM, resolution 192 -> 0.5s/note ->
+    # span 0 to 1.5s, (4-1)/1.5 = 2.0 NPS.
+    assert lcp.parse_chart_nps_from_text(CHART_CONSTANT_BPM) == 2.0
+
+
+def test_parse_chart_nps_integrates_across_bpm_change():
+    # First 2 ticks (0->384) at 120 BPM = 1.0s; next 192 ticks (384->576) at
+    # 240 BPM = 0.25s. Total span 1.25s, (4-1)/1.25 = 2.4 NPS.
+    assert lcp.parse_chart_nps_from_text(CHART_BPM_CHANGE) == 2.4
+
+
+def test_parse_chart_nps_none_when_fewer_than_two_notes():
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n}\n'
+    )
+    assert lcp.parse_chart_nps_from_text(text) is None
+
+
+def test_parse_chart_nps_none_when_no_expert_section():
+    text = '[Song]\n{\n  Name = "Test"\n}\n'
+    assert lcp.parse_chart_nps_from_text(text) is None
+
+
+def test_parse_chart_nps_missing_file_returns_none(tmp_path):
+    missing = tmp_path / 'does_not_exist.chart'
+    assert lcp.parse_chart_nps(missing) is None
+
+
+def test_parse_chart_nps_reads_from_file(tmp_path):
+    chart = tmp_path / 'notes.chart'
+    chart.write_text(CHART_CONSTANT_BPM, encoding='utf-8')
+    assert lcp.parse_chart_nps(chart) == 2.0
