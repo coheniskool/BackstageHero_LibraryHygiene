@@ -44,18 +44,20 @@
 ---
 
 ### Task 1.3: Chorus Response Cacher
-- [ ] Create `chorus_cache.py`
-  - [ ] `CachedChorusClient` class
-  - [ ] `.search_by_artist_title(artist, title, force=False)`
-  - [ ] In-memory + optional disk cache (JSON)
-  - [ ] 7-day TTL; `force=True` clears cache
-- [ ] Unit tests in `tests/test_library_enricher.py`
-  - [ ] Cache hit, miss, expiry, force-clear
-  - [ ] Concurrent access (if needed)
-  - [ ] Cached response structure validation
-- [ ] Code review & verify coverage
+- [x] Create `chorus_cache.py`
+  - [x] `CachedChorusClient` class
+  - [x] `.search_by_artist_title(artist, title, force=False)`
+  - [x] In-memory + optional disk cache (JSON, atomic tmp+replace write)
+  - [x] 7-day TTL; `force=True` bypasses (not "clears" — a forced call still refreshes the entry for future calls)
+- [x] Unit tests in `tests/test_chorus_cache.py` (own file, matching test_library_chart_parser.py's precedent — module-scoped, not the shared test_library_enricher.py)
+  - [x] Cache hit, miss, expiry (injected clock via monkeypatch, no real sleep), force-bypass
+  - [x] `None` (confirmed no-match) is cached too
+  - [x] Cache key is case/whitespace-insensitive (reuses library_common.normalize_lookup_value)
+  - [x] Disk persistence across instances, corrupt-disk-cache tolerance, valid-JSON-on-disk check
+  - [~] Concurrent access: not tested — single-process CLI/subprocess usage per spec, no concurrent-writer scenario in scope
+- [x] Code review & verify coverage (10/10 module tests green)
 
-**Status**: Not started
+**Status**: Complete
 
 **Checkpoint 1**: All three foundation parsers complete and tested ✓
 
