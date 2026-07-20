@@ -138,6 +138,32 @@ def test_parse_chart_nps_reads_from_file(tmp_path):
     assert lcp.parse_chart_nps(chart) == 2.0
 
 
+def test_parse_chart_nps_bpm_track_not_starting_at_tick_zero():
+    """A sync track whose first B event isn't at tick 0 (a terse/hand-edited
+    chart) must still have a defined tempo for ticks before that event --
+    _parse_bpm_events prepends a default (0, 120bpm) segment rather than
+    leaving an undefined gap."""
+    text = (
+        '[Song]\n{\n  Name = "Test"\n  Resolution = 192\n}\n'
+        '[SyncTrack]\n{\n  0 = TS 4\n  192 = B 120000\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  192 = N 1 0\n  384 = N 2 0\n}\n'
+    )
+    # ticks 0->192 at the default 120bpm fallback (0.5s), 192->384 also at
+    # 120bpm (explicit event) -> span 1.0s, (3-1)/1.0 = 2.0 NPS.
+    assert lcp.parse_chart_nps_from_text(text) == 2.0
+
+
+def test_parse_chart_nps_zero_span_returns_none():
+    """Two-or-more notes that all land on the same tick (e.g. only chords,
+    no rhythm to measure) have a defined note count but an undefined rate --
+    must be None, not a division by zero or a fabricated infinity."""
+    text = (
+        '[Song]\n{\n  Name = "Test"\n}\n'
+        '[ExpertSingle]\n{\n  0 = N 0 0\n  0 = N 1 0\n  0 = N 2 0\n}\n'
+    )
+    assert lcp.parse_chart_nps_from_text(text) is None
+
+
 # --- parse_chart_features --------------------------------------------------
 #
 # Grounded in TheNathannator/GuitarGame_ChartFormats' documented .chart

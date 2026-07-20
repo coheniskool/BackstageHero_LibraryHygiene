@@ -133,6 +133,22 @@ def test_corrupt_disk_cache_is_ignored_not_raised(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_disk_write_failure_does_not_raise(tmp_path, monkeypatch):
+    """A convenience cache must never cost the user the ability to run
+    enrichment -- matches _export_library_csv's own philosophy."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    def _denied(*a, **k):
+        raise OSError(13, 'Permission denied')
+    monkeypatch.setattr('builtins.open', _denied)
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    result = client.search_by_artist_title('3 Doors Down', 'Kryptonite')  # must not raise
+    assert result == _RESULT_A
+
+
 def test_disk_cache_written_as_valid_json(tmp_path, monkeypatch):
     calls = []
     _stub(monkeypatch, calls, result=_RESULT_A)

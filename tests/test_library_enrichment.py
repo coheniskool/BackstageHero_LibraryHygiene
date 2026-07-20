@@ -151,6 +151,64 @@ def test_enrich_library_uses_cached_chorus_client_not_raw_chorus_client(tmp_path
     assert len(calls) == 1
 
 
+def test_enrich_library_corrupt_sidecar_is_ignored_not_raised(tmp_path, monkeypatch):
+    _stub_chorus(monkeypatch, result=None)
+    _make_song(tmp_path, '3 Doors Down - Kryptonite')
+    (tmp_path / le.SIDECAR_FILENAME).write_text('{not valid json', encoding='utf-8')
+
+    summary = le.enrich_library(tmp_path)  # must not raise
+    assert summary['songs_processed'] == 1
+
+
+def test_enrich_library_sidecar_write_failure_does_not_raise(tmp_path, monkeypatch):
+    """A convenience sidecar must never cost the user the ability to run a
+    scan -- matches _export_library_csv's own philosophy."""
+    _stub_chorus(monkeypatch, result=None)
+    _make_song(tmp_path, '3 Doors Down - Kryptonite')
+
+    real_open = open
+    def _deny_writes(path, mode='r', *a, **k):
+        if 'w' in mode:
+            raise OSError(13, 'Permission denied')
+        return real_open(path, mode, *a, **k)
+    monkeypatch.setattr('builtins.open', _deny_writes)
+
+    summary = le.enrich_library(tmp_path)  # must not raise
+    assert summary['songs_processed'] == 1
+
+
+def test_enrich_library_non_numeric_song_length_is_a_problem(tmp_path, monkeypatch):
+    _stub_chorus(monkeypatch, result=None)
+    _make_song(tmp_path, '3 Doors Down - Kryptonite',
+               ini_text='[song]\nname = Kryptonite\nartist = 3 Doors Down\nsong_length = not_a_number\n')
+
+    le.enrich_library(tmp_path)
+
+    sidecar_path = tmp_path / le.SIDECAR_FILENAME
+    with open(sidecar_path, encoding='utf-8') as f:
+        sidecar = json.load(f)
+    entry = next(iter(sidecar['songs'].values()))
+    assert entry['song_length_ms'] is None
+    assert any('song_length' in p for p in entry['problems'])
+
+
+def test_enrich_library_chart_present_but_no_song_ini_is_a_problem_but_still_indexes(tmp_path, monkeypatch):
+    _stub_chorus(monkeypatch, result=None)
+    folder = tmp_path / 'No Ini'
+    folder.mkdir()
+    (folder / 'notes.chart').write_text(CHART_TEXT, encoding='utf-8')
+    # No song.ini at all, but the chart is enough to compute a chart_hash.
+
+    summary = le.enrich_library(tmp_path)
+    assert summary['songs_processed'] == 1
+
+    sidecar_path = tmp_path / le.SIDECAR_FILENAME
+    with open(sidecar_path, encoding='utf-8') as f:
+        sidecar = json.load(f)
+    entry = next(iter(sidecar['songs'].values()))
+    assert 'no song.ini found' in entry['problems']
+
+
 def test_enrich_library_no_scores_available_is_none_not_zero(tmp_path, monkeypatch):
     """No ch_data_path given -> no scores available. Must be None (unknown),
     never a fabricated 0 (which would look like a real, terrible score)."""
