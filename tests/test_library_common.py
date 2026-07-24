@@ -33,6 +33,56 @@ def test_find_song_audio_no_audio_returns_none(tmp_path):
     assert lc.find_song_audio(tmp_path) is None
 
 
+# --- shared folder-listing helper (perf-simplification pass) --------------
+
+def test_shared_listing_avoids_rescanning_the_folder(tmp_path, monkeypatch):
+    """find_song_audio/find_video_file used to each do their own independent
+    glob()/exists() scans of the same folder. Passing one shared listing
+    (from list_song_folder_files) must mean the folder is only scanned once."""
+    (tmp_path / 'song.ogg').write_bytes(b'x')
+    (tmp_path / 'video.mp4').write_bytes(b'x')
+
+    calls = []
+    real = lc._list_folder_entries
+
+    def _counting(folder):
+        calls.append(folder)
+        return real(folder)
+
+    monkeypatch.setattr(lc, '_list_folder_entries', _counting)
+
+    files = lc.list_song_folder_files(tmp_path)
+    assert lc.find_song_audio(tmp_path, files=files).name == 'song.ogg'
+    assert lc.find_video_file(tmp_path, files=files).name == 'video.mp4'
+
+    assert len(calls) == 1
+
+
+def test_iter_song_folders_lists_each_container_directory_once(tmp_path, monkeypatch):
+    """A container folder (holding other song folders, not song content
+    itself) used to be listed twice per level: once via looks_like_song_folder
+    to check whether it was a song folder, once by the recursive walk
+    re-listing it to find its children. No directory should appear twice."""
+    pack = tmp_path / 'Pack'
+    song = pack / 'Song'
+    song.mkdir(parents=True)
+    (song / 'song.ini').write_text('[song]\n', encoding='utf-8')
+
+    calls = []
+    real = lc._list_folder_entries
+
+    def _counting(folder):
+        calls.append(str(folder))
+        return real(folder)
+
+    monkeypatch.setattr(lc, '_list_folder_entries', _counting)
+
+    found = list(lc.iter_song_folders(tmp_path))
+
+    assert [f.name for f in found] == ['Song']
+    assert len(calls) == len(set(calls))   # no directory listed more than once
+
+
 # --- find_song_ini -------------------------------------------------------
 
 def test_find_song_ini_prefers_literal_name(tmp_path):
@@ -73,6 +123,24 @@ def test_read_song_ini_fields_parses_requested_keys(tmp_path):
 
 def test_read_song_ini_fields_missing_file_returns_empty(tmp_path):
     assert lc.read_song_ini_fields(tmp_path / 'missing.ini', ('name',)) == {}
+
+
+def test_read_song_ini_fields_single_pass_matches_per_key_semantics(tmp_path):
+    """Regression for the single-pass rewrite (one regex pass over the file
+    instead of one search per key): still case-insensitive on both the
+    requested key and the file's own key casing, still skips keys that
+    aren't present, and a duplicate key's FIRST occurrence still wins --
+    matching what per-key re.search used to find."""
+    ini = tmp_path / 'song.ini'
+    ini.write_text(
+        '[song]\nName = My Song\nARTIST = My Artist\nyear=2020\n'
+        'diff_guitar = 3\ndiff_guitar = 5\n',
+        encoding='utf-8')
+
+    fields = lc.read_song_ini_fields(ini, ('name', 'Artist', 'year', 'diff_guitar', 'genre'))
+
+    assert fields == {'name': 'My Song', 'artist': 'My Artist', 'year': '2020',
+                       'diff_guitar': '3'}
 
 
 # --- read_chart_song_fields -------------------------------------------------

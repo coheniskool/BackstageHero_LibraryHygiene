@@ -310,20 +310,29 @@ def probe_static_video(video_path):
     Every error path returns 'unknown'. This function is the gate in front of an
     irreversible delete, so it must never guess in the acting direction.
     """
+    verdict, _duration = _probe_static_video_verdict(video_path)
+    return verdict
+
+
+def _probe_static_video_verdict(video_path):
+    """Same classification as probe_static_video(), but also returns the
+    duration ffprobe already measured along the way (or None), so a caller
+    about to extract a frame at the video's midpoint (convert_to_album_art)
+    can reuse it instead of spending a second ffprobe call on the same file."""
     video_path = Path(video_path)
     if not video_path.exists():
-        return 'unknown'
+        return 'unknown', None
     if Image is None:
         log.error('Pillow unavailable - cannot judge static video %s', video_path)
-        return 'unknown'
+        return 'unknown', None
 
     duration, bit_rate = _probe_duration_and_bitrate(video_path)
     if duration is None:
-        return 'unknown'
+        return 'unknown', None
     if duration < MIN_PROBE_SECONDS:
         log.info('static-art probe %s: unknown (%.1fs is below the %ds floor)',
                  video_path.name, duration, MIN_PROBE_SECONDS)
-        return 'unknown'
+        return 'unknown', duration
 
     # Cheap prefilter. This can only ever conclude 'video' -- bitrate alone
     # cannot tell a still from a dark, slow scene, so it is never allowed to
@@ -331,13 +340,13 @@ def probe_static_video(video_path):
     if bit_rate is not None and bit_rate > PREFILTER_BITRATE_CEILING:
         log.info('static-art probe %s: video (bitrate %d bps is above the still ceiling)',
                  video_path.name, bit_rate)
-        return 'video'
+        return 'video', duration
 
     frames = _sample_frames(video_path, duration)
     if len(frames) < MIN_SAMPLES_REQUIRED:
         log.error('static-art probe %s: unknown (only %d of %d frames were readable)',
                   video_path.name, len(frames), SAMPLE_FRAMES)
-        return 'unknown'
+        return 'unknown', duration
 
     pairs = list(itertools.combinations(frames, 2))
     distance = max(_hamming(a[0], b[0]) for a, b in pairs)
@@ -358,7 +367,7 @@ def probe_static_video(video_path):
 
     log.info('static-art probe %s: %s (hash distance %d, max cell delta %d, over %d frames)',
              video_path.name, verdict, distance, cell_delta, len(frames))
-    return verdict
+    return verdict, duration
 
 
 def _find_album_art(song_dir):
@@ -412,7 +421,7 @@ def convert_to_album_art(song_dir, dry_run=False):
     if video_path is None:
         return {'status': 'ok', 'detail': 'no video file'}
 
-    verdict = probe_static_video(video_path)
+    verdict, duration = _probe_static_video_verdict(video_path)
     if verdict == 'video':
         return {'status': 'ok', 'detail': ''}
     if verdict == 'unknown':
@@ -436,7 +445,9 @@ def convert_to_album_art(song_dir, dry_run=False):
     #    a frame grab is only ever a fallback.
     art_tmp = None
     if existing_art is None:
-        duration, _ = _probe_duration_and_bitrate(video_path)
+        # duration came from the verdict probe above -- a 'static' verdict
+        # always has one, but the check stays as a defensive fallback rather
+        # than assuming that invariant holds forever.
         if duration is None:
             return {'status': 'failed',
                     'detail': f'{video_path.name}: could not re-probe duration - video kept'}

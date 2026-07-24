@@ -9,6 +9,11 @@ import pytest
 
 import resolver_client as rc
 
+# Captured before the autouse _stub_client_id fixture below ever runs, so the
+# _client_id caching tests can restore the real implementation for
+# themselves instead of exercising the test-wide stub.
+_REAL_CLIENT_ID = rc._client_id
+
 
 class _FakeResponse:
     def __init__(self, payload=b'{"status": "none"}'):
@@ -138,3 +143,70 @@ def test_ping_sent_when_sharing_is_on(monkeypatch):
     assert len(calls) == 1
     assert calls[0]['url'] == rc.RESOLVER_BASE + '/ping'
     assert set(calls[0]['body'].keys()) == {'client_id', 'sharing', 'app_version'}
+
+
+# --- _client_id caching (perf-simplification) -------------------------------
+#
+# The autouse _stub_client_id fixture above replaces _client_id() entirely
+# for every other test in this file, so these exercise the REAL
+# implementation directly instead.
+
+def test_client_id_is_cached_after_first_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(rc, '_client_id', _REAL_CLIENT_ID)  # bypass the autouse stub
+    monkeypatch.setattr(rc, '_cached_client_id', None)  # isolate from other tests/order
+    monkeypatch.setattr(rc.updater, 'data_dir', lambda: str(tmp_path))
+
+    first = rc._client_id()
+    # the file changing must not affect a second call -- if the cache were
+    # not working, this would prove it by returning the new value instead
+    (tmp_path / 'client_id').write_text('a-different-value-entirely')
+    second = rc._client_id()
+
+    assert first == second
+    assert second != 'a-different-value-entirely'
+
+
+def test_client_id_reads_the_file_only_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(rc, '_client_id', _REAL_CLIENT_ID)
+    monkeypatch.setattr(rc, '_cached_client_id', None)
+    monkeypatch.setattr(rc.updater, 'data_dir', lambda: str(tmp_path))
+    (tmp_path / 'client_id').write_text('preexisting-id')
+
+    real_open = open
+    calls = []
+
+    def _counting_open(path, *a, **k):
+        if str(path) == str(tmp_path / 'client_id'):
+            calls.append(path)
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(rc, 'open', _counting_open, raising=False)
+
+    rc._client_id()
+    rc._client_id()
+    rc._client_id()
+
+    assert len(calls) == 1
+
+
+def test_client_id_failure_is_not_cached_and_retries(tmp_path, monkeypatch):
+    """A transient read failure must not permanently stick the process with
+    'anon' -- the next call should retry the real file, not stay poisoned."""
+    monkeypatch.setattr(rc, '_client_id', _REAL_CLIENT_ID)
+    monkeypatch.setattr(rc, '_cached_client_id', None)
+
+    calls = {'n': 0}
+
+    def _flaky_data_dir():
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise OSError('transient failure')
+        return str(tmp_path)
+
+    monkeypatch.setattr(rc.updater, 'data_dir', _flaky_data_dir)
+
+    first = rc._client_id()
+    assert first == 'anon'
+
+    second = rc._client_id()
+    assert second != 'anon'   # retried, and this time it succeeded

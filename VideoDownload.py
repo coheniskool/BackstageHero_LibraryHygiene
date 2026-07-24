@@ -763,11 +763,17 @@ def process_download(folder, song_name, quality, sync_ready, replace):
             # offset - the video is trustworthy, the timing is still a guess
             how = SYNC_COMMUNITY if offset is not None else SYNC_GUESS
             offset = DEFAULT_START_TIME if offset is None else offset
-            if not set_ini_values(folder, {'video_start_time': str(offset),
-                                            'backstagehero_sync': how,
-                                            'backstagehero_source': hit['video_id']}):
+            values = {'video_start_time': str(offset),
+                      'backstagehero_sync': how,
+                      'backstagehero_source': hit['video_id']}
+            # video.mp4 is already on disk (download_video just finished), so
+            # fold the resolution into this same write instead of a second
+            # read-modify-write of song.ini right after it.
+            res = _probe_resolution_value(folder)
+            if res and res != '?':
+                values['backstagehero_res'] = res
+            if not set_ini_values(folder, values):
                 raise Exception('song.ini missing [song] section')
-            _probe_and_store_resolution(folder)
             print('  Song ready (community offset). Next song...')
             return
         except BotDetected:
@@ -835,9 +841,13 @@ def process_download(folder, song_name, quality, sync_ready, replace):
               'backstagehero_sync': SYNC_MEASURED if matched else SYNC_GUESS,
               'backstagehero_source': vid,
               'backstagehero_video_title': used_title or ''}
+    # video.mp4 is already on disk at this point, so fold the resolution
+    # into this same write instead of a second one right after it.
+    res = _probe_resolution_value(folder)
+    if res and res != '?':
+        values['backstagehero_res'] = res
     if set_ini_values(folder, values):
         note = 'auto-synced' if matched else 'default offset'
-        _probe_and_store_resolution(folder)
         print('  Song ready (' + note + '). Next song...')
     else:
         print('  Could not update song.ini (no [song] section?). Video kept.')
@@ -920,11 +930,17 @@ def process_resync(folder, song_name, sync_ready):
                            if audio else (None, 'no audio', 0.0))
         finally:
             cleanup_temp_files(folder)
-        if ms is not None and set_ini_values(folder, {'video_start_time': str(ms),
-                                                      'backstagehero_sync': SYNC_MEASURED}):
-            _probe_and_store_resolution(folder)
-            print('  Re-synced: ' + info)
-            return
+        if ms is not None:
+            values = {'video_start_time': str(ms), 'backstagehero_sync': SYNC_MEASURED}
+            # fold the resolution into this same write instead of a second
+            # one right after it; _probe_resolution_value() is a safe no-op
+            # if video.mp4 isn't actually present.
+            res = _probe_resolution_value(folder)
+            if res and res != '?':
+                values['backstagehero_res'] = res
+            if set_ini_values(folder, values):
+                print('  Re-synced: ' + info)
+                return
         print('  Known source no longer matches - falling back to search')
 
     # Last resort: search for a candidate that matches the chart. Note what this
@@ -948,8 +964,12 @@ def process_resync(folder, song_name, sync_ready):
         print('  No confident match - timing left unchanged')
 
 
-def _read_ini_value(folder, key):
-    """Return a single [song] value from song.ini (stripped), or None."""
+def _read_ini_section(folder):
+    """Parse song.ini's [song] section once. Returns a dict of key->value
+    (lowercased keys, stripped values), or None if the file/section is
+    missing. The shared parse-once primitive behind _read_ini_value and
+    every multi-key reader, so a caller needing several fields opens and
+    parses the file once instead of once per key."""
     path = os.path.join(folder, 'song.ini')
     if not os.path.exists(path):
         return None
@@ -960,8 +980,16 @@ def _read_ini_value(folder, key):
         return None
     for sec in cp.sections():
         if sec.lower() == 'song':
-            return cp.get(sec, key, fallback='').strip() or None
+            return {k: (v or '').strip() for k, v in cp.items(sec)}
     return None
+
+
+def _read_ini_value(folder, key):
+    """Return a single [song] value from song.ini (stripped), or None."""
+    section = _read_ini_section(folder)
+    if section is None:
+        return None
+    return section.get(key.lower()) or None
 
 
 def _has_audio_stream(path):
@@ -983,9 +1011,13 @@ def _has_audio_stream(path):
         return False
 
 
-def get_stored_source(folder):
-    """The backstagehero_source video ID stored in song.ini, or None."""
-    return _read_ini_value(folder, 'backstagehero_source')
+def get_stored_source(folder, section=None):
+    """The backstagehero_source video ID stored in song.ini, or None.
+    Pass `section` (from _read_ini_section) to reuse an already-parsed
+    file instead of re-reading it."""
+    if section is None:
+        return _read_ini_value(folder, 'backstagehero_source')
+    return section.get('backstagehero_source') or None
 
 
 # Uploads the user has thrown away for this song, comma-separated in song.ini.
@@ -997,9 +1029,12 @@ def get_stored_source(folder):
 REJECTED_KEY = 'backstagehero_rejected'
 
 
-def get_rejected_sources(folder):
+def get_rejected_sources(folder, section=None):
     """Video IDs the user has dumped for this song, as a set."""
-    raw = _read_ini_value(folder, REJECTED_KEY) or ''
+    if section is None:
+        raw = _read_ini_value(folder, REJECTED_KEY) or ''
+    else:
+        raw = section.get(REJECTED_KEY.lower()) or ''
     return {part.strip() for part in raw.split(',') if part.strip()}
 
 
@@ -1016,15 +1051,16 @@ def dump_video(folder):
     """
     folder = str(folder)
     video_path = os.path.join(folder, 'video.mp4')
-    marker = _read_ini_value(folder, static_art.VIDEO_MARKER_KEY)
+    section = _read_ini_section(folder) or {}
+    marker = section.get(static_art.VIDEO_MARKER_KEY.lower()) or None
     was_converted = marker == static_art.VIDEO_MARKER_STATIC_ART
     if not os.path.exists(video_path) and not was_converted:
         return {'status': 'nothing_to_dump', 'detail': 'this song has no video'}
 
-    vid = get_stored_source(folder)
+    vid = get_stored_source(folder, section)
     values = {'backstagehero_source': ''}
     if vid:
-        rejected = get_rejected_sources(folder)
+        rejected = get_rejected_sources(folder, section)
         rejected.add(vid)
         values[REJECTED_KEY] = ','.join(sorted(rejected))
     if was_converted:
@@ -1067,15 +1103,20 @@ def dump_video(folder):
     return {'status': 'dumped', 'detail': detail}
 
 
-def get_stored_resolution(folder):
+def get_stored_resolution(folder, section=None):
     """The stored backstagehero_res value (e.g. '720p'), or None."""
-    return _read_ini_value(folder, 'backstagehero_res')
+    if section is None:
+        return _read_ini_value(folder, 'backstagehero_res')
+    return section.get('backstagehero_res') or None
 
 
-def probe_resolution(folder):
-    """Read video.mp4's height via ffmpeg, cache it in song.ini, and return it
-    (e.g. '720p'), '?' if it couldn't be read, or None if there's nothing to
-    probe. Shared by the download flow and the GUI's library scan."""
+def _probe_resolution_value(folder):
+    """Read video.mp4's height via ffmpeg without writing it anywhere.
+    Returns 'NNNp' on success, '?' if it couldn't be read, or None if
+    there's nothing to probe (no ffmpeg, no video.mp4 yet). The pure-compute
+    half of probe_resolution() - lets a caller that's about to write several
+    song.ini fields at once fold the resolution into that single write
+    instead of triggering probe_resolution()'s own separate one."""
     if not ffmpegAvailable:
         return None
     video = os.path.join(folder, 'video.mp4')
@@ -1091,16 +1132,20 @@ def probe_resolution(folder):
         video_line = next((l for l in r.stderr.splitlines() if 'Video:' in l), '')
         m = re.search(r'(\d{3,4})x(\d{3,4})', video_line or r.stderr)
         if m:
-            res = f'{int(m.group(2))}p'
-            set_ini_values(folder, {'backstagehero_res': res})
-            return res
+            return f'{int(m.group(2))}p'
     except Exception:
         log.debug('Resolution probe failed for %s', folder, exc_info=True)
     return '?'
 
 
-# Back-compat name used by the download flow (return value ignored there).
-_probe_and_store_resolution = probe_resolution
+def probe_resolution(folder):
+    """Read video.mp4's height via ffmpeg, cache it in song.ini, and return it
+    (e.g. '720p'), '?' if it couldn't be read, or None if there's nothing to
+    probe. Shared by the download flow and the GUI's library scan."""
+    res = _probe_resolution_value(folder)
+    if res and res != '?':
+        set_ini_values(folder, {'backstagehero_res': res})
+    return res
 
 
 def parse_selection(sel, maxn):

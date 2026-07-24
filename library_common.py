@@ -218,7 +218,30 @@ TEXT_UTF8 = {'text': True, 'encoding': 'utf-8', 'errors': 'replace'}
 SONG_FOLDER_MARKER_EXTENSIONS = ('.ini', '.chart', '.mid', '.midi', '.sng')
 
 
-def looks_like_song_folder(folder):
+def _list_folder_entries(folder):
+    """One directory listing of `folder`'s direct children (files and
+    subdirectories alike), or [] if it can't be read. The single-scan
+    primitive behind list_song_folder_files() and iter_song_folders()'s
+    walk, so a directory is listed once instead of once per caller."""
+    try:
+        return list(Path(folder).iterdir())
+    except OSError:
+        return []
+
+
+def list_song_folder_files(song_dir, entries=None):
+    """The files (not subdirectories) directly inside song_dir, from one
+    directory listing. Pass `entries` (from _list_folder_entries) to reuse a
+    listing the caller already has instead of scanning again. Shared by
+    looks_like_song_folder/find_song_audio/find_video_file, which used to
+    each do their own independent glob()/exists() calls over the same
+    folder."""
+    if entries is None:
+        entries = _list_folder_entries(song_dir)
+    return [p for p in entries if p.is_file()]
+
+
+def looks_like_song_folder(folder, files=None):
     """True if this directory holds song content itself, rather than holding
     other song folders. Deliberately generous: an ID-suffixed song_2400.ini
     or a bare notes.chart counts, since those broken states are exactly what
@@ -228,17 +251,17 @@ def looks_like_song_folder(folder):
     one from inside a song folder, so its presence identifies one just as well
     as a chart does -- and video_repair's whole job is folders that have a
     video, including any whose chart files are missing or misnamed.
+
+    Pass `files` (from list_song_folder_files) to reuse a listing the caller
+    already has.
     """
-    try:
-        for path in Path(folder).iterdir():
-            if not path.is_file():
-                continue
-            if path.suffix.lower() in SONG_FOLDER_MARKER_EXTENSIONS:
-                return True
-            if path.name.lower() in VIDEO_NAMES:
-                return True
-    except OSError:
-        pass
+    if files is None:
+        files = list_song_folder_files(folder)
+    for path in files:
+        if path.suffix.lower() in SONG_FOLDER_MARKER_EXTENSIONS:
+            return True
+        if path.name.lower() in VIDEO_NAMES:
+            return True
     return False
 
 
@@ -278,35 +301,55 @@ def iter_song_folders(home_folder, skip_names=None):
     exists for callers that know exactly what they want excluded.
     """
     extra = {n.lower() for n in skip_names} if skip_names is not None else None
-    try:
-        entries = sorted(p for p in Path(home_folder).iterdir() if p.is_dir())
-    except OSError:
-        return
-    for folder in entries:
-        skip = (folder.name.lower() in extra if extra is not None
-                else is_review_folder_name(folder.name))
-        if skip or folder.is_symlink():
+    yield from _iter_song_folders(Path(home_folder), extra, skip_names, entries=None)
+
+
+def _iter_song_folders(folder, extra, skip_names, entries):
+    """Recursive worker for iter_song_folders(). `entries` is this folder's
+    own listing if the caller already has one (from the parent's walk),
+    avoiding a second iterdir() of the same directory that the old
+    single-function version incurred on every container folder: one via
+    looks_like_song_folder(), one via the recursive call re-listing it."""
+    if entries is None:
+        entries = _list_folder_entries(folder)
+    dirs = sorted(p for p in entries if p.is_dir())
+    for child in dirs:
+        skip = (child.name.lower() in extra if extra is not None
+                else is_review_folder_name(child.name))
+        if skip or child.is_symlink():
             continue
-        if looks_like_song_folder(folder):
-            yield folder
+        child_entries = _list_folder_entries(child)
+        files = list_song_folder_files(child, entries=child_entries)
+        if looks_like_song_folder(child, files=files):
+            yield child
         else:
-            yield from iter_song_folders(folder, skip_names)
+            yield from _iter_song_folders(child, extra, skip_names, entries=child_entries)
 
 
-def find_song_audio(song_dir):
+_AUDIO_EXTS = ('.ogg', '.opus', '.mp3', '.wav')
+
+
+def find_song_audio(song_dir, files=None):
     """The song folder's full backing-mix audio file, or None.
 
     Filename is always "song*" regardless of numeric suffix -- some
     libraries use "song.ogg", others "song_1877.ogg" from a different chart
     source. Falls back to a lone audio file only when there's exactly one
     candidate in the folder (never guesses between multiple stems).
+
+    Pass `files` (from list_song_folder_files) to reuse a listing the caller
+    already has instead of re-scanning the folder up to 5 times (once per
+    extension, plus the fallback pass).
     """
     song_dir = Path(song_dir)
-    for ext in ('.ogg', '.opus', '.mp3', '.wav'):
-        matches = sorted(song_dir.glob('song*' + ext))
+    if files is None:
+        files = list_song_folder_files(song_dir)
+    for ext in _AUDIO_EXTS:
+        matches = sorted(f for f in files
+                          if f.suffix.lower() == ext and f.name.lower().startswith('song'))
         if matches:
             return matches[0]
-    audio_files = [f for f in song_dir.glob('*') if f.suffix.lower() in {'.ogg', '.mp3', '.wav', '.opus'}]
+    audio_files = [f for f in files if f.suffix.lower() in _AUDIO_EXTS]
     return audio_files[0] if len(audio_files) == 1 else None
 
 
@@ -325,14 +368,35 @@ def find_song_ini(song_dir):
     return next((p for p in ini_files if p.name.lower() == 'song.ini'), ini_files[0])
 
 
-def find_video_file(song_dir):
-    """The song folder's background video file (any recognized name), or None."""
+def find_video_file(song_dir, files=None):
+    """The song folder's background video file (any recognized name), or None.
+
+    Pass `files` (from list_song_folder_files) to reuse a listing the caller
+    already has instead of a separate .exists() stat call per candidate name.
+    """
     song_dir = Path(song_dir)
+    if files is None:
+        files = list_song_folder_files(song_dir)
+    lookup = {f.name.lower(): f for f in files}
     for name in VIDEO_NAMES:
-        candidate = song_dir / name
-        if candidate.exists():
+        candidate = lookup.get(name)
+        if candidate is not None:
             return candidate
     return None
+
+
+_INI_LINE_RE = re.compile(r'(?im)^[ \t]*([^=\r\n]+?)[ \t]*=[ \t]*(.*?)[ \t]*$')
+
+
+def _parse_ini_lines(text):
+    """Every top-level key=value line in an .ini-shaped text, as a dict with
+    lowercased keys. One regex pass over the whole text rather than one
+    search per key. A key's FIRST occurrence wins on a duplicate, matching
+    what a per-key re.search would have found."""
+    fields = {}
+    for match in _INI_LINE_RE.finditer(text):
+        fields.setdefault(match.group(1).lower(), match.group(2))
+    return fields
 
 
 def read_song_ini_fields(ini_path, keys):
@@ -341,18 +405,16 @@ def read_song_ini_fields(ini_path, keys):
     Regex-based (not configparser) so this stays consistent with the
     byte-preserving-regex philosophy the writer side of this project uses --
     but this is read-only, so no formatting-preservation concerns apply.
+    One parse of the file regardless of how many keys are requested.
     """
     ini_path = Path(ini_path)
     try:
         text = ini_path.read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return {}
-    fields = {}
-    for key in keys:
-        match = re.search(rf'(?im)^[ \t]*{re.escape(key)}[ \t]*=[ \t]*(.*?)[ \t]*$', text)
-        if match:
-            fields[key.lower()] = match.group(1)
-    return fields
+    parsed = _parse_ini_lines(text)
+    wanted = {key.lower() for key in keys}
+    return {k: v for k, v in parsed.items() if k in wanted}
 
 
 _CHART_NAME_RE = re.compile(r'(?im)^\s*name\s*=\s*"([^"]*)"')

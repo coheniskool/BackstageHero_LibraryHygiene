@@ -6,8 +6,10 @@
 
 import hmac
 import json
+import logging
 import os
 import re
+import threading
 import time
 import urllib.request
 import urllib.parse
@@ -18,6 +20,8 @@ from pydantic import BaseModel, Field
 
 import db
 import suggest as suggest_mod
+
+log = logging.getLogger(__name__)
 
 # video_id has to be a real YouTube id, hash is our chart-hash format. check them
 # here so junk/markup never reaches the DB or the dashboard.
@@ -52,9 +56,26 @@ PUBLIC_URL = os.environ.get('BACKSTAGEHERO_PUBLIC_URL', '').rstrip('/')
 
 
 def _purge_resolve(chart_hash):
-    """Purge one /resolve URL from Cloudflare's edge cache. Skipped if env vars aren't set."""
+    """Purge one /resolve URL from Cloudflare's edge cache. Skipped if env vars
+    aren't set.
+
+    Fire-and-forget: runs on a background thread so a curator action
+    (admin_set/admin_offset) doesn't wait out a slow or failing Cloudflare API
+    round-trip (up to the 5s timeout below) before its HTTP response returns.
+    The change still appears once the edge TTL expires either way -- this
+    purge is a latency optimisation, not a correctness requirement -- so it's
+    safe for the caller to move on before it completes. A failure is logged
+    rather than silently discarded, since fire-and-forget means the caller
+    has no other way to notice one.
+    """
     if not (CF_API_TOKEN and CF_ZONE_ID and PUBLIC_URL):
         return
+    threading.Thread(target=_purge_resolve_now, args=(chart_hash,), daemon=True).start()
+
+
+def _purge_resolve_now(chart_hash):
+    """The actual Cloudflare purge call. Only ever run on the background
+    thread _purge_resolve() spawns -- see its docstring."""
     try:
         target = PUBLIC_URL + '/resolve?hash=' + urllib.parse.quote(chart_hash)
         body = json.dumps({'files': [target]}).encode('utf-8')
@@ -64,8 +85,8 @@ def _purge_resolve(chart_hash):
             headers={'Authorization': f'Bearer {CF_API_TOKEN}',
                      'Content-Type': 'application/json'})
         urllib.request.urlopen(req, timeout=5).close()
-    except Exception:
-        pass
+    except Exception as e:
+        log.error('Cloudflare cache purge failed for hash=%s: %s', chart_hash, e)
 
 DB_PATH = os.environ.get('BACKSTAGEHERO_DB', os.path.join('data', 'resolver.sqlite3'))
 ADMIN_TOKEN = os.environ.get('BACKSTAGEHERO_ADMIN_TOKEN', '')

@@ -61,20 +61,28 @@ def scan_song_folder_chart_names(song_dir):
 
     chart_candidates = _notes_candidates(song_dir)
     if len(chart_candidates) > 1:
-        return {'status': 'ambiguous', 'detail': ', '.join(p.name for p in chart_candidates)}
+        return {'status': 'ambiguous',
+                'detail': ', '.join(p.name for p in chart_candidates),
+                'ini_file': ini_file}
     chart_file = chart_candidates[0] if chart_candidates else None
 
     if chart_file is None:
-        return {'status': 'no_chart_file', 'detail': ini_file.name}
+        return {'status': 'no_chart_file', 'detail': ini_file.name, 'ini_file': ini_file}
 
+    # Resolved Paths threaded to callers (process_chart_folder_names) so the
+    # verify/rename step reuses the exact ini/notes file detection already
+    # selected here -- never a second *.ini glob or _notes_candidates() pass,
+    # which is what lets a stray non-notes .chart get verified in its place.
     id_suffixed = [
         p.name for p in (ini_file, chart_file)
         if p.name.lower() not in CANONICAL_CHART_NAMES
     ]
     if id_suffixed:
-        return {'status': 'id_suffixed', 'detail': ', '.join(id_suffixed)}
+        return {'status': 'id_suffixed', 'detail': ', '.join(id_suffixed),
+                'ini_file': ini_file, 'chart_file': chart_file}
 
-    return {'status': 'ok', 'detail': f'{ini_file.name}, {chart_file.name}'}
+    return {'status': 'ok', 'detail': f'{ini_file.name}, {chart_file.name}',
+            'ini_file': ini_file, 'chart_file': chart_file}
 
 
 # Both Name AND Artist must independently clear this -- set higher than a
@@ -185,6 +193,27 @@ def _match_stem_role(file_stem):
     return None, None
 
 
+def _stems_by_role(song_dir):
+    """Group a folder's recognized audio-stem files by role, from one listing.
+
+    Returns {role: [(path, is_id_suffixed), ...]}. The single source of truth
+    for the per-folder stem scan: scan_song_folder_audio_stems() (detection)
+    and apply_stem_renames() (action) both call this instead of each doing
+    their own iterdir()/_match_stem_role() pass over the same folder. Reuses
+    library_common.list_song_folder_files()'s one-directory-listing primitive,
+    which filters to files exactly as the inlined `path.is_file()` guard did.
+    """
+    by_role = {}
+    for path in library_common.list_song_folder_files(song_dir):
+        if path.suffix.lower() not in AUDIO_STEM_EXTENSIONS:
+            continue
+        role, is_id_suffixed = _match_stem_role(path.stem)
+        if role is None:
+            continue
+        by_role.setdefault(role, []).append((path, is_id_suffixed))
+    return by_role
+
+
 def scan_song_folder_audio_stems(song_dir):
     """Classify each recognized audio-stem role's naming state in a folder.
 
@@ -198,14 +227,7 @@ def scan_song_folder_audio_stems(song_dir):
     ambiguity -- never auto-picked).
     """
     song_dir = Path(song_dir)
-    by_role = {}
-    for path in song_dir.iterdir():
-        if not path.is_file() or path.suffix.lower() not in AUDIO_STEM_EXTENSIONS:
-            continue
-        role, is_id_suffixed = _match_stem_role(path.stem)
-        if role is None:
-            continue
-        by_role.setdefault(role, []).append((path, is_id_suffixed))
+    by_role = _stems_by_role(song_dir)
 
     ambiguous_roles = {role: files for role, files in by_role.items() if len(files) > 1}
     if ambiguous_roles:
@@ -293,14 +315,7 @@ def apply_stem_renames(song_dir, ini_fields, dry_run=False):
     dry_run=True reports what WOULD be renamed without touching any file.
     """
     song_dir = Path(song_dir)
-    by_role = {}
-    for path in song_dir.iterdir():
-        if not path.is_file() or path.suffix.lower() not in AUDIO_STEM_EXTENSIONS:
-            continue
-        role, is_id_suffixed = _match_stem_role(path.stem)
-        if role is None:
-            continue
-        by_role.setdefault(role, []).append((path, is_id_suffixed))
+    by_role = _stems_by_role(song_dir)
 
     plan = []
     blocked = []
@@ -471,7 +486,7 @@ def is_sng_packaged(song_dir):
     return any(Path(song_dir).glob('*.sng'))
 
 
-def process_chart_folder_names(song_dir, dry_run=False):
+def process_chart_folder_names(song_dir, dry_run=False, skip_sng_check=False):
     """Verify and rename ID-suffixed song.ini/notes.chart/notes.mid, with a collision guard.
 
     Returns {'status': ..., 'detail': ...}. Statuses: 'confirmed_ok'
@@ -480,36 +495,41 @@ def process_chart_folder_names(song_dir, dry_run=False):
     target already exists, or there's nothing to verify against),
     'skipped_sng' (is_sng_packaged() -- left completely untouched).
 
+    The returned dict also carries 'ini_file' (the single resolved song.ini
+    Path, or None) so a caller that has already driven this scan doesn't glob
+    *.ini a third time to read the same file.
+
+    skip_sng_check=True lets a caller that already ran is_sng_packaged()
+    itself (process_song_folder_for_chart_rename does, and returns early on a
+    hit) avoid a redundant second *.sng glob of the same folder.
+
     dry_run=True computes and returns the same status/detail without
     renaming anything -- the reported outcome describes what WOULD happen.
     """
     song_dir = Path(song_dir)
-    if is_sng_packaged(song_dir):
-        return {'status': 'skipped_sng', 'detail': ''}
+    if not skip_sng_check and is_sng_packaged(song_dir):
+        return {'status': 'skipped_sng', 'detail': '', 'ini_file': None}
 
     detection = scan_song_folder_chart_names(song_dir)
+    ini_file = detection.get('ini_file')
     if detection['status'] == 'ok':
-        return {'status': 'confirmed_ok', 'detail': detection['detail']}
+        return {'status': 'confirmed_ok', 'detail': detection['detail'], 'ini_file': ini_file}
     if detection['status'] in ('no_ini', 'no_chart_file', 'ambiguous'):
-        return {'status': 'needs_review', 'detail': f"{detection['status']}: {detection['detail']}"}
+        return {'status': 'needs_review',
+                'detail': f"{detection['status']}: {detection['detail']}",
+                'ini_file': ini_file}
 
-    # detection['status'] == 'id_suffixed' -- verify content before touching anything
-    ini_files = sorted(song_dir.glob('*.ini'))
-    ini_file = next((p for p in ini_files if p.name.lower() == 'song.ini'), ini_files[0])
+    # detection['status'] == 'id_suffixed' -- verify content before touching
+    # anything, reusing the exact ini/notes Paths detection already resolved
+    # (never a second *.ini glob or _notes_candidates() pass: a stray
+    # non-notes .chart file could sort first and get verified/renamed in its
+    # place, and re-deriving here is the redundant I/O this consolidates away)
+    chart_file = detection['chart_file']
     ini_fields = library_common.read_song_ini_fields(ini_file, ('name', 'artist', 'song_length'))
-
-    # the SAME candidate detection selected -- detection guaranteed exactly
-    # one notes-pattern file exists, and verifying/renaming must target that
-    # file, never a broad *.chart re-glob (a stray non-notes .chart file
-    # could sort first and get verified/renamed in its place)
-    chart_candidates = _notes_candidates(song_dir)
-    if not chart_candidates:
-        return {'status': 'needs_review', 'detail': 'no .chart or .mid file found to rename'}
-    chart_file = chart_candidates[0]
 
     matched, reason = verify_chart_content_match(song_dir, ini_fields, chart_file=chart_file)
     if not matched:
-        return {'status': 'needs_review', 'detail': reason}
+        return {'status': 'needs_review', 'detail': reason, 'ini_file': ini_file}
     target_chart_name = 'notes.chart' if chart_file.suffix.lower() == '.chart' else 'notes.mid'
     target_chart = song_dir / target_chart_name
 
@@ -517,9 +537,12 @@ def process_chart_folder_names(song_dir, dry_run=False):
     # name -- can happen if a prior partial run or manual edit left both present
     target_ini = song_dir / 'song.ini'
     if ini_file.name.lower() != 'song.ini' and target_ini.exists():
-        return {'status': 'needs_review', 'detail': f'{ini_file.name}: song.ini already exists'}
+        return {'status': 'needs_review',
+                'detail': f'{ini_file.name}: song.ini already exists', 'ini_file': ini_file}
     if chart_file.name.lower() != target_chart_name and target_chart.exists():
-        return {'status': 'needs_review', 'detail': f'{chart_file.name}: {target_chart_name} already exists'}
+        return {'status': 'needs_review',
+                'detail': f'{chart_file.name}: {target_chart_name} already exists',
+                'ini_file': ini_file}
 
     renamed = []
     if ini_file.name.lower() != 'song.ini':
@@ -534,7 +557,7 @@ def process_chart_folder_names(song_dir, dry_run=False):
     detail = '; '.join(renamed) if renamed else 'already correct'
     if dry_run and renamed:
         detail += ' (dry-run, not applied)'
-    return {'status': 'confirmed_ok', 'detail': detail}
+    return {'status': 'confirmed_ok', 'detail': detail, 'ini_file': ini_file}
 
 
 # Same file dedupe_report.py's keeper-scoring points at for its
@@ -603,9 +626,18 @@ def process_song_folder_for_chart_rename(song_dir, home_folder, dry_run=False):
     if load_chart_rename_status(song_dir) == 'confirmed_ok':
         return {'status': 'skipped_settled', 'detail': 'already confirmed_ok'}
 
-    names_result = process_chart_folder_names(song_dir, dry_run=dry_run)
+    # is_sng_packaged() was already checked above and returned early on a hit,
+    # so skip_sng_check spares a redundant second *.sng glob of this folder.
+    names_result = process_chart_folder_names(song_dir, dry_run=dry_run, skip_sng_check=True)
 
-    ini_path = library_common.find_song_ini(song_dir)
+    # Reuse the single song.ini Path the scan inside process_chart_folder_names
+    # already resolved, instead of a third independent *.ini glob via
+    # find_song_ini(). Only the rare multi-.ini 'ambiguous' case leaves ini_file
+    # unresolved (scan won't pick between them) -- fall back to find_song_ini
+    # there to preserve its exact song.ini-preferred choice.
+    ini_path = names_result.get('ini_file')
+    if ini_path is None:
+        ini_path = library_common.find_song_ini(song_dir)
     ini_fields = library_common.read_song_ini_fields(ini_path, ('song_length',)) if ini_path else {}
 
     audio_result = apply_stem_renames(song_dir, ini_fields, dry_run=dry_run)

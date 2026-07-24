@@ -1,3 +1,4 @@
+import library_common
 import metadata_enrichment as me
 
 SONG_INI = (
@@ -199,3 +200,57 @@ def test_enrich_song_ini_metadata_library_processes_all_folders(tmp_path, monkey
     text = (song / 'song.ini').read_text(encoding='utf-8')
     assert 'genre = Rock' in text
     assert counts == {'filled': 1}
+
+
+def test_enrich_library_runs_concurrently_and_survives_one_failure(tmp_path, monkeypatch):
+    """Perf-simplification: per-song Chorus lookups now run on a thread pool
+    instead of serially. A single song's lookup raising must not lose the
+    rest of the batch, and every folder must still be accounted for in the
+    final counts regardless of which order the threads finish in."""
+    home = tmp_path
+    for name in ('Good1', 'Good2', 'Good3'):
+        folder = home / name
+        folder.mkdir()
+        _write_song_ini(folder)
+    bad = home / 'Bad'
+    bad.mkdir()
+    _write_song_ini(bad, SONG_INI.replace('artist = 3 Doors Down', 'artist = RAISE'))
+
+    def _stub(artist, title):
+        if artist == 'RAISE':
+            raise RuntimeError('simulated Chorus failure')
+        return {'name': 'Kryptonite', 'artist': '3 Doors Down', 'genre': 'Rock', 'year': '2000'}
+
+    monkeypatch.setattr(me.chorus_client, 'search_by_artist_title', _stub)
+
+    counts = me.enrich_song_ini_metadata_library(home)
+
+    assert counts.get('filled', 0) == 3
+    assert counts.get('error', 0) == 1
+    assert sum(counts.values()) == 4   # every folder accounted for, none lost
+
+
+def test_enrich_library_thread_pool_matches_a_serial_run(tmp_path, monkeypatch):
+    """The concurrent version's aggregate result must match what a fully
+    serial pass over the same input would have produced -- concurrency
+    changes ordering, never correctness."""
+    home = tmp_path
+    for i in range(6):
+        folder = home / f'Song{i}'
+        folder.mkdir()
+        _write_song_ini(folder, SONG_INI if i % 2 == 0 else
+                        SONG_INI.replace('genre = \n', 'genre = Already Set\n'))
+    _stub_chorus(monkeypatch, {'name': 'Kryptonite', 'artist': '3 Doors Down',
+                              'genre': 'Rock', 'year': '2000'})
+
+    concurrent_counts = me.enrich_song_ini_metadata_library(home)
+
+    for i in range(6):
+        _write_song_ini(home / f'Song{i}', SONG_INI if i % 2 == 0 else
+                        SONG_INI.replace('genre = \n', 'genre = Already Set\n'))
+    serial_counts = {}
+    for folder in library_common.iter_song_folders(home):
+        result = me.fill_song_ini_metadata(str(folder))
+        serial_counts[result['status']] = serial_counts.get(result['status'], 0) + 1
+
+    assert concurrent_counts == serial_counts

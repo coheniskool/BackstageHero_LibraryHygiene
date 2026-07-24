@@ -58,6 +58,40 @@ def test_group_candidates_no_group_for_unrelated_songs(tmp_path):
     assert dr.group_candidates([a, b]) == []
 
 
+def test_group_candidates_matches_across_adjacent_length_buckets(tmp_path):
+    """Boundary test for the blocking-key optimization (SPEC finding C16).
+
+    A real near-duplicate pair whose normalized-title lengths straddle a
+    length-bucket boundary must still be grouped. Here a dropped leading
+    character turns 'my name is jonas' (len 16, bucket 16//4 = 4) into
+    'y name is jonas' (len 15, bucket 15//4 = 3): the two titles are ~97%
+    similar (SequenceMatcher) with an identical artist, yet a NAIVE blocking
+    scheme would silently drop them --
+
+      * disjoint length buckets: 4 != 3, so they never get compared;
+      * a first-1-2-char prefix key: 'my' != 'y ', likewise dropped.
+
+    The chosen strategy (compare EQUAL-OR-ADJACENT buckets) keeps them
+    together because |4 - 3| == 1. This proves the bucketing does not lose a
+    genuine boundary-straddling duplicate. If LENGTH_BUCKET_WIDTH or the
+    adjacency tolerance were ever tightened past this pair, this test fails.
+    """
+    keeper = _make_song(tmp_path, 'Weezer - My Name Is Jonas')
+    typo = _make_song(tmp_path, 'Weezer - y Name Is Jonas')  # dropped leading 'M'
+
+    # Guard: confirm the pair really does land in two DIFFERENT disjoint
+    # buckets, so the test exercises the adjacency path rather than passing
+    # trivially because both titles share a bucket.
+    import library_common as lc
+    len_keeper = len(lc.normalize_lookup_value('My Name Is Jonas'))
+    len_typo = len(lc.normalize_lookup_value('y Name Is Jonas'))
+    assert (len_keeper // dr.LENGTH_BUCKET_WIDTH) != (len_typo // dr.LENGTH_BUCKET_WIDTH)
+
+    groups = dr.group_candidates([keeper, typo])
+    assert len(groups) == 1
+    assert set(groups[0]) == {keeper, typo}
+
+
 # --- confirm_group --------------------------------------------------
 
 def test_confirm_group_returns_empty_when_acoustid_unavailable(tmp_path, monkeypatch):

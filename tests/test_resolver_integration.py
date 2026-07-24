@@ -18,7 +18,7 @@ def test_resolver_hit_skips_youtube_search(tmp_path, monkeypatch):
                          lambda ch: {'video_id': 'dQw4w9WgXcQ', 'start_ms': -1500})
     monkeypatch.setattr(vd, 'download_video', lambda *a, **k: None)
     monkeypatch.setattr(vd, 'set_ini_values', lambda *a, **k: True)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda *a, **k: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda *a, **k: None)
     monkeypatch.setattr(vd, 'search_candidates', _unexpected_search)
 
     vd.process_download(str(folder), 'Test Song', vd.quality_format(720),

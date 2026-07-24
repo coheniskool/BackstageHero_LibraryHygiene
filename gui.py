@@ -216,7 +216,7 @@ def _video_status(song):
     return 'no'
 
 
-def _video_kind(folder):
+def _video_kind(folder, title=None):
     """'lyric', 'gameplay', 'official'... for the attached video, or ''.
 
     Derived from the stored title rather than stored separately, so there is
@@ -224,21 +224,29 @@ def _video_kind(folder):
     downloaded before titles were recorded -- those can only be identified by
     re-querying YouTube, which is a deliberate opt-in, not something a library
     scan should do 376 times unprompted.
+
+    Pass `title` if the caller already read it, to avoid a second parse of
+    the same song.ini for the same key.
     """
-    title = _read_song_value(folder, 'backstagehero_video_title')
+    if title is None:
+        title = _read_song_value(folder, 'backstagehero_video_title')
     if not title:
         return ''
     kind = classify_candidate_title(title)
     return '' if kind == 'unknown' else kind
 
 
-def _read_song_value(folder, key):
+def _read_song_value(folder, key, section=None):
     """One [song] value from a song.ini, or '' -- for building the CSV.
 
     Thin wrapper over VideoDownload's reader rather than a second parser, so
-    the export can never disagree with what the app itself reads.
+    the export can never disagree with what the app itself reads. Pass
+    `section` (from VideoDownload._read_ini_section) to reuse an
+    already-parsed file instead of re-reading it.
     """
     try:
+        if section is not None:
+            return section.get(key.lower()) or ''
         from VideoDownload import _read_ini_value
         return _read_ini_value(folder, key) or ''
     except Exception:
@@ -496,18 +504,12 @@ class SyncEditor(ctk.CTkToplevel):
                       command=self._save).pack(side='right')
 
     def _read_offset(self):
-        path = os.path.join(self._song.folder, 'song.ini')
-        try:
-            with open(path, encoding='utf-8-sig', errors='replace') as f:
-                for line in f:
-                    if '=' in line:
-                        k, _, v = line.partition('=')
-                        if k.strip().lower() == 'video_start_time':
-                            val = v.strip()
-                            if val.lstrip('-').isdigit():
-                                return int(val)
-        except Exception:
-            pass
+        # Reuses VideoDownload's shared ini reader instead of a second,
+        # hand-rolled line scan -- one canonical way to read video_start_time
+        # across the whole app.
+        val = _read_song_value(self._song.folder, 'video_start_time')
+        if val.lstrip('-').isdigit():
+            return int(val)
         return DEFAULT_START_TIME
 
     def _grow_window_for(self, ms):
@@ -1647,26 +1649,32 @@ class App(ctk.CTk):
                 w.writerow(['Song', 'Artist', 'Title', 'Has video', 'Resolution',
                             'Offset (ms)', 'Offset source', 'Video kind',
                             'Video title', 'Video ID', 'Dumped videos', 'Folder'])
+                from VideoDownload import _read_ini_section
                 for s in sorted(self._songs, key=lambda x: x.key):
                     artist, title = read_metadata(s.folder)
+                    # One parse of song.ini for every field below, instead of
+                    # a separate open+parse per column (this used to be 6-7
+                    # reads of the same file per song).
+                    section = _read_ini_section(s.folder) or {}
+                    video_title = section.get('backstagehero_video_title') or ''
                     w.writerow([
                         s.label,
                         artist or '',
                         title or '',
                         _video_status(s),
                         s.res if s.has_video else '',
-                        _read_song_value(s.folder, 'video_start_time'),
+                        _read_song_value(s.folder, 'video_start_time', section),
                         # the provenance marker, so a spreadsheet sort shows at
                         # a glance which songs were never actually measured
-                        _read_song_value(s.folder, 'backstagehero_sync'),
+                        _read_song_value(s.folder, 'backstagehero_sync', section),
                         # what KIND of video it is -- sorting on this column is
                         # how you find every lyric video and gameplay capture
                         # in one pass. Fingerprinting cannot tell these apart,
                         # because their audio is identical to the real thing.
-                        _video_kind(s.folder),
-                        _read_song_value(s.folder, 'backstagehero_video_title'),
-                        _read_song_value(s.folder, 'backstagehero_source'),
-                        ' '.join(sorted(get_rejected_sources(s.folder))),
+                        _video_kind(s.folder, video_title),
+                        video_title,
+                        _read_song_value(s.folder, 'backstagehero_source', section),
+                        ' '.join(sorted(get_rejected_sources(s.folder, section))),
                         s.folder,
                     ])
         except OSError as e:

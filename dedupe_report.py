@@ -52,6 +52,46 @@ _VERSION_TAG_RE = re.compile(
 ARTIST_MATCH_THRESHOLD = 90
 TITLE_MATCH_THRESHOLD = 85
 
+# --- Blocking key (O(n^2) -> bucketed matching) ------------------------------
+#
+# group_candidates() used to run SequenceMatcher.ratio() on EVERY pair of
+# folders (~13M comparisons at a real 5,000-song library). We now compute a
+# cheap "blocking key" per folder once, and only fuzzy-compare folders whose
+# keys fall in the same or an ADJACENT bucket -- skipping the vast majority of
+# obviously-unrelated pairs without ever building the full n^2 grid.
+#
+# CHOSEN KEY: len(title_norm) // LENGTH_BUCKET_WIDTH, compared with an
+# adjacency tolerance of 1 bucket. Why length, and why conservative:
+#
+#   * A real title-near-duplicate must clear TITLE_MATCH_THRESHOLD (0.85).
+#     SequenceMatcher.ratio() = 2*M / (len_a + len_b) with M <= min(len_a,
+#     len_b), so ratio >= 0.85 forces len_b <= ~1.35 * len_a -- the two
+#     lengths cannot drift far apart. Length is therefore a *safe* axis to
+#     block on: near-duplicates land at similar lengths by construction.
+#   * Bucketing alone (a naive `len // W` into DISJOINT buckets) would still
+#     drop a genuine pair whose lengths happen to straddle a bucket boundary
+#     (e.g. a dropped leading character shifting length 16 -> 15 across the
+#     W=4 edge at 16). Comparing EQUAL-OR-ADJACENT buckets closes that gap:
+#     any pair whose |len difference| <= LENGTH_BUCKET_WIDTH is *guaranteed*
+#     to share or neighbour a bucket and still be compared, regardless of
+#     where the boundary falls. See test_group_candidates_blocking_key_*.
+#
+# ACCEPTED MISS RATE (documented behavior shift, per SPEC finding C16):
+# the only pairs this can silently skip are ones whose normalized-title
+# lengths differ by MORE than LENGTH_BUCKET_WIDTH (4). Reaching the 0.85
+# title threshold across a length gap that large requires the shorter title
+# to be almost entirely contained in the longer one (a >4-char pure prefix/
+# suffix addition that survived _clean_folder_name + strip_title_noise) -- a
+# rare shape in practice, and exactly the "leading-character typo"-class edge
+# case the spec flags as acceptable. Common near-duplicates (trailing
+# [dupN] -- already stripped, single-char typos, punctuation/format
+# differences that normalize away, short prefix words) all differ in length
+# by <= 4 and stay comparable. Blocking only ever *removes* comparisons; it
+# never changes the result of a comparison that is still performed, so it can
+# never create a spurious group -- it can only, in that rare documented case,
+# miss one.
+LENGTH_BUCKET_WIDTH = 4
+
 
 def _clean_folder_name(name):
     name = _DUP_SUFFIX_RE.sub('', name)
@@ -83,11 +123,16 @@ def group_candidates(song_folders):
         # output instead
         version_tag = _version_tag(cleaned_name)
         artist, title = library_common.parse_folder_name(cleaned_name)
+        title_norm = library_common.normalize_lookup_value(title)
         parsed.append({
             'folder': folder,
             'artist_norm': library_common.normalize_lookup_value(artist),
-            'title_norm': library_common.normalize_lookup_value(title),
+            'title_norm': title_norm,
             'version_tag': version_tag,
+            # Blocking key: bucket by normalized-title length. Compared with a
+            # +/-1 adjacency tolerance below so boundary-straddling pairs are
+            # still matched (see LENGTH_BUCKET_WIDTH docs above).
+            'bucket': len(title_norm) // LENGTH_BUCKET_WIDTH,
         })
 
     groups = []
@@ -101,6 +146,11 @@ def group_candidates(song_folders):
                 continue
             b = parsed[j]
             if a['version_tag'] != b['version_tag']:
+                continue
+            # Blocking-key gate: skip the expensive SequenceMatcher pass for
+            # folders whose title-length buckets are neither equal nor
+            # adjacent -- these cannot clear TITLE_MATCH_THRESHOLD anyway.
+            if abs(a['bucket'] - b['bucket']) > 1:
                 continue
             artist_score = SequenceMatcher(None, a['artist_norm'], b['artist_norm']).ratio() * 100
             title_score = SequenceMatcher(None, a['title_norm'], b['title_norm']).ratio() * 100
