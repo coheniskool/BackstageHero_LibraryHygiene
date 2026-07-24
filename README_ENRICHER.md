@@ -75,33 +75,33 @@ Limitations).
 
 ## Known Limitations
 
-**High scores aren't read yet.** `library_scores.read_scoredata()` is a
-deliberate stub that always returns `{}`. A hex dump of a real Clone Hero
-installation (2026-07-20) found two things that contradicted the initial
-assumption (based on a third-party tool's README):
+**High scores are read from `scores.bin` (not `scoredata.bin`).** A hex
+dump of a real Clone Hero installation (2026-07-20) found the actual file
+is named `scores.bin`, and its byte layout differs from what a third-party
+tool's README described (checksums are a length-prefixed ASCII hex string,
+not 16 raw bytes). The corrected layout was cross-validated against all 7
+real entries in that installation's score file — exact byte accounting to
+a clean EOF, sane percent/score/stars magnitudes — and is now implemented.
+Full layout: [`tests/test_library_scores.py`](tests/test_library_scores.py)'s
+header comment.
 
-1. The actual file is named `scores.bin`, not `scoredata.bin`.
-2. Entries are **not** a raw 16-byte MD5 as that README described — the
-   observed layout starts with a length-prefixed ASCII hex string (1 byte
-   length = 32, then 32 hex characters), not raw bytes.
+Scores are stored **per instrument**, not one number per song (a song can
+have separate lead-guitar and bass scores). The sidecar's `high_score` is
+the best of them; `score_detail` keeps the full per-instrument breakdown
+(plays, difficulty, percent, stars, score) if you want more than one
+number. There is no `high_score_streak` field — no streak of any kind
+exists anywhere in the confirmed real format, so the original spec's
+assumption of one (based on the same wrong README) was dropped rather than
+kept as a permanently-`null` placeholder.
 
-Implementing a full binary parser against an unconfirmed layout risks
-silently wrong scores, which is worse than showing none — so this is
-deferred until validated against a real chart + a real, known score. What's
-needed to finish it:
-
-- A populated Clone Hero library with at least one played, scored song
-  (the configured library was empty when this was last checked)
-- That song's actual displayed high score, to check the parser's output
-  against
-- Confirmation of whether `.chart`-only songs (no `notes.mid`) ever get a
-  `scores.bin` entry at all, or whether Clone Hero synthesizes a `.mid`
-  internally to hash
-
-Everything else (`notes_mid_md5()`, the identity/cache hashing, the whole
-orchestration pipeline) is unaffected and already works — high scores in
-the sidecar are simply always `null` for now, which is the correct "not
-yet available" signal, not a bug.
+**Still open**: whether `.chart`-only songs (no `notes.mid`) ever get a
+`scores.bin` entry at all, or whether Clone Hero synthesizes a `.mid`
+internally to hash for them. The only real `scores.bin` available to test
+against predates the current library entirely (unmodified since 2022,
+while the library itself is from 2026) and its checksums matched none of
+5,205 `notes.mid` files hashed across the current library — so there was
+no currently-relevant song to check this specific question against. Not a
+blocker for the implemented format, just an unconfirmed edge case.
 
 **No manual "Enrich now" button.** The checkbox plus a rescan achieves the
 same result; a dedicated button was deferred to keep the change to `gui.py`

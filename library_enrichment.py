@@ -124,8 +124,9 @@ def _enrich_one_song(folder, chorus_client, scoredata):
 
     mid_md5 = library_scores.notes_mid_md5(folder)
     score_entry = scoredata.get(mid_md5) if mid_md5 else None
-    high_score = score_entry.get('high_score') if score_entry else None
-    high_score_streak = score_entry.get('high_score_streak') if score_entry else None
+    high_score = None
+    if score_entry and score_entry.get('instruments'):
+        high_score = max(i['score'] for i in score_entry['instruments'].values())
 
     chorus_match = None
     if artist and title:
@@ -154,7 +155,7 @@ def _enrich_one_song(folder, chorus_client, scoredata):
         'stems': _list_audio_stems(folder),
         'has_album_art': _has_album_art(folder),
         'high_score': high_score,
-        'high_score_streak': high_score_streak,
+        'score_detail': score_entry,
         'problems': problems,
         'chorus_match': chorus_match,
         'last_updated': _utcnow_iso(),

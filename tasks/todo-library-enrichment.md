@@ -23,24 +23,27 @@
 
 ---
 
-### Task 1.2: Score Reader — scoredata.bin Parsing
-- [ ] **Spike first**: validate the clonehero-score-exporter format against a real Clone Hero install with known scores; confirm/deny `.chart`-only song coverage (resolves spec Open Question #6)
-  - **Partial spike findings (2026-07-20, real install)**: the actual filename on a current Clone Hero install is **`scores.bin`**, not `scoredata.bin` (dir itself confirmed correct: `%USERPROFILE%\AppData\LocalLow\srylain Inc_\Clone Hero\`). Hex-dumped a real 358-byte `scores.bin`: it does NOT start with a raw 16-byte MD5 as clonehero-score-exporter's README described — the observed layout is a little-endian uint32 entry count, then per-entry a **1-byte length prefix (0x20=32) followed by 32 ASCII hex characters** (the MD5 as a *string*, not raw bytes), e.g. `20 '62057549D38DAFD406ECB76849290F4'`. This contradicts the assumed raw-bytes format and must be re-verified/re-derived before implementation — do not code against the raw-16-byte assumption. Test library location for a full end-to-end spike (real chart + real score) was not resolved this pass — the configured `F:\Clone Hero\Library\Songs` was empty at spike time.
+### Task 1.2: Score Reader — scores.bin Parsing
+- [x] **Spike completed (2026-07-20, real install + real library)**: user pointed at their actual library (`M:\_Organized\Songs`, 7,655 songs) and confirmed "implement now from structural evidence" after being shown the tradeoff. Hex-dumped a real `scores.bin`, tried the third-party-documented raw-16-byte-MD5 format first and confirmed it garbage-parses (num_scores=52, difficulty=55 out of a 0-3 range) — then derived the real layout from the actual bytes: length-prefixed ASCII hex checksum string, followed by a 17-byte-per-entry tail (num_instruments, plays, then per-instrument: 4-byte instrument index, 1-byte difficulty, 2-byte percent numerator, 2-byte percent denominator, 1-byte stars, 1-byte unknown flag, 4-byte score). Cross-validated against all 7 real entries: exact byte accounting to a clean EOF, sane percent/score/stars magnitudes. Confirmed the real parser output against the real file directly (not just a hand-built test fixture). `.chart`-only coverage (the other half of Open Question #6) stayed unresolved — the only real `scores.bin` predates the current library entirely (unmodified since 2022 vs. the library's 2026 cache) and its 7 checksums matched none of 5,205 `notes.mid` files hashed across the current library, so there was no currently-relevant song to test that specific question against.
 - [x] Create `library_scores.py`
   - [x] `notes_mid_md5(song_folder) -> Optional[str]` — separate from `resolver_client.chart_hash()`, confirmed different by test
-  - [~] `read_scoredata(ch_data_path) -> Dict[str, Dict[str, int]]` — **STUB, returns `{}` unconditionally**. Real-install spike found the file is `scores.bin` (not `scoredata.bin`) and entries are NOT the raw-16-byte-MD5 layout initially assumed (observed: length-prefixed ASCII hex string). Implementing the real parser against either the wrong or an unconfirmed layout risks silently wrong scores, which is worse than none — deferred until re-verified against a real chart+score pair (need: a populated library + a known score to check against; `F:\Clone Hero\Library\Songs` was empty at spike time)
-  - [ ] Auto-detect `scores.bin` via Unity `persistentDataPath` convention — not yet wired in since read_scoredata() doesn't parse anything yet
-  - [ ] Handle missing/corrupt/version-mismatched files gracefully — N/A until real parsing exists
+  - [x] `read_scoredata(ch_data_path) -> Dict[str, Dict]` — **implemented**, per-instrument (not one scalar per song — see below), returns `{}` on missing dir/file/parse failure
+  - [ ] Auto-detect `scores.bin` via Unity `persistentDataPath` convention — still not wired in; `--ch-data` is prompted for interactively instead (Task 2.2) rather than auto-detected
+  - [x] Handle missing/corrupt/version-mismatched files gracefully — strict inner parser (`_parse_scoredata`) raises on any malformed/truncated input, caught by the outer `read_scoredata()` boundary and degraded to `{}`
   - [x] `.chart`-only songs get `None` from `notes_mid_md5`, not `0`
+  - [x] **Schema correction from the original spec**: dropped `high_score_streak` entirely — no streak field exists anywhere in the confirmed real layout, and the original assumption came from the same wrong third-party README as the byte-format guess. Added `score_detail` (full per-instrument breakdown: plays, difficulty, percent, stars, score) since scores.bin is genuinely per-instrument, not per-song — `high_score` in the sidecar is derived as the max across a song's scored instruments.
 - [x] Unit tests in `tests/test_library_scores.py` (own file, matching precedent)
-  - [ ] Mock scoredata.bin fragment — blocked on confirming the real layout first
-  - [ ] Version mismatch detection — N/A until real parsing exists
-  - [x] Missing/unreadable file scenarios (for `notes_mid_md5` and the `read_scoredata` stub)
+  - [x] Hand-built `scores.bin` fragment matching the confirmed layout exactly, built from a documented byte-layout comment (not guessed)
+  - [x] Malformed/truncated file → `{}`, never raises
+  - [x] Missing/unreadable file scenarios (for `notes_mid_md5` and `read_scoredata`)
   - [x] `.chart`-only song → `None` score via `notes_mid_md5`
   - [x] `notes_mid_md5` confirmed distinct from `resolver_client.chart_hash()` by test
-- [x] Code review & verify coverage (6/6 module tests green; stub explicitly tested as a stub, not silently left uncovered)
+  - [x] Checksum case-normalization (real file is uppercase, `notes_mid_md5()` is lowercase — `read_scoredata()` normalizes so callers never need to)
+  - [x] Unknown instrument index falls back to its numeric string rather than crashing
+  - [x] Explicit test documenting `high_score_streak`'s absence, so a future re-add is a conscious decision
+- [x] Code review & verify coverage (12/12 module tests green; also validated the real parser against the actual real `scores.bin` file directly, not just synthetic fixtures)
 
-**Status**: Partial — `notes_mid_md5()` done; `read_scoredata()` stubbed pending real-install spike (needs a populated library + known score)
+**Status**: Complete
 
 **Status**: Not started
 

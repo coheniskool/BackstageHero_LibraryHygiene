@@ -222,3 +222,42 @@ def test_enrich_library_no_scores_available_is_none_not_zero(tmp_path, monkeypat
         sidecar = json.load(f)
     entry = next(iter(sidecar['songs'].values()))
     assert entry['high_score'] is None
+    assert entry['score_detail'] is None
+
+
+def test_enrich_library_high_score_is_max_across_scored_instruments(tmp_path, monkeypatch):
+    """A song can have separate scores per instrument (lead/bass/etc). The
+    booklet-facing high_score is the best of them; score_detail keeps the
+    full per-instrument breakdown for anything that wants more than one
+    number. Confirmed against a real installation -- see
+    tests/test_library_scores.py's header comment."""
+    _stub_chorus(monkeypatch, result=None)
+    song = _make_song(tmp_path, '3 Doors Down - Kryptonite',
+                       extra_files={'notes.mid': b'MThd fake midi bytes'})
+
+    import library_scores
+    mid_md5 = library_scores.notes_mid_md5(song)
+    fake_scoredata = {
+        mid_md5: {
+            'plays': 3,
+            'instruments': {
+                'lead': {'difficulty': 'expert', 'percent_numerator': 95,
+                          'percent_denominator': 100, 'stars': 5, 'score': 500000},
+                'bass': {'difficulty': 'hard', 'percent_numerator': 80,
+                         'percent_denominator': 100, 'stars': 3, 'score': 200000},
+            },
+        },
+    }
+    monkeypatch.setattr(le.library_scores, 'read_scoredata', lambda ch_data_path: fake_scoredata)
+
+    le.enrich_library(tmp_path, ch_data_path='/fake/ch/data')
+
+    sidecar_path = tmp_path / le.SIDECAR_FILENAME
+    with open(sidecar_path, encoding='utf-8') as f:
+        sidecar = json.load(f)
+    entry = next(iter(sidecar['songs'].values()))
+    assert entry['high_score'] == 500000
+    assert entry['score_detail']['plays'] == 3
+    assert entry['score_detail']['instruments']['lead']['score'] == 500000
+    assert entry['score_detail']['instruments']['bass']['score'] == 200000
+    assert 'high_score_streak' not in entry  # removed -- no such field exists in the real format
