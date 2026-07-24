@@ -23,20 +23,42 @@ python library_enricher.py --library-path "C:\path\to\Songs" --dry-run -v
 
 # Recompute every song, ignoring the incremental skip
 python library_enricher.py --library-path "C:\path\to\Songs" --force
+
+# Or just run it with no flags at all -- it will ask
+python library_enricher.py
 ```
+
+If `--library-path` or `--ch-data` are omitted, the tool prompts for them
+interactively, with real example paths to pattern-match against:
+
+```
+No --library-path given. Where is your Clone Hero Songs library?
+Examples:
+  F:\Clone Hero\Library\Songs
+  M:\_Organized\Songs
+  C:\Users\<you>\Documents\Clone Hero\Songs
+Songs library path:
+```
+
+An invalid entry re-prompts (up to 3 attempts) rather than failing
+immediately — but an *explicitly wrong* `--library-path` passed on the
+command line still fails fast with no retry, since you already told it
+where to look. Leaving the `--ch-data` prompt blank skips high scores for
+that run, same as omitting the flag entirely.
 
 Or from the GUI: the "Enrich after scan" checkbox (on by default, next to
 "Share matches" in the footer) runs this automatically in a background
-thread after every library scan settles.
+thread after every library scan settles — no prompting there, since the
+GUI already knows the library path from its own folder picker.
 
 ### Flags
 
 | Flag | Meaning |
 |---|---|
-| `--library-path` | Required. Root folder containing your song subfolders. |
+| `--library-path` | Root folder containing your song subfolders. Prompted for interactively if omitted. |
 | `--dry-run` | Compute everything, print a summary, write nothing. |
 | `--force` | Recompute every song, ignoring the incremental (unchanged) skip. |
-| `--ch-data` | Clone Hero user data directory. Not yet used — see Known Limitations. |
+| `--ch-data` | Clone Hero user data directory (for `scores.bin`). Prompted for interactively if omitted; leave blank there (or pass `--ch-data ""`) to skip high scores for that run. |
 | `--chorus-cache` | Chorus response cache file path. Defaults to a file next to the sidecar. |
 | `-v`, `--verbose` | Log each song's status. |
 

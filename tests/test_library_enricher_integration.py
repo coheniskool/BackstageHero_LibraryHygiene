@@ -65,7 +65,7 @@ def test_full_cli_run_against_a_real_synthetic_library(tmp_path, monkeypatch, ca
                          'search_by_artist_title', lambda artist, title: None)
     kryptonite, roboto, incomplete = _build_test_library(tmp_path)
 
-    exit_code = library_enricher.main(['--library-path', str(tmp_path), '-v'])
+    exit_code = library_enricher.main(['--library-path', str(tmp_path), '--ch-data', '', '-v'])
     assert exit_code == 0
 
     out = capsys.readouterr().out
@@ -105,7 +105,7 @@ def test_full_cli_run_dry_run_leaves_no_trace(tmp_path, monkeypatch):
                          'search_by_artist_title', lambda artist, title: None)
     _build_test_library(tmp_path)
 
-    exit_code = library_enricher.main(['--library-path', str(tmp_path), '--dry-run'])
+    exit_code = library_enricher.main(['--library-path', str(tmp_path), '--ch-data', '', '--dry-run'])
     assert exit_code == 0
     assert not (tmp_path / library_enrichment.SIDECAR_FILENAME).exists()
 
@@ -115,15 +115,15 @@ def test_second_run_is_incremental_third_run_with_force_reprocesses(tmp_path, mo
                          'search_by_artist_title', lambda artist, title: None)
     _build_test_library(tmp_path)
 
-    library_enricher.main(['--library-path', str(tmp_path)])
+    library_enricher.main(['--library-path', str(tmp_path), '--ch-data', ''])
     capsys.readouterr()  # discard first run's output
 
-    library_enricher.main(['--library-path', str(tmp_path)])
+    library_enricher.main(['--library-path', str(tmp_path), '--ch-data', ''])
     second_out = capsys.readouterr().out
     assert '0 processed' in second_out
     assert '2 skipped' in second_out
 
-    library_enricher.main(['--library-path', str(tmp_path), '--force'])
+    library_enricher.main(['--library-path', str(tmp_path), '--ch-data', '', '--force'])
     third_out = capsys.readouterr().out
     assert '2 processed' in third_out
     assert '0 skipped' in third_out
