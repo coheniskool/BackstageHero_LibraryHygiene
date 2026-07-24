@@ -7,12 +7,20 @@
 # ini writers).
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from pathlib import Path
 
 import chorus_client
 import library_common
 import VideoDownload
+
+# Each song's Chorus lookup is an independent network round-trip, so running
+# them serially across a whole library means the wall-clock cost is
+# (per-lookup latency) x (song count). A bounded pool overlaps those
+# round-trips instead -- matches gui.py's own ThreadPoolExecutor convention
+# for resolution probing (_probe_resolutions).
+ENRICHMENT_WORKERS = 8
 
 # Chorus fields are spliced into song.ini via set_ini_values(), not parsed
 # by configparser -- an unsanitized value with a stray [, ], ;, #, or
@@ -122,6 +130,14 @@ def enrich_song_ini_metadata_library(home_folder, dry_run=False):
     Mirrors the other hygiene scans' aggregate/summary style -- logs every
     song's outcome with a reason, never silently skips one.
 
+    Runs each folder's lookup on a bounded thread pool (ENRICHMENT_WORKERS):
+    every folder's Chorus lookup is independent, so this used to spend
+    (lookup latency) x (song count) fully serially. One song's lookup
+    raising must never lose the rest of the batch -- caught per-future below
+    and recorded as an 'error', same as fill_song_ini_metadata's own error
+    statuses. Progress lines print in COMPLETION order now, not folder-scan
+    order; the returned counts are still exact regardless of that order.
+
     Returns the counts dict (status -> number of folders), so a caller
     (e.g. the GUI) can build its own summary without re-parsing printed
     output.
@@ -135,14 +151,22 @@ def enrich_song_ini_metadata_library(home_folder, dry_run=False):
     # recursive, matching the app's own **/song.ini discovery. The flat walk
     # both missed every song in a nested library AND reported one spurious
     # "no song.ini found" error per pack folder it mistook for a song.
-    for folder in library_common.iter_song_folders(home_folder):
-        result = fill_song_ini_metadata(str(folder), dry_run=dry_run)
-        counts[result['status']] = counts.get(result['status'], 0) + 1
+    folders = list(library_common.iter_song_folders(home_folder))
+    with ThreadPoolExecutor(max_workers=ENRICHMENT_WORKERS) as pool:
+        futures = {pool.submit(fill_song_ini_metadata, str(folder), dry_run): folder
+                   for folder in folders}
+        for fut in as_completed(futures):
+            folder = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                result = {'status': 'error', 'detail': str(e)}
+            counts[result['status']] = counts.get(result['status'], 0) + 1
 
-        if result['status'] == 'filled':
-            print(f"  Filled: {folder.name}: {result['detail']}")
-        elif result['status'] == 'error':
-            print(f"  ERROR: {folder.name}: {result['detail']}")
+            if result['status'] == 'filled':
+                print(f"  Filled: {folder.name}: {result['detail']}")
+            elif result['status'] == 'error':
+                print(f"  ERROR: {folder.name}: {result['detail']}")
 
     print()
     print(

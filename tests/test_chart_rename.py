@@ -865,3 +865,82 @@ def test_ffprobe_failure_does_not_block_when_there_is_no_song_length(tmp_path, m
 
     assert result['status'] == 'ok'
     assert (tmp_path / 'song.ogg').exists()
+
+
+# --- Task 5: redundant folder-listing consolidation (call-counting) ---------
+#
+# These assert on HOW MANY times a folder is listed per pass, not on which
+# files are chosen -- the rename/relocation decisions are pinned unchanged by
+# every test above. They guard against the redundant-I/O regressing back.
+
+def test_stem_scan_and_apply_share_one_listing_helper(tmp_path, monkeypatch):
+    """A11: scan_song_folder_audio_stems (detection) and apply_stem_renames
+    (action) both build their by_role map through the single shared
+    _stems_by_role helper -- one directory listing each -- instead of each
+    running its own independent iterdir()/_match_stem_role pass."""
+    (tmp_path / 'song_1877.ogg').write_bytes(b'x')
+    (tmp_path / 'guitar_1760.ogg').write_bytes(b'x')
+    (tmp_path / 'guitar_1846.ogg').write_bytes(b'x')
+
+    calls = []
+    real = cr._stems_by_role
+    monkeypatch.setattr(cr, '_stems_by_role', lambda d: calls.append(str(d)) or real(d))
+
+    cr.scan_song_folder_audio_stems(tmp_path)
+    assert len(calls) == 1                       # detection: one listing
+    cr.apply_stem_renames(tmp_path, {}, dry_run=True)
+    assert len(calls) == 2                        # action: one more, not two more
+
+
+def test_process_chart_folder_names_derives_notes_candidates_once(tmp_path, monkeypatch):
+    """A9: the id_suffixed path reuses the notes-file Path detection already
+    resolved instead of re-running _notes_candidates() (and re-globbing
+    *.ini). One notes-candidate derivation per pass, not two -- which is also
+    what keeps verify/rename targeting the same file detection selected."""
+    (tmp_path / 'song_2400.ini').write_text(
+        '[song]\nname = Kryptonite\nartist = 3 Doors Down\n', encoding='utf-8')
+    (tmp_path / 'notes_454.chart').write_text(CHART_TEXT, encoding='utf-8')
+
+    calls = []
+    real = cr._notes_candidates
+    monkeypatch.setattr(cr, '_notes_candidates', lambda d: calls.append(str(d)) or real(d))
+
+    result = cr.process_chart_folder_names(tmp_path, dry_run=True)
+
+    assert result['status'] == 'confirmed_ok'
+    assert len(calls) == 1
+
+
+def test_process_song_folder_kryptonite_shape_consolidates_folder_listings(tmp_path, monkeypatch):
+    """Task 5, on the real Kryptonite-shaped multi-file fixture: a full
+    per-folder pass lists the folder the minimum number of times --
+    is_sng_packaged globs once not twice (A12), the stem scan builds by_role
+    once via the shared helper (A11), and no third find_song_ini *.ini glob
+    happens because the scan's resolved song.ini is reused (A10)."""
+    home = tmp_path / 'Library'
+    home.mkdir()
+    song = home / '3 Doors Down - Kryptonite'
+    song.mkdir()
+    (song / 'song.ini').write_text('[song]\nname = Kryptonite\nartist = 3 Doors Down\n', encoding='utf-8')
+    (song / 'notes.mid').write_bytes(b'fake midi bytes')
+    (song / 'song_1877.ogg').write_bytes(b'x')           # sole candidate
+    (song / 'album_827.png').write_bytes(b'x')            # sole candidate
+    (song / 'guitar_1760.ogg').write_bytes(b'x')          # ambiguous
+    (song / 'guitar_1846.ogg').write_bytes(b'x')
+    (song / 'rhythm_1315.ogg').write_bytes(b'x')          # ambiguous
+    (song / 'rhythm_647.ogg').write_bytes(b'x')
+
+    sng_calls, stem_calls, ini_calls = [], [], []
+    real_sng, real_stem = cr.is_sng_packaged, cr._stems_by_role
+    real_ini = cr.library_common.find_song_ini
+    monkeypatch.setattr(cr, 'is_sng_packaged', lambda d: sng_calls.append(1) or real_sng(d))
+    monkeypatch.setattr(cr, '_stems_by_role', lambda d: stem_calls.append(1) or real_stem(d))
+    monkeypatch.setattr(cr.library_common, 'find_song_ini',
+                        lambda d: ini_calls.append(1) or real_ini(d))
+
+    result = cr.process_song_folder_for_chart_rename(song, home, dry_run=True)
+
+    assert result['status'] == 'needs_review'   # guitar/rhythm ambiguity, unchanged
+    assert len(sng_calls) == 1                   # A12: one *.sng glob, not two
+    assert len(stem_calls) == 1                  # A11: one by_role build for the pass
+    assert ini_calls == []                       # A10: scan's song.ini reused, no third glob

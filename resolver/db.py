@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS client_pings (
     app_version  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mappings_hash ON mappings(chart_hash);
+CREATE INDEX IF NOT EXISTS idx_mappings_status ON mappings(status);
 CREATE INDEX IF NOT EXISTS idx_pings_last_seen ON client_pings(last_seen);
 """
 
@@ -88,7 +89,15 @@ def _ip_hash(ip, client_id):
 
 
 def _refresh_mapping(conn, chart_hash, video_id, now):
-    """Recompute one mapping's aggregates and (unless locked) its status."""
+    """Recompute one mapping's aggregates and (unless locked) its status.
+
+    Returns the resulting status string ('approved' | 'pending' | 'rejected')
+    so callers don't have to re-read it back out of the mappings table."""
+    # E23: the distinct-source count could be pushed to SQL via
+    # SELECT COUNT(DISTINCT ip_hash), but median_ms below needs every row's
+    # start_ms anyway (SQLite has no median aggregate), so pulling all rows in
+    # this single query is already the minimal-query-count option -- splitting
+    # out a COUNT(DISTINCT) would add a query, not remove one. Left as-is.
     rows = conn.execute(
         'SELECT start_ms, ip_hash FROM votes WHERE chart_hash=? AND video_id=?',
         (chart_hash, video_id)).fetchall()
@@ -129,6 +138,8 @@ def _refresh_mapping(conn, chart_hash, video_id, now):
                WHERE chart_hash=? AND video_id!=? AND status='approved' AND locked=0""",
             (chart_hash, video_id))
 
+    return status
+
 
 def record_vote(conn, chart_hash, video_id, start_ms, client_id, confidence,
                 artist='', title='', ip=''):
@@ -152,13 +163,9 @@ def record_vote(conn, chart_hash, video_id, start_ms, client_id, confidence,
              last_seen=excluded.last_seen""",
         (chart_hash, artist, title, now))
 
-    _refresh_mapping(conn, chart_hash, video_id, now)
+    status = _refresh_mapping(conn, chart_hash, video_id, now)
     conn.commit()
-
-    row = conn.execute(
-        'SELECT status FROM mappings WHERE chart_hash=? AND video_id=?',
-        (chart_hash, video_id)).fetchone()
-    return row['status'] if row else 'pending'
+    return status
 
 
 def resolve(conn, chart_hash):
@@ -214,11 +221,16 @@ def set_start_ms(conn, chart_hash, video_id, start_ms):
 def list_pending(conn, limit=200):
     """Charts awaiting a decision: those with no approved mapping yet, newest
     activity first. This is the maintainer's work queue."""
+    # E21: NOT EXISTS (SQLite plans it better than NOT IN) over the
+    # idx_mappings_status index -- filters the "has an approved sibling" check
+    # without a full scan of mappings on every call.
     return [dict(r) for r in conn.execute(
         """SELECT m.chart_hash, m.video_id, m.votes, m.start_ms, m.status,
                   c.artist, c.title, m.last_seen
            FROM mappings m LEFT JOIN charts c ON c.chart_hash=m.chart_hash
-           WHERE m.chart_hash NOT IN (SELECT chart_hash FROM mappings WHERE status='approved')
+           WHERE NOT EXISTS (
+               SELECT 1 FROM mappings m2
+               WHERE m2.chart_hash=m.chart_hash AND m2.status='approved')
            ORDER BY m.last_seen DESC LIMIT ?""", (limit,)).fetchall()]
 
 
@@ -239,34 +251,46 @@ def record_ping(conn, client_id, sharing, app_version=''):
 def client_stats(conn):
     """Active user counts over several windows."""
     now = int(time.time())
-    def active(window):
-        cutoff = now - window
-        return conn.execute(
-            'SELECT COUNT(*) FROM client_pings WHERE last_seen >= ?',
-            (cutoff,)).fetchone()[0]
-    def sharing(window):
-        cutoff = now - window
-        return conn.execute(
-            'SELECT COUNT(*) FROM client_pings WHERE last_seen >= ? AND sharing=1',
-            (cutoff,)).fetchone()[0]
+    d1, d7, d30 = now - 86400, now - 604800, now - 2592000
+    # E19: one pass over client_pings with conditional SUMs instead of six
+    # separate COUNT(*) queries. SUM(...) is NULL on an empty table, so coalesce
+    # each window back to 0 to match the old per-query COUNT(*) behavior.
+    row = conn.execute(
+        """SELECT
+             COUNT(*)                                                      AS total_ever,
+             SUM(CASE WHEN last_seen >= ?               THEN 1 ELSE 0 END) AS active_24h,
+             SUM(CASE WHEN last_seen >= ?               THEN 1 ELSE 0 END) AS active_7d,
+             SUM(CASE WHEN last_seen >= ?               THEN 1 ELSE 0 END) AS active_30d,
+             SUM(CASE WHEN last_seen >= ? AND sharing=1 THEN 1 ELSE 0 END) AS sharing_24h,
+             SUM(CASE WHEN last_seen >= ? AND sharing=1 THEN 1 ELSE 0 END) AS sharing_7d
+           FROM client_pings""",
+        (d1, d7, d30, d1, d7)).fetchone()
     return {
-        'total_ever':    conn.execute('SELECT COUNT(*) FROM client_pings').fetchone()[0],
-        'active_24h':    active(86400),
-        'active_7d':     active(604800),
-        'active_30d':    active(2592000),
-        'sharing_24h':   sharing(86400),
-        'sharing_7d':    sharing(604800),
+        'total_ever':  row['total_ever'],
+        'active_24h':  row['active_24h'] or 0,
+        'active_7d':   row['active_7d'] or 0,
+        'active_30d':  row['active_30d'] or 0,
+        'sharing_24h': row['sharing_24h'] or 0,
+        'sharing_7d':  row['sharing_7d'] or 0,
     }
 
 
 def stats(conn):
     def scalar(sql):
         return conn.execute(sql).fetchone()[0]
+    # E20: total/approved/pending all hit the mappings table -- fold them into
+    # one pass. (charts and votes are different tables, so they stay separate.)
+    # SUM(...) is NULL on an empty table, so coalesce approved/pending to 0.
+    m = conn.execute(
+        """SELECT COUNT(*)                                             AS total,
+                  SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END)   AS approved,
+                  SUM(CASE WHEN status='pending'  THEN 1 ELSE 0 END)   AS pending
+           FROM mappings""").fetchone()
     s = {
         'charts':   scalar('SELECT COUNT(*) FROM charts'),
-        'mappings': scalar('SELECT COUNT(*) FROM mappings'),
-        'approved': scalar("SELECT COUNT(*) FROM mappings WHERE status='approved'"),
-        'pending':  scalar("SELECT COUNT(*) FROM mappings WHERE status='pending'"),
+        'mappings': m['total'],
+        'approved': m['approved'] or 0,
+        'pending':  m['pending'] or 0,
         'votes':    scalar('SELECT COUNT(*) FROM votes'),
     }
     s.update(client_stats(conn))

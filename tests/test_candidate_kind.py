@@ -238,7 +238,7 @@ def test_the_attached_videos_title_is_written_to_song_ini(tmp_path, monkeypatch)
     monkeypatch.setattr(vd.resolver_client, 'resolve', lambda ch: None)
     monkeypatch.setattr(vd.resolver_client, 'report', lambda *a, **k: None)
     monkeypatch.setattr(vd, 'is_converted', lambda f: False)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
     monkeypatch.setattr(vd.static_art, 'probe_static_video', lambda p: 'video')
     monkeypatch.setattr(vd, 'search_candidates',
                         lambda q: [('https://youtube.com/watch?v=abc',
@@ -267,7 +267,7 @@ def test_a_fallback_download_records_the_title_it_actually_used(tmp_path, monkey
     monkeypatch.setattr(vd.resolver_client, 'resolve', lambda ch: None)
     monkeypatch.setattr(vd.resolver_client, 'report', lambda *a, **k: None)
     monkeypatch.setattr(vd, 'is_converted', lambda f: False)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
     monkeypatch.setattr(vd.static_art, 'probe_static_video', lambda p: 'video')
     monkeypatch.setattr(vd, 'search_candidates', lambda q: [
         ('https://youtube.com/watch?v=first', 'Band - Song (Official Video)', 200),

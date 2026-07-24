@@ -243,7 +243,7 @@ def test_convert_no_video_file_is_ok(tmp_path):
 
 def test_convert_real_video_is_untouched(monkeypatch, tmp_path):
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'video')
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('video', 30.0))
     result = sa.convert_to_album_art(song)
     assert result == {'status': 'ok', 'detail': ''}
     assert (song / 'video.mp4').exists()
@@ -251,7 +251,7 @@ def test_convert_real_video_is_untouched(monkeypatch, tmp_path):
 
 def test_convert_near_static_reports_only_never_deletes(monkeypatch, tmp_path):
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'near_static')
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('near_static', 30.0))
     result = sa.convert_to_album_art(song)
     assert result['status'] == 'near_static'
     assert (song / 'video.mp4').exists()
@@ -259,7 +259,7 @@ def test_convert_near_static_reports_only_never_deletes(monkeypatch, tmp_path):
 
 def test_convert_unknown_keeps_the_video(monkeypatch, tmp_path):
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'unknown')
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('unknown', None))
     result = sa.convert_to_album_art(song)
     assert result['status'] == 'unknown'
     assert (song / 'video.mp4').exists()
@@ -267,7 +267,7 @@ def test_convert_unknown_keeps_the_video(monkeypatch, tmp_path):
 
 def test_convert_dry_run_is_a_zero_byte_filesystem_diff(monkeypatch, tmp_path):
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     extract_called = []
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: extract_called.append(1))
 
@@ -283,8 +283,7 @@ def test_convert_dry_run_is_a_zero_byte_filesystem_diff(monkeypatch, tmp_path):
 
 def test_convert_writes_frame_deletes_video_and_marks_ini(monkeypatch, tmp_path):
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
-    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', lambda p: (30.0, None))
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: b'FAKE PNG BYTES')
 
     result = sa.convert_to_album_art(song)
@@ -301,9 +300,38 @@ def test_convert_writes_frame_deletes_video_and_marks_ini(monkeypatch, tmp_path)
     assert 'name = Test Song' in ini_text
 
 
+def test_convert_calls_the_duration_probe_only_once(monkeypatch, tmp_path):
+    """Regression for the perf-simplification consolidation: convert_to_
+    album_art used to re-probe duration a second time for the frame
+    extraction midpoint, even though the verdict probe moments earlier had
+    already measured it. Must now be exactly one ffprobe duration call for
+    the whole conversion, real code path (not the verdict itself mocked
+    away) to prove the duration actually gets threaded through."""
+    song = _make_song(tmp_path)
+    calls = []
+    real_probe = sa._probe_duration_and_bitrate
+
+    def _counting(p):
+        calls.append(p)
+        return real_probe(p)
+
+    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', _counting)
+    monkeypatch.setattr(sa.subprocess, 'run',
+                        lambda *a, **k: _FakeCompletedProcess(
+                            stdout='{"format": {"duration": "30.0"}}'))
+    monkeypatch.setattr(sa, '_sample_frames',
+                        lambda p, d: _controlled_frames(hash_distance=0, cell_delta=0))
+    monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: b'FAKE PNG BYTES')
+
+    result = sa.convert_to_album_art(song)
+
+    assert result['status'] == 'converted'
+    assert len(calls) == 1
+
+
 def test_convert_never_overwrites_existing_album_art(monkeypatch, tmp_path):
     song = _make_song(tmp_path, art_name='album.jpg')
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     extract_called = []
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: extract_called.append(1))
 
@@ -318,8 +346,7 @@ def test_convert_never_overwrites_existing_album_art(monkeypatch, tmp_path):
 
 def test_convert_frame_extraction_failure_keeps_video(monkeypatch, tmp_path):
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
-    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', lambda p: (30.0, None))
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: None)
 
     result = sa.convert_to_album_art(song)
@@ -335,8 +362,7 @@ def test_convert_no_song_section_leaves_video_and_cleans_up(monkeypatch, tmp_pat
     the marker, the very next run would treat this as still needing a video
     and re-download the same static upload forever."""
     song = _make_song(tmp_path, ini='name = orphaned, no section header\n')
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
-    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', lambda p: (30.0, None))
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: b'FAKE PNG BYTES')
 
     result = sa.convert_to_album_art(song)
@@ -353,8 +379,7 @@ def test_convert_delete_failure_leaves_marker_and_art_committed(monkeypatch, tmp
     the song must not re-download on the next run -- it's already marked --
     and nothing already written should be rolled back."""
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
-    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', lambda p: (30.0, None))
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: b'FAKE PNG BYTES')
 
     real_unlink = Path.unlink
@@ -678,8 +703,7 @@ def test_a_failed_art_promote_leaves_no_marker_and_keeps_the_video(monkeypatch, 
     A failure there left marker-set / no-album.png / video-still-present --
     a state with no name, which process_download then skipped forever."""
     song = _make_song(tmp_path)
-    monkeypatch.setattr(sa, 'probe_static_video', lambda p: 'static')
-    monkeypatch.setattr(sa, '_probe_duration_and_bitrate', lambda p: (30.0, None))
+    monkeypatch.setattr(sa, '_probe_static_video_verdict', lambda p: ('static', 30.0))
     monkeypatch.setattr(sa, '_extract_frame_png', lambda p, t: b'FAKE PNG BYTES')
     monkeypatch.setattr(sa.os, 'replace',
                         lambda *a, **k: (_ for _ in ()).throw(OSError(13, 'locked')))

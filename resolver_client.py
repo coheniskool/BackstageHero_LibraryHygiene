@@ -68,18 +68,31 @@ def chart_hash(folder):
     return None
 
 
+_cached_client_id = None
+
+
 def _client_id():
-    """Random anonymous ID stored per machine so the server can count distinct voters."""
+    """Random anonymous ID stored per machine so the server can count distinct
+    voters. Cached in memory after the first read/creation, since ping() and
+    report() each call this and the value never changes within one process's
+    lifetime -- avoids a disk read on every call. The 'anon' fallback is
+    deliberately never cached, so a transient read failure doesn't
+    permanently stick a whole process with it; the next call retries."""
+    global _cached_client_id
+    if _cached_client_id is not None:
+        return _cached_client_id
     try:
         path = os.path.join(updater.data_dir(), 'client_id')
         if os.path.exists(path):
             with open(path) as f:
                 val = f.read().strip()
                 if val:
+                    _cached_client_id = val
                     return val
         val = uuid.uuid4().hex
         with open(path, 'w') as f:
             f.write(val)
+        _cached_client_id = val
         return val
     except Exception:
         return 'anon'

@@ -99,7 +99,7 @@ def test_ensure_playable_no_file_returns_ok(tmp_path):
 def test_ensure_playable_cfr_video_is_ok(monkeypatch, tmp_path):
     video = tmp_path / 'video.mp4'
     video.write_bytes(b'x')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: False)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: (None, False))
 
     result = vr.ensure_playable(video)
 
@@ -109,7 +109,7 @@ def test_ensure_playable_cfr_video_is_ok(monkeypatch, tmp_path):
 def test_ensure_playable_vfr_video_gets_reencoded(monkeypatch, tmp_path):
     video = tmp_path / 'video.mp4'
     video.write_bytes(b'x')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: True)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: (None, True))
     monkeypatch.setattr(vr, 'reencode_to_cfr', lambda p: True)
 
     result = vr.ensure_playable(video)
@@ -120,7 +120,7 @@ def test_ensure_playable_vfr_video_gets_reencoded(monkeypatch, tmp_path):
 def test_ensure_playable_reencode_failure_is_reported(monkeypatch, tmp_path):
     video = tmp_path / 'video.mp4'
     video.write_bytes(b'x')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: True)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: (None, True))
     monkeypatch.setattr(vr, 'reencode_to_cfr', lambda p: False)
 
     result = vr.ensure_playable(video)
@@ -131,7 +131,7 @@ def test_ensure_playable_reencode_failure_is_reported(monkeypatch, tmp_path):
 def test_ensure_playable_dry_run_vfr_never_calls_reencode(monkeypatch, tmp_path):
     video = tmp_path / 'video.mp4'
     video.write_bytes(b'original bytes')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: True)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: (None, True))
     called = []
     monkeypatch.setattr(vr, 'reencode_to_cfr', lambda p: called.append(1) or True)
 
@@ -146,8 +146,7 @@ def test_ensure_playable_dry_run_vfr_never_calls_reencode(monkeypatch, tmp_path)
 def test_ensure_playable_dry_run_never_removes_codec(monkeypatch, tmp_path):
     video = tmp_path / 'video.webm'
     video.write_bytes(b'x')
-    monkeypatch.setattr(vr, 'probe_video_codec', lambda p: 'vp9')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: False)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: ('vp9', False))
 
     result = vr.ensure_playable(video, allow_codec_removal=True, dry_run=True)
 
@@ -156,19 +155,19 @@ def test_ensure_playable_dry_run_never_removes_codec(monkeypatch, tmp_path):
     assert video.exists()  # never actually removed
 
 
-def test_ensure_playable_inline_mode_never_probes_codec(monkeypatch, tmp_path):
+def test_ensure_playable_inline_mode_never_removes_codec(monkeypatch, tmp_path):
     """allow_codec_removal defaults to False -- the inline post-download hook
-    must never delete a video (BackstageHero's own downloads are always
-    remuxed AVC .mp4; codec removal is standalone-scan-only)."""
+    must never delete a video for its codec (BackstageHero's own downloads
+    are always remuxed AVC .mp4; codec removal is standalone-scan-only).
+    The merged probe still reports the codec it saw (one ffprobe call
+    answers both the VFR and codec questions regardless of mode), but that
+    information must never be acted on outside allow_codec_removal."""
     video = tmp_path / 'video.webm'
     video.write_bytes(b'x')
-    called = []
-    monkeypatch.setattr(vr, 'probe_video_codec', lambda p: called.append(1) or 'vp9')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: False)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: ('vp9', False))
 
     result = vr.ensure_playable(video)  # allow_codec_removal defaults False
 
-    assert called == []  # codec probe never even attempted
     assert video.exists()
     assert result['status'] == 'ok'
 
@@ -176,7 +175,7 @@ def test_ensure_playable_inline_mode_never_probes_codec(monkeypatch, tmp_path):
 def test_ensure_playable_standalone_mode_removes_unsupported_webm_codec(monkeypatch, tmp_path):
     video = tmp_path / 'video.webm'
     video.write_bytes(b'x')
-    monkeypatch.setattr(vr, 'probe_video_codec', lambda p: 'vp9')
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: ('vp9', False))
 
     result = vr.ensure_playable(video, allow_codec_removal=True)
 
@@ -187,13 +186,32 @@ def test_ensure_playable_standalone_mode_removes_unsupported_webm_codec(monkeypa
 def test_ensure_playable_standalone_mode_keeps_vp8_webm(monkeypatch, tmp_path):
     video = tmp_path / 'video.webm'
     video.write_bytes(b'x')
-    monkeypatch.setattr(vr, 'probe_video_codec', lambda p: 'vp8')
-    monkeypatch.setattr(vr, 'probe_frame_rate', lambda p: False)
+    monkeypatch.setattr(vr, '_probe_video_info', lambda p: ('vp8', False))
 
     result = vr.ensure_playable(video, allow_codec_removal=True)
 
     assert result['status'] == 'ok'
     assert video.exists()
+
+
+def test_ensure_playable_calls_the_combined_probe_only_once(monkeypatch, tmp_path):
+    """Regression for the perf-simplification merge (finding B15): a webm
+    being checked in standalone mode used to cost two separate ffprobe
+    calls (codec, then frame rate). Must now be exactly one."""
+    video = tmp_path / 'video.webm'
+    video.write_bytes(b'x')
+    calls = []
+
+    def _counting(p):
+        calls.append(p)
+        return 'vp8', False
+
+    monkeypatch.setattr(vr, '_probe_video_info', _counting)
+
+    result = vr.ensure_playable(video, allow_codec_removal=True)
+
+    assert result['status'] == 'ok'
+    assert len(calls) == 1
 
 
 # --- scan_and_repair_video_library --------------------------------------------------
@@ -224,6 +242,33 @@ def test_scan_and_repair_video_library_processes_all_folders(monkeypatch, tmp_pa
     assert all(name != '_needs_review' for name, _ in calls)
     assert counts == {'ok': 1, 'removed_unsupported_codec': 1}
     assert len(calls) == 2  # Song C has no video, never calls ensure_playable
+
+
+def test_scan_and_repair_survives_one_video_raising(monkeypatch, tmp_path):
+    """Perf-simplification: per-video repair now runs on a thread pool. A
+    single video's ensure_playable raising must not lose the rest of the
+    batch, and every video must still be accounted for in the final counts
+    regardless of which order the threads finish in."""
+    for i in range(3):
+        song = tmp_path / f'Song{i}'
+        song.mkdir()
+        (song / 'video.mp4').write_bytes(b'x')
+    bad = tmp_path / 'Bad'
+    bad.mkdir()
+    (bad / 'video.mp4').write_bytes(b'x')
+
+    def _fake_ensure_playable(video_path, *, allow_codec_removal=False, dry_run=False):
+        if 'Bad' in str(video_path):
+            raise OSError('simulated unlink failure')
+        return {'status': 'ok', 'detail': ''}
+
+    monkeypatch.setattr(vr, 'ensure_playable', _fake_ensure_playable)
+
+    counts = vr.scan_and_repair_video_library(tmp_path)
+
+    assert counts.get('ok', 0) == 3
+    assert counts.get('reencode_failed', 0) == 1
+    assert sum(counts.values()) == 4   # every video accounted for, none lost
 
 
 def test_scan_and_repair_video_library_checks_every_video_in_a_folder(monkeypatch, tmp_path):

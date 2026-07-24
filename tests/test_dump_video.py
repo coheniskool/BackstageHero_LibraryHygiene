@@ -89,6 +89,24 @@ def test_dumping_never_touches_album_art_the_app_did_not_create(tmp_path):
     assert (folder / 'album.png').read_bytes() == b'the users own artwork'
 
 
+def test_dump_video_parses_song_ini_once(tmp_path, monkeypatch):
+    """dump_video needs the video marker, stored source, and rejected list --
+    three keys that used to mean three separate opens+parses of song.ini."""
+    folder = _song(tmp_path)
+    calls = []
+    real = vd._read_ini_section
+
+    def _counting(f):
+        calls.append(f)
+        return real(f)
+
+    monkeypatch.setattr(vd, '_read_ini_section', _counting)
+
+    vd.dump_video(folder)
+
+    assert len(calls) == 1
+
+
 # --- the rejection has to actually change what gets downloaded ------------
 
 def _sync_off(monkeypatch):

@@ -32,7 +32,7 @@ def _quiet_download(monkeypatch, folder):
     monkeypatch.setattr(vd, 'download_with_fallback',
                         lambda folder_, url, candidates, quality, info=None: url)
     monkeypatch.setattr(vd, 'is_converted', lambda f: False)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
 
 
 def test_unmeasured_offset_is_recorded_as_a_guess(tmp_path, monkeypatch):
@@ -97,7 +97,7 @@ def test_fallback_to_a_different_video_downgrades_measured_to_guess(tmp_path, mo
     folder = _song(tmp_path)
     _no_resolver(monkeypatch)
     monkeypatch.setattr(vd, 'is_converted', lambda f: False)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
     # measured against ...=abc, but ...=xyz is what actually downloaded
     monkeypatch.setattr(vd, 'download_with_fallback',
                         lambda folder_, url, candidates, quality, info=None: 'https://youtube.com/watch?v=xyz')
@@ -114,6 +114,39 @@ def test_fallback_to_a_different_video_downgrades_measured_to_guess(tmp_path, mo
     assert written['backstagehero_sync'] == vd.SYNC_GUESS
 
 
+def test_resolution_is_folded_into_the_same_write_as_the_rest(tmp_path, monkeypatch):
+    """Probing the resolution used to be a second, separate set_ini_values()
+    call right after the main write -- a second read-modify-write of
+    song.ini for every single download. It must now ride along in the same
+    write as video_start_time/backstagehero_sync/etc."""
+    folder = _song(tmp_path)
+    _no_resolver(monkeypatch)
+    monkeypatch.setattr(vd, 'download_with_fallback',
+                        lambda folder_, url, candidates, quality, info=None: url)
+    monkeypatch.setattr(vd, 'is_converted', lambda f: False)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: '720p')
+    monkeypatch.setattr(vd.static_art, 'probe_static_video', lambda p: 'video')
+    monkeypatch.setattr(vd, 'search_candidates', lambda q: [('https://youtube.com/watch?v=abc', 'A', 200)])
+    monkeypatch.setattr(vd, 'select_video',
+                        lambda f, c, s, target_h=0:
+                        ('https://youtube.com/watch?v=abc', 'A', 4005, True, 0.93, None))
+
+    calls = []
+
+    def _counting_write(f, values):
+        calls.append(dict(values))
+        return True
+
+    monkeypatch.setattr(vd, 'set_ini_values', _counting_write)
+
+    vd.process_download(str(folder), 'Test Song', vd.quality_format(720),
+                        sync_ready=True, replace=False)
+
+    assert len(calls) == 1
+    assert calls[0]['video_start_time'] == '4005'
+    assert calls[0]['backstagehero_res'] == '720p'
+
+
 def test_community_offset_is_distinguished_from_a_community_video_with_no_offset(tmp_path, monkeypatch):
     """A resolver hit carrying a start_ms is a real community measurement; a hit
     without one is a trusted video on a guessed timing. Different provenance."""
@@ -123,7 +156,7 @@ def test_community_offset_is_distinguished_from_a_community_video_with_no_offset
     monkeypatch.setattr(vd.resolver_client, 'report', lambda *a, **k: None)
     monkeypatch.setattr(vd, 'download_video', lambda folder_, url, quality: None)
     monkeypatch.setattr(vd, 'is_converted', lambda f: False)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
 
     monkeypatch.setattr(vd.resolver_client, 'resolve',
                         lambda ch: {'video_id': 'abc123', 'start_ms': 2750})

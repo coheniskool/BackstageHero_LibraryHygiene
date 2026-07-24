@@ -12,11 +12,19 @@ import logging
 import os
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import library_common
 
 log = logging.getLogger('backstagehero')
+
+# Each video's repair is an independent ffprobe/ffmpeg subprocess pipeline,
+# so running them serially across a whole library means the wall-clock cost
+# is (per-video probe+encode time) x (video count). A bounded pool overlaps
+# those subprocess calls instead -- matches gui.py's own ThreadPoolExecutor
+# convention for resolution probing (_probe_resolutions).
+REPAIR_WORKERS = 4
 
 # Suppress the console window each ffmpeg/ffprobe child would otherwise
 # flash on a windowed (--noconsole) build; harmless 0 elsewhere. Matches
@@ -77,6 +85,39 @@ def probe_video_codec(video_path):
         return None
 
 
+def _probe_video_info(video_path):
+    """(codec_name_or_None, is_vfr) for a video, in one ffprobe call.
+
+    probe_video_codec() and probe_frame_rate() each ask ffprobe a separate,
+    single-purpose question; ensure_playable() used to call both of them,
+    spending two subprocess spawns on the same file when it needed both
+    answers (a webm being checked for both codec support and VFR). This asks
+    for codec_name, r_frame_rate and avg_frame_rate together so that caller
+    gets both facts from one probe. Fails safe the same way each individual
+    probe does: (None, False) on any error, so a caller falls through to
+    "leave it alone" rather than acting on a guess.
+    """
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name,r_frame_rate,avg_frame_rate',
+             '-of', 'json', str(video_path)],
+            check=True, capture_output=True, creationflags=_NO_WINDOW,
+            **_TEXT_UTF8,
+        )
+        data = json.loads(result.stdout)
+        streams = data.get('streams', [])
+        if not streams:
+            return None, False
+        stream = streams[0]
+        codec = stream.get('codec_name')
+        is_vfr = stream.get('r_frame_rate', '0/0') != stream.get('avg_frame_rate', '0/0')
+        return codec, is_vfr
+    except Exception as e:
+        log.error(f'ffprobe combined probe error {video_path}: {e}')
+        return None, False
+
+
 def reencode_to_cfr(video_path, fps=30):
     """Overwrite video_path in place with a constant-frame-rate re-encode.
 
@@ -123,8 +164,11 @@ def ensure_playable(video_path, *, allow_codec_removal=False, dry_run=False):
     if not video_path.exists():
         return {'status': 'ok', 'detail': 'no video file'}
 
+    # One ffprobe call for both facts this function needs, instead of a
+    # separate codec probe and frame-rate probe (finding B15).
+    codec, is_vfr = _probe_video_info(video_path)
+
     if allow_codec_removal and video_path.suffix.lower() == '.webm':
-        codec = probe_video_codec(video_path)
         if codec is not None and codec != 'vp8':
             if not dry_run:
                 video_path.unlink()
@@ -133,7 +177,7 @@ def ensure_playable(video_path, *, allow_codec_removal=False, dry_run=False):
                 detail += ' (dry-run, not applied)'
             return {'status': 'removed_unsupported_codec', 'detail': detail}
 
-    if probe_frame_rate(video_path):
+    if is_vfr:
         if dry_run:
             return {'status': 'reencoded_cfr',
                      'detail': f'{video_path.name}: VFR -> CFR (dry-run, not applied)'}
@@ -154,6 +198,15 @@ def scan_and_repair_video_library(home_folder, dry_run=False):
 
     Returns the counts dict (status -> number of videos), so a caller (e.g.
     the GUI) can build its own summary without re-parsing printed output.
+
+    Runs each video's repair on a bounded thread pool (REPAIR_WORKERS):
+    every video's ffprobe/ffmpeg work is independent, so this used to spend
+    (probe+encode time) x (video count) fully serially. One video's repair
+    raising must never lose the rest of the batch -- caught per-future below
+    and recorded as 'reencode_failed', same bucket ensure_playable() itself
+    uses for a failed re-encode. Progress lines print in COMPLETION order
+    now, not folder-scan order; the returned counts are still exact
+    regardless of that order.
     """
     library_common.make_console_encoding_safe()
     print('=' * 70)
@@ -162,15 +215,27 @@ def scan_and_repair_video_library(home_folder, dry_run=False):
 
     counts = {}
     # recursive, matching the app's own **/song.ini discovery -- a one-level
-    # walk finds zero songs in a Songs/<Pack>/<Song>/ library
-    for folder in library_common.iter_song_folders(home_folder):
-        # every recognized video file, not just the first -- a folder with a
-        # good video.mp4 can still hold a stale VP9 video.webm from another
-        # tool, and checking only find_video_file()'s first hit would leave
-        # that one unexamined forever
-        videos = [folder / name for name in library_common.VIDEO_NAMES if (folder / name).exists()]
-        for video in videos:
-            result = ensure_playable(video, allow_codec_removal=True, dry_run=dry_run)
+    # walk finds zero songs in a Songs/<Pack>/<Song>/ library. Every
+    # recognized video file, not just the first -- a folder with a good
+    # video.mp4 can still hold a stale VP9 video.webm from another tool, and
+    # checking only find_video_file()'s first hit would leave that one
+    # unexamined forever.
+    videos = [(folder, folder / name)
+              for folder in library_common.iter_song_folders(home_folder)
+              for name in library_common.VIDEO_NAMES
+              if (folder / name).exists()]
+
+    with ThreadPoolExecutor(max_workers=REPAIR_WORKERS) as pool:
+        futures = {pool.submit(ensure_playable, video,
+                               allow_codec_removal=True, dry_run=dry_run): (folder, video)
+                   for folder, video in videos}
+        for fut in as_completed(futures):
+            folder, video = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                result = {'status': 'reencode_failed',
+                          'detail': f'{video.name}: unexpected error ({e})'}
             counts[result['status']] = counts.get(result['status'], 0) + 1
             if result['status'] in ('reencoded_cfr', 'removed_unsupported_codec', 'reencode_failed'):
                 print(f"  {folder.name}: {result['detail']}")

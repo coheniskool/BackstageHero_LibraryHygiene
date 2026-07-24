@@ -77,6 +77,31 @@ def test_any_offset_the_user_asks_for_is_representable(target):
     assert ed._ms_min <= target <= ed._ms_max
 
 
+# --- _read_offset (perf-simplification: now reuses the shared ini reader) -
+
+def _bare_editor_for(folder, label='Test'):
+    ed = object.__new__(gui.SyncEditor)
+    ed._song = _FakeSong(folder, label, True, '720p')
+    return ed
+
+
+def test_read_offset_uses_the_shared_ini_reader(tmp_path):
+    """Regression for reusing VideoDownload's shared reader instead of a
+    hand-rolled line scan -- must still parse a real stored value."""
+    a = _write_song(tmp_path / 'Song', 'Song', video_start_time='-4200')
+    assert _bare_editor_for(a)._read_offset() == -4200
+
+
+def test_read_offset_falls_back_to_default_when_unparsable(tmp_path):
+    a = _write_song(tmp_path / 'Song', 'Song', video_start_time='not-a-number')
+    assert _bare_editor_for(a)._read_offset() == gui.DEFAULT_START_TIME
+
+
+def test_read_offset_falls_back_to_default_when_absent(tmp_path):
+    a = _write_song(tmp_path / 'Song', 'Song')
+    assert _bare_editor_for(a)._read_offset() == gui.DEFAULT_START_TIME
+
+
 # --- the CSV export -------------------------------------------------------
 
 class _FakeSong:
@@ -245,3 +270,31 @@ def test_an_unwritable_library_folder_does_not_break_the_app(tmp_path, monkeypat
 def test_no_csv_is_written_before_a_library_is_loaded(tmp_path):
     _app_with([], tmp_path)._export_library_csv()
     assert not (tmp_path / gui.App.CSV_NAME).exists()
+
+
+def test_export_csv_parses_each_songs_ini_once(tmp_path, monkeypatch):
+    """The export used to re-open+parse each song's ini 6-7 times (once per
+    ini-derived column). It must now do exactly one _read_ini_section() call
+    per song, regardless of how many columns are written from it."""
+    a = _write_song(tmp_path / 'Song', 'Song',
+                    video_start_time='-4200', backstagehero_sync='measured',
+                    backstagehero_video_title='Band - Song (Lyrics)',
+                    backstagehero_source='abc123')
+    songs = [_FakeSong(a, 'Song', True, '720p')]
+
+    import VideoDownload
+    calls = []
+    real = VideoDownload._read_ini_section
+
+    def _counting(folder):
+        calls.append(folder)
+        return real(folder)
+
+    monkeypatch.setattr(VideoDownload, '_read_ini_section', _counting)
+
+    _app_with(songs, tmp_path)._export_library_csv()
+
+    assert len(calls) == 1
+    row = _read_csv(tmp_path / gui.App.CSV_NAME)[1]
+    assert row[5] == '-4200' and row[6] == 'measured' and row[7] == 'lyric'
+    assert row[8] == 'Band - Song (Lyrics)' and row[9] == 'abc123'

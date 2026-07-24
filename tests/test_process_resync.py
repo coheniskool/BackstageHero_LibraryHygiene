@@ -98,7 +98,7 @@ def test_an_audioless_video_skips_straight_to_the_network_path(tmp_path, monkeyp
     monkeypatch.setattr(vd, 'fetch_audio',
                         lambda folder_, url: ('fetched_audio.opus', 720, None))
     monkeypatch.setattr(vd, 'cleanup_temp_files', lambda f: None)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
     monkeypatch.setattr(vd, 'set_ini_values', lambda f, values: True)
 
     probes = []
@@ -142,11 +142,39 @@ def test_process_resync_falls_back_to_known_source_when_local_video_inconclusive
     monkeypatch.setattr(vd, 'fetch_audio', lambda f, url: ('fake_audio_path', 0, None))
     monkeypatch.setattr(vd, 'cleanup_temp_files', lambda f: None)
     monkeypatch.setattr(vd, 'set_ini_values', lambda f, values: True)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
 
     vd.process_resync(str(folder), 'Test Song', sync_ready=True)
 
     assert probes == [os.path.join(str(folder), 'video.mp4'), 'fake_audio_path']
+
+
+def test_known_source_resync_folds_resolution_into_one_write(tmp_path, monkeypatch):
+    """The known-source branch used to call set_ini_values() for the offset,
+    then a second, separate _probe_and_store_resolution() write right after
+    it. Both must now land in a single write."""
+    folder = _make_song_folder(tmp_path, with_video=False)
+    monkeypatch.setattr(vd, 'is_converted', lambda f: False)
+    monkeypatch.setattr(vd, 'get_stored_source', lambda f: 'dQw4w9WgXcQ')
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: '1080p')
+    monkeypatch.setattr(vd.audiosync, 'compute_offset_ms',
+                        lambda folder_, probe: (-1000, 'matched', 0.8))
+    monkeypatch.setattr(vd, 'fetch_audio', lambda f, url: ('fake_audio_path', 0, None))
+    monkeypatch.setattr(vd, 'cleanup_temp_files', lambda f: None)
+
+    calls = []
+
+    def _counting_write(f, values):
+        calls.append(dict(values))
+        return True
+
+    monkeypatch.setattr(vd, 'set_ini_values', _counting_write)
+
+    vd.process_resync(str(folder), 'Test Song', sync_ready=True)
+
+    assert len(calls) == 1
+    assert calls[0]['video_start_time'] == '-1000'
+    assert calls[0]['backstagehero_res'] == '1080p'
 
 
 def test_process_resync_no_local_video_behaves_exactly_as_before(tmp_path, monkeypatch):
@@ -167,7 +195,7 @@ def test_process_resync_no_local_video_behaves_exactly_as_before(tmp_path, monke
     monkeypatch.setattr(vd, 'fetch_audio', lambda f, url: ('fake_audio_path', 0, None))
     monkeypatch.setattr(vd, 'cleanup_temp_files', lambda f: None)
     monkeypatch.setattr(vd, 'set_ini_values', lambda f, values: True)
-    monkeypatch.setattr(vd, '_probe_and_store_resolution', lambda f: None)
+    monkeypatch.setattr(vd, '_probe_resolution_value', lambda f: None)
 
     vd.process_resync(str(folder), 'Test Song', sync_ready=True)
 
