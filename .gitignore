@@ -21,6 +21,7 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.coverage
 
 # Local runtime and tooling artifacts - never part of the source
 # launch_log.txt is rewritten by "Launch BackstageHero.bat" on every launch.

@@ -54,6 +54,7 @@ import chart_rename
 import metadata_enrichment
 import dedupe_report
 import static_art
+import library_enrichment
 
 log = logging.getLogger('backstagehero')
 
@@ -1435,9 +1436,23 @@ class App(ctk.CTk):
             command=self._on_share_toggle)
         share_cb.grid(row=0, column=6, padx=(12, 4), pady=15)
 
+        # Booklet-data enrichment (instruments/NPS/features/high scores) --
+        # runs in a background thread after each scan settles, same
+        # threading.Thread pattern as _probe_resolutions/_scan_library, not
+        # a subprocess -- no interpreter-path or stdout-piping fragility.
+        self._enrich_var = tk.BooleanVar(
+            value=self._settings.get('enrich_after_scan', True))
+        enrich_cb = ctk.CTkCheckBox(
+            foot, text='Enrich after scan', variable=self._enrich_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18,
+            command=lambda: self._persist_setting(
+                'enrich_after_scan', bool(self._enrich_var.get())))
+        enrich_cb.grid(row=0, column=7, padx=(12, 4), pady=15)
+
         # Progress + status (right side of footer)
         prog_frame = ctk.CTkFrame(foot, fg_color='transparent')
-        prog_frame.grid(row=0, column=7, padx=(8, 16), pady=15, sticky='e')
+        prog_frame.grid(row=0, column=8, padx=(8, 16), pady=15, sticky='e')
 
         self._progress = ctk.CTkProgressBar(prog_frame, width=190, height=8,
                                              corner_radius=4)
@@ -1460,6 +1475,25 @@ class App(ctk.CTk):
         on = bool(self._share_var.get())
         resolver_client.set_sharing(on)
         self._persist_setting('share_matches', on)
+
+    def _maybe_start_enrichment(self):
+        """Runs library_enrichment.enrich_library() in a background thread
+        after a scan settles, if the user has it enabled. Deliberately
+        touches no Tkinter widget from that thread -- unlike the download/
+        probe flows, it has nothing the user needs to watch live, so there's
+        no need to route anything through self._queue and no risk of a
+        cross-thread widget access bug. A failure here costs the user an
+        optional booklet-data file, never the app itself -- same philosophy
+        as _export_library_csv, logged via `log` and otherwise ignored."""
+        if not self._enrich_var.get() or not self._songs_folder:
+            return
+        threading.Thread(target=self._run_enrichment, daemon=True).start()
+
+    def _run_enrichment(self):
+        try:
+            library_enrichment.enrich_library(self._songs_folder)
+        except Exception as e:
+            log.warning('Library enrichment failed: %s', e)
 
     def _startup(self):
         saved = _load_songs_path()
@@ -1575,7 +1609,8 @@ class App(ctk.CTk):
         self._apply_filter()
         n = len(songs)
         unprobed = [s for s in songs if s.has_video and s.res == '...']
-        if unprobed and ffmpegAvailable:
+        will_probe = bool(unprobed and ffmpegAvailable)
+        if will_probe:
             self._status_lbl.configure(
                 text=f'{n} songs found, reading resolutions...')
             threading.Thread(target=self._probe_resolutions,
@@ -1585,6 +1620,11 @@ class App(ctk.CTk):
                 text=f'{n} song{"s" if n != 1 else ""} found')
         self._export_library_csv()
         self._update_buttons()
+        if not will_probe:
+            # If resolutions need probing, enrichment waits for that to
+            # settle instead (triggered from the 'csv_refresh' handler) --
+            # otherwise it would run twice per scan, once redundantly.
+            self._maybe_start_enrichment()
 
     CSV_NAME = 'backstagehero_library.csv'
 
@@ -2182,6 +2222,7 @@ class App(ctk.CTk):
 
         elif kind == 'csv_refresh':
             self._export_library_csv()
+            self._maybe_start_enrichment()
 
         elif kind == 'app_update_available':
             _, latest, asset, sha = msg
