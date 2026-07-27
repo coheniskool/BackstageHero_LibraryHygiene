@@ -16,10 +16,19 @@ import gui
 
 
 @pytest.fixture(scope='module')
-def app():
+def app(tmp_path_factory):
+    # gui.App() reads gui._SETTINGS_FILE (real per-machine settings.json) at
+    # construction time via _load_settings() -- without isolating it here,
+    # "fresh install" defaults below only hold on a machine that has never
+    # toggled cookies on for real. monkeypatch is function-scoped and can't
+    # be used by a module-scoped fixture, hence pytest.MonkeyPatch() directly.
+    mp = pytest.MonkeyPatch()
+    fake_settings = tmp_path_factory.mktemp('cookie_settings_gui') / 'settings.json'
+    mp.setattr(gui, '_SETTINGS_FILE', str(fake_settings))
     try:
         a = gui.App()
     except Exception as exc:                      # genuinely no display / no Tk
+        mp.undo()
         pytest.skip(f'Tk unavailable: {exc}')
     a.withdraw()
     yield a
@@ -27,6 +36,7 @@ def app():
         a.destroy()
     except Exception:
         pass
+    mp.undo()
 
 
 def test_cookie_toggle_and_browser_dropdown_exist_with_defaults(app):
