@@ -60,14 +60,34 @@ def test_enrich_library_writes_sidecar_with_expected_entry(tmp_path, monkeypatch
     assert entry['status'] == 'success'
 
 
-def test_enrich_library_dry_run_writes_nothing(tmp_path, monkeypatch):
+def test_enrich_library_dry_run_writes_sidecar(tmp_path, monkeypatch):
     _stub_chorus(monkeypatch, result=None)
-    _make_song(tmp_path, '3 Doors Down - Kryptonite')
+    song = _make_song(tmp_path, '3 Doors Down - Kryptonite')
 
     summary = le.enrich_library(tmp_path, dry_run=True)
 
     assert summary['songs_processed'] == 1
-    assert not (tmp_path / le.SIDECAR_FILENAME).exists()
+
+    sidecar_path = tmp_path / le.SIDECAR_FILENAME
+    assert sidecar_path.exists()
+    with open(sidecar_path, encoding='utf-8') as f:
+        sidecar = json.load(f)
+
+    chart_hash = resolver_client.chart_hash(str(song))
+    assert chart_hash in sidecar['songs']
+
+
+def test_dry_run_then_real_run_skips_everything(tmp_path, monkeypatch):
+    _stub_chorus(monkeypatch, result=None)
+    _make_song(tmp_path, '3 Doors Down - Kryptonite')
+
+    dry = le.enrich_library(tmp_path, dry_run=True)
+    assert dry['songs_processed'] == 1
+    assert dry['songs_skipped'] == 0
+
+    real = le.enrich_library(tmp_path, dry_run=False)
+    assert real['songs_processed'] == 0
+    assert real['songs_skipped'] == 1
 
 
 def test_enrich_library_incremental_skips_unchanged_song(tmp_path, monkeypatch):

@@ -172,7 +172,10 @@ def enrich_library(library_path, ch_data_path=None, dry_run=False, force=False,
     already a key in the sidecar is skipped without re-running Chorus
     lookups or chart parsing. force=True reprocesses everything (Chorus
     lookups still go through the cache, which has its own independent TTL).
-    dry_run=True computes everything but writes nothing.
+    dry_run=True never mutates the library itself (this function never does
+    that regardless), but the sidecar -- a read-only computation cache, not
+    a library mutation -- is written either way, so a dry run's work is
+    reused by the next real run instead of discarded.
 
     Returns a summary dict: songs_processed, songs_skipped, new_data_written,
     problems_found, duration_seconds.
@@ -214,8 +217,7 @@ def enrich_library(library_path, ch_data_path=None, dry_run=False, force=False,
 
     sidecar['scanned_at'] = _utcnow_iso()
 
-    if not dry_run:
-        _save_sidecar(sidecar_path, sidecar)
+    _save_sidecar(sidecar_path, sidecar)
 
     return {
         'songs_processed': songs_processed,

@@ -45,8 +45,6 @@
 
 **Status**: Complete
 
-**Status**: Not started
-
 ---
 
 ### Task 1.3: Chorus Response Cacher
@@ -145,8 +143,6 @@
 
 **Status**: Complete
 
-**Status**: Not started
-
 ---
 
 ### Task 3.2: Test Suite — Comprehensive Coverage
@@ -158,7 +154,7 @@
   - [x] CLI: `tests/test_library_enricher_cli.py` (5 tests — arg parsing, exit codes, flag pass-through)
   - [x] GUI: `tests/test_gui_enrichment_integration.py` (6 tests — checkbox gating, thread spawning, failure containment, cross-thread-widget-touch regression guard)
   - [x] Error recovery: covered per-module above (missing/corrupt files return safe defaults everywhere; sidecar write is atomic tmp+replace; a raise inside `enrich_library()` never propagates out of the GUI thread)
-- [x] Test fixtures — hand-built inline per file (matches existing project convention: `CHART_TEXT`-style module constants in `test_chart_rename.py`), not a shared fixtures module; no mock `scoredata.bin` yet since `read_scoredata()` is still a stub (real binary fixture blocked on the Task 1.2 spike)
+- [x] Test fixtures — hand-built inline per file (matches existing project convention: `CHART_TEXT`-style module constants in `test_chart_rename.py`), not a shared fixtures module. **Updated 2026-07-26**: this line originally noted no mock `scores.bin` existed since `read_scoredata()` was still a stub, pending the Task 1.2 spike — that spike is now complete (see Task 1.2 above), `read_scoredata()` is fully implemented, and `tests/test_library_scores.py` has a hand-built `scores.bin` fixture matching the confirmed real byte layout.
 - [x] Coverage report: user asked for `pytest-cov` to be installed and run (2026-07-20). **99% overall** across the five enrichment modules: `chorus_cache.py`, `library_chart_parser.py`, `library_enrichment.py`, `library_scores.py` all 100%; `library_enricher.py` 96% (the single uncovered line is the standard `if __name__ == '__main__':` guard, not exercised under pytest by design). Closed 5 real gaps this surfaced — not defensive dead code, actual untested branches: a corrupt-sidecar-JSON read, a sidecar-write-permission-failure, a non-numeric `song.ini song_length`, a chart-present-but-no-song.ini folder, a Chorus-cache disk-write failure, and two chart-parser edge cases (a `[SyncTrack]` whose first BPM event isn't at tick 0, and an all-notes-on-one-tick zero-duration NPS span). `pytest-cov` is installed in this environment only, **not added to `requirements.txt`** — it's a test-time tool, not a runtime dependency; flag if you want it persisted.
 - [x] Fix any coverage gaps found during review (the `_has_album_art` double-glob cleanup in Task 2.1 was caught this way)
 - [x] Code review (self-review at each commit; full suite re-run before every commit)
@@ -169,7 +165,7 @@
 
 ### Task 3.3: Integration Test & Real Library Validation
 - [~] Create test library with 5+ real song folders — used a **synthetic** 3-song library instead (2 complete songs with real-shaped chart/ini/stems/album-art, 1 deliberately incomplete to exercise the problems path). Not real user charts, since none were needed for what this test covers — see split below.
-- [x] CLI dry-run test — `tests/test_library_enricher_integration.py::test_full_cli_run_dry_run_leaves_no_trace`
+- [x] CLI dry-run test — `tests/test_library_enricher_integration.py::test_full_cli_run_dry_run_persists_sidecar` (renamed 2026-07-26 per `SPEC-dry-run-cache.md`; dry runs now persist the sidecar, so the assertion inverted along with the name)
   - [x] Run via `library_enricher.main()` directly (same code path as the real CLI, no subprocess needed since there's no subprocess in this design — see Task 3.1)
   - [x] Verify output: song count, fields extracted, problems detected — full sidecar shape asserted field-by-field, including solo/open-note/2x-kick feature detection firing correctly together in one real multi-instrument chart
 - [x] CLI normal run test — `test_full_cli_run_against_a_real_synthetic_library`, real file I/O, real hashing, real sidecar write, nothing mocked except the Chorus network call

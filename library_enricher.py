@@ -42,7 +42,9 @@ def parse_args(argv=None):
                          help='Path to your Clone Hero songs library folder. '
                               'Prompted for interactively if omitted.')
     parser.add_argument('--dry-run', action='store_true',
-                         help='Compute everything and print a summary without writing the sidecar.')
+                         help='Preview mode: never modifies song.ini or other library files. '
+                              'Still writes the enrichment sidecar cache (same as a normal run), '
+                              'so the work is reused next time.')
     parser.add_argument('--force', action='store_true',
                          help='Recompute every song, ignoring the incremental (unchanged) skip.')
     parser.add_argument('--ch-data', type=str, default=None,

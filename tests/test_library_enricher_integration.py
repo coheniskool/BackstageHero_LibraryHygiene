@@ -100,14 +100,14 @@ def test_full_cli_run_against_a_real_synthetic_library(tmp_path, monkeypatch, ca
     assert roboto_entry['stems'] == []
 
 
-def test_full_cli_run_dry_run_leaves_no_trace(tmp_path, monkeypatch):
+def test_full_cli_run_dry_run_persists_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(library_enrichment.chorus_cache.chorus_client,
                          'search_by_artist_title', lambda artist, title: None)
     _build_test_library(tmp_path)
 
     exit_code = library_enricher.main(['--library-path', str(tmp_path), '--ch-data', '', '--dry-run'])
     assert exit_code == 0
-    assert not (tmp_path / library_enrichment.SIDECAR_FILENAME).exists()
+    assert (tmp_path / library_enrichment.SIDECAR_FILENAME).exists()
 
 
 def test_second_run_is_incremental_third_run_with_force_reprocesses(tmp_path, monkeypatch, capsys):
