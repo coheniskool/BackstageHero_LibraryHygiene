@@ -45,6 +45,8 @@ from VideoDownload import (
     DEFAULT_START_TIME, get_stored_source, NO_WINDOW,
     SONG_DELAY_MIN, SONG_DELAY_MAX, probe_resolution, scan_song,
     SYNC_MANUAL, dump_video, get_rejected_sources, classify_candidate_title,
+    configure_cookies,
+    next_resume_at, get_active_schedule, record_throttle_episode,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
@@ -143,6 +145,62 @@ def _save_settings(data):
     try:
         with open(_SETTINGS_FILE, 'w', encoding='utf-8') as f:
             _json.dump(data, f)
+    except Exception:
+        pass
+
+
+# background_state.json holds structured, frequently-rewritten background-mode
+# run state -- kept separate from settings.json (flat, rarely-written UI
+# preferences loaded once at startup). Schema (a plain dict; no dataclass, since
+# no controller consumes this yet and every helper below already speaks plain
+# dicts):
+#   phase             'downloading' | 'library_tools' | 'done'
+#   resume_at         unix timestamp (float/int) the next retry is scheduled
+#                     for, or None if no backoff is pending
+#   throttle_count    int, consecutive long-backoff throttles this run
+#   songs_folder      str, the library path this run is targeting
+#   quality           str, the quality setting the run started with
+#   replace           bool
+#   resync            bool
+#   remaining_folders list[str], folders not yet processed
+#   tool_dry_run      dict[str, bool], each Library Tool's key (e.g.
+#                     'fix_chart_names') -> its Dry run checkbox state at the
+#                     moment background mode started, so a later controller
+#                     with no live dialog to read from still knows each tool's
+#                     preference.
+_BACKGROUND_STATE_FILE = os.path.join(updater.data_dir(), 'background_state.json')
+
+
+def _load_background_state():
+    try:
+        with open(_BACKGROUND_STATE_FILE, encoding='utf-8') as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_background_state(state):
+    """Atomic write (temp file + os.replace), unlike _save_settings's plain
+    open().write(). background_state.json is rewritten far more often, over a
+    run that may span days and survive app/machine restarts -- a crash or
+    forced-close mid-write must leave the previous valid state file intact,
+    never a half-written one a resume would trust blindly."""
+    try:
+        tmp_path = _BACKGROUND_STATE_FILE + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            _json.dump(state, f)
+        os.replace(tmp_path, _BACKGROUND_STATE_FILE)
+    except Exception:
+        pass
+
+
+def _clear_background_state():
+    """Removes background_state.json entirely (rather than resetting it to an
+    empty dict on disk) once a run reaches 'done' -- so a startup resume check
+    (_load_background_state() returning {}) can't be told apart from "never
+    ran", which is exactly the behavior a finished run should have."""
+    try:
+        os.remove(_BACKGROUND_STATE_FILE)
     except Exception:
         pass
 
@@ -932,6 +990,90 @@ _LIBRARY_TOOLS = (
      'alongside your library instead. Nothing is deleted.'),
 )
 
+# Dependency order for "Run all tools": each step's OUTPUT is another step's
+# INPUT, so running out of order means a tool sees stale state instead of the
+# best data the others can give it.
+#
+#   1. migrate_review_folders -- gets any old misplaced review folders out of
+#      the library root before anything below walks the tree.
+#   2. fix_chart_names        -- dedupe_report.is_keeper_eligible() requires
+#      chart_rename_status == 'confirmed_ok'; nothing scanned before this
+#      runs is eligible to be picked as a dedupe keeper.
+#   3. repair_videos / find_static_art -- finalize which videos are actually
+#      present and playable (bad-codec removal, static-art-to-image
+#      conversion) before dedupe scores has_video on them.
+#   4. enrich_metadata        -- fills the year/genre/charter/album fields
+#      dedupe's metadata_completeness scoring reads.
+#   5. find_duplicates        -- last, so its keeper-selection scoring sees
+#      the finished state of everything above instead of a half-repaired one.
+_RUN_ALL_ORDER = (
+    'migrate_review_folders', 'fix_chart_names', 'repair_videos',
+    'find_static_art', 'enrich_metadata', 'find_duplicates',
+)
+
+
+def _run_library_tool(songs_folder, key, dry_run):
+    """Dispatch one tool's library-wide scan by key. Raises on failure --
+    callers each decide how to handle that.
+
+    Module-level (not a LibraryToolsDialog method) so a background-mode
+    controller can call this directly, with no dialog window ever open --
+    LibraryToolsDialog._run_tool_scan is now a thin wrapper around this that
+    just supplies self._songs_folder."""
+    if key == 'repair_videos':
+        return video_repair.scan_and_repair_video_library(songs_folder, dry_run=dry_run)
+    elif key == 'fix_chart_names':
+        return chart_rename.scan_and_fix_chart_library(songs_folder, dry_run=dry_run)
+    elif key == 'enrich_metadata':
+        return metadata_enrichment.enrich_song_ini_metadata_library(songs_folder, dry_run=dry_run)
+    elif key == 'find_duplicates':
+        return dedupe_report.generate_dedupe_report(songs_folder, dry_run=dry_run)
+    elif key == 'find_static_art':
+        return static_art.scan_and_convert_static_art_library(songs_folder, dry_run=dry_run)
+    elif key == 'migrate_review_folders':
+        return library_common.migrate_legacy_review_folders(songs_folder, dry_run=dry_run)
+    return {}
+
+
+def _format_tool_summary(key, counts, dry_run):
+    """Module-level twin of _run_library_tool -- see that function's
+    docstring. LibraryToolsDialog._format_summary is now a thin wrapper."""
+    suffix = ' (dry run)' if dry_run else ''
+    if key == 'repair_videos':
+        body = (f"{counts.get('ok', 0)} ok, {counts.get('reencoded_cfr', 0)} re-encoded, "
+                f"{counts.get('removed_unsupported_codec', 0)} removed, "
+                f"{counts.get('reencode_failed', 0)} failed")
+    elif key == 'fix_chart_names':
+        body = (f"{counts.get('confirmed_ok', 0)} confirmed, "
+                f"{counts.get('needs_review', 0)} need review, "
+                f"{counts.get('skipped_settled', 0)} already settled")
+    elif key == 'enrich_metadata':
+        body = (f"{counts.get('filled', 0)} filled, {counts.get('no_change', 0)} no change, "
+                f"{counts.get('no_match', 0)} no match, {counts.get('error', 0)} error(s)")
+    elif key == 'find_duplicates':
+        body = (f"{counts.get('resolved', 0)} resolved, "
+                f"{counts.get('skipped_all_ineligible', 0)} unscanned, "
+                f"{counts.get('skipped_not_confirmed', 0)} unconfirmed")
+    elif key == 'find_static_art':
+        body = (f"{counts.get('converted', 0)} converted, "
+                f"{counts.get('near_static', 0)} near-static (reported), "
+                f"{counts.get('ok', 0)} real videos left alone")
+    elif key == 'migrate_review_folders':
+        if not counts:
+            body = 'nothing to migrate - no old review folders inside your library'
+        else:
+            # past tense on a dry run would read as if files had moved
+            moved = counts.get('would_move', 0) if dry_run else counts.get('moved', 0)
+            body = (f"{moved} folder(s) would move out" if dry_run
+                    else f"{moved} folder(s) moved out")
+            if counts.get('conflict'):
+                body += f", {counts['conflict']} already existed (left in place)"
+            if counts.get('failed'):
+                body += f", {counts['failed']} failed (details in log)"
+    else:
+        body = str(counts)
+    return body + suffix
+
 
 class LibraryToolsDialog(ctk.CTkToplevel):
     """Library-wide hygiene scans: video repair, chart-name fixes, metadata
@@ -944,7 +1086,8 @@ class LibraryToolsDialog(ctk.CTkToplevel):
     same per-folder chart_rename_status, so overlapping runs could race.
     """
 
-    def __init__(self, parent, songs_folder, on_close=None, on_run_state=None):
+    def __init__(self, parent, songs_folder, on_close=None, on_run_state=None,
+                 dry_run_prefs=None, on_dry_run_change=None):
         super().__init__(parent)
         self._songs_folder = songs_folder
         self._on_close = on_close
@@ -954,6 +1097,13 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         # button to offer, and killing a scan mid-rename would be worse than
         # letting it finish).
         self._on_run_state = on_run_state
+        # Per-tool dry-run checkbox state, persisted by the caller (App) so
+        # an unattended background run started without this dialog open can
+        # still know what the user last chose per tool. Both optional and
+        # additive -- omitting them keeps every tool defaulting to dry-run
+        # True with no persistence, exactly as before this was added.
+        self._dry_run_prefs = dry_run_prefs if dry_run_prefs is not None else {}
+        self._on_dry_run_change = on_dry_run_change
         self._running_key = None
         self._dry_run_vars = {}
         self._status_labels = {}
@@ -977,7 +1127,7 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         self.after(50, self._center)
 
     def _build(self):
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
         header = ctk.CTkFrame(self, fg_color='transparent')
@@ -992,11 +1142,45 @@ class LibraryToolsDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
             wraplength=530, justify='left').pack(padx=20, anchor='w')
 
+        run_all_card = ctk.CTkFrame(self, fg_color='#1c2e4a', corner_radius=10,
+                                    border_width=1, border_color=_BLUE)
+        run_all_card.grid(row=1, column=0, sticky='ew', padx=12, pady=(12, 0))
+        rtop = ctk.CTkFrame(run_all_card, fg_color='transparent')
+        rtop.pack(fill='x', padx=16, pady=(12, 2))
+        ctk.CTkLabel(rtop, text='Run all tools', font=ctk.CTkFont(size=13, weight='bold'),
+                     text_color=_TEXT).pack(side='left')
+        ctk.CTkLabel(
+            run_all_card,
+            text="Runs every tool below once, in the order each one benefits most "
+                 "from the last: old review folders moved out, chart names fixed, "
+                 "videos repaired and static-art converted, metadata filled in, then "
+                 "duplicates found last so its scoring sees the finished result of "
+                 "everything before it. Uses each tool's own Dry run checkbox below.",
+            font=ctk.CTkFont(size=10), text_color=_SUBTEXT, wraplength=480,
+            justify='left', anchor='w').pack(fill='x', padx=16, anchor='w')
+        rrow = ctk.CTkFrame(run_all_card, fg_color='transparent')
+        rrow.pack(fill='x', padx=16, pady=(10, 12))
+        self._run_all_status_lbl = ctk.CTkLabel(
+            rrow, text='Ready', font=ctk.CTkFont(size=10),
+            text_color=_SUBTEXT, anchor='w')
+        self._run_all_status_lbl.pack(side='left', fill='x', expand=True)
+        self._run_all_btn = ctk.CTkButton(
+            rrow, text='Run all', width=90, height=28,
+            font=ctk.CTkFont(size=11, weight='bold'),
+            fg_color=_BLUE, hover_color='#7aaef8', text_color='#11111b',
+            command=self._run_all)
+        self._run_all_btn.pack(side='right')
+        # Shares the same disable/enable cycle as the per-tool buttons below
+        # (_run_tool/_finish iterate self._run_buttons.values()), so a single
+        # Run-all pass locks every button, including its own, exactly like a
+        # single tool run does.
+        self._run_buttons['__run_all__'] = self._run_all_btn
+
         # Scrollable so the window can be resized smaller (or run at a
         # higher OS text-scaling setting) without any card's content or the
         # Close button getting clipped off-screen.
         scroll = ctk.CTkScrollableFrame(self, fg_color='transparent')
-        scroll.grid(row=1, column=0, sticky='nsew', padx=8, pady=(8, 0))
+        scroll.grid(row=2, column=0, sticky='nsew', padx=8, pady=(8, 0))
 
         for key, label, desc in _LIBRARY_TOOLS:
             card = ctk.CTkFrame(scroll, fg_color='#252540', corner_radius=10)
@@ -1007,13 +1191,15 @@ class LibraryToolsDialog(ctk.CTkToplevel):
             ctk.CTkLabel(top, text=label, font=ctk.CTkFont(size=13, weight='bold'),
                          text_color=_TEXT).pack(side='left')
 
-            dry_var = tk.BooleanVar(value=True)
+            dry_var = tk.BooleanVar(value=self._dry_run_prefs.get(key, True))
             self._dry_run_vars[key] = dry_var
             ctk.CTkCheckBox(top, text='Dry run', variable=dry_var,
                             font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
                             checkbox_width=16, checkbox_height=16,
                             checkmark_color=_BG, fg_color=_BLUE,
-                            hover_color='#7aaef8').pack(side='right')
+                            hover_color='#7aaef8',
+                            command=lambda k=key: self._on_dry_toggle(k)
+                            ).pack(side='right')
 
             ctk.CTkLabel(card, text=desc, font=ctk.CTkFont(size=10),
                          text_color=_SUBTEXT, wraplength=480, justify='left',
@@ -1037,7 +1223,14 @@ class LibraryToolsDialog(ctk.CTkToplevel):
                       fg_color='transparent', border_width=1,
                       border_color=_BORDER, hover_color='#30304a',
                       text_color=_SUBTEXT, font=ctk.CTkFont(size=12),
-                      command=self._close).grid(row=2, column=0, pady=18)
+                      command=self._close).grid(row=3, column=0, pady=18)
+
+    def _on_dry_toggle(self, key):
+        """Checkbox command for a tool's Dry run box. No-op when the dialog
+        was constructed without on_dry_run_change (e.g. existing tests that
+        build LibraryToolsDialog with only the original params)."""
+        if self._on_dry_run_change is not None:
+            self._on_dry_run_change(key, self._dry_run_vars[key].get())
 
     def _run_tool(self, key):
         if self._running_key is not None:
@@ -1067,22 +1260,17 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         except Exception:
             log.exception('Failed to report library-tool run state (running=%s)', running)
 
+    def _run_tool_scan(self, key, dry_run):
+        """Dispatch one tool's library-wide scan by key. Raises on failure --
+        callers (_worker for a single tool, _run_all_worker for the combined
+        run) each decide how to handle that. Thin wrapper around the
+        module-level _run_library_tool (see its docstring for why this is
+        split out) supplying this dialog's own songs folder."""
+        return _run_library_tool(self._songs_folder, key, dry_run)
+
     def _worker(self, key, dry_run):
         try:
-            if key == 'repair_videos':
-                counts = video_repair.scan_and_repair_video_library(self._songs_folder, dry_run=dry_run)
-            elif key == 'fix_chart_names':
-                counts = chart_rename.scan_and_fix_chart_library(self._songs_folder, dry_run=dry_run)
-            elif key == 'enrich_metadata':
-                counts = metadata_enrichment.enrich_song_ini_metadata_library(self._songs_folder, dry_run=dry_run)
-            elif key == 'find_duplicates':
-                counts = dedupe_report.generate_dedupe_report(self._songs_folder, dry_run=dry_run)
-            elif key == 'find_static_art':
-                counts = static_art.scan_and_convert_static_art_library(self._songs_folder, dry_run=dry_run)
-            elif key == 'migrate_review_folders':
-                counts = library_common.migrate_legacy_review_folders(self._songs_folder, dry_run=dry_run)
-            else:
-                counts = {}
+            counts = self._run_tool_scan(key, dry_run)
             text = self._format_summary(key, counts, dry_run)
             color = _GREEN
         except Exception as e:
@@ -1101,43 +1289,74 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
+    def _run_all(self):
+        if self._running_key is not None:
+            return
+        self._running_key = 'run_all'
+        # "previewing" only if every step in the sequence is dry-run; a
+        # single live step means real files change, so the close-confirm
+        # wording should say so rather than undersell it.
+        self._dry_run_of_current = all(
+            self._dry_run_vars[k].get() for k in _RUN_ALL_ORDER)
+        self._notify_run_state(True)
+        for btn in self._run_buttons.values():
+            btn.configure(state='disabled')
+        self._run_all_status_lbl.configure(text='Running...', text_color=_BLUE)
+        threading.Thread(target=self._run_all_worker, daemon=True).start()
+
+    def _run_all_worker(self):
+        """Runs every tool in _RUN_ALL_ORDER, each with its own current Dry
+        run checkbox. One tool's failure is logged and shown on its own card
+        -- never abort the rest of the sequence over it, same "don't lose the
+        batch to one bad step" rule the other library scans already follow."""
+        ok = 0
+        failed = 0
+        for key in _RUN_ALL_ORDER:
+            dry_run = self._dry_run_vars[key].get()
+            try:
+                self.after(0, lambda k=key: self._status_labels[k].configure(
+                    text='Running...', text_color=_BLUE))
+            except Exception:
+                pass
+            try:
+                counts = self._run_tool_scan(key, dry_run)
+                text = self._format_summary(key, counts, dry_run)
+                color = _GREEN
+                ok += 1
+            except Exception as e:
+                log.exception('Library tool %s failed during Run all', key)
+                text = f'Error: {e}'
+                color = _RED
+                failed += 1
+            try:
+                self.after(0, lambda k=key, t=text, c=color:
+                           self._status_labels[k].configure(text=t, text_color=c))
+            except Exception:
+                pass
+
+        summary = f'{ok}/{len(_RUN_ALL_ORDER)} tools completed'
+        if failed:
+            summary += f', {failed} failed'
+        self._notify_run_state(False)
+        try:
+            self.after(0, lambda: self._finish_run_all(
+                summary, _RED if failed else _GREEN))
+        except Exception:
+            pass
+
+    def _finish_run_all(self, text, color):
+        self._running_key = None
+        if not self.winfo_exists():
+            return
+        for btn in self._run_buttons.values():
+            btn.configure(state='normal')
+        self._run_all_status_lbl.configure(text=text, text_color=color)
+
     @staticmethod
     def _format_summary(key, counts, dry_run):
-        suffix = ' (dry run)' if dry_run else ''
-        if key == 'repair_videos':
-            body = (f"{counts.get('ok', 0)} ok, {counts.get('reencoded_cfr', 0)} re-encoded, "
-                    f"{counts.get('removed_unsupported_codec', 0)} removed, "
-                    f"{counts.get('reencode_failed', 0)} failed")
-        elif key == 'fix_chart_names':
-            body = (f"{counts.get('confirmed_ok', 0)} confirmed, "
-                    f"{counts.get('needs_review', 0)} need review, "
-                    f"{counts.get('skipped_settled', 0)} already settled")
-        elif key == 'enrich_metadata':
-            body = (f"{counts.get('filled', 0)} filled, {counts.get('no_change', 0)} no change, "
-                    f"{counts.get('no_match', 0)} no match, {counts.get('error', 0)} error(s)")
-        elif key == 'find_duplicates':
-            body = (f"{counts.get('resolved', 0)} resolved, "
-                    f"{counts.get('skipped_all_ineligible', 0)} unscanned, "
-                    f"{counts.get('skipped_not_confirmed', 0)} unconfirmed")
-        elif key == 'find_static_art':
-            body = (f"{counts.get('converted', 0)} converted, "
-                    f"{counts.get('near_static', 0)} near-static (reported), "
-                    f"{counts.get('ok', 0)} real videos left alone")
-        elif key == 'migrate_review_folders':
-            if not counts:
-                body = 'nothing to migrate - no old review folders inside your library'
-            else:
-                # past tense on a dry run would read as if files had moved
-                moved = counts.get('would_move', 0) if dry_run else counts.get('moved', 0)
-                body = (f"{moved} folder(s) would move out" if dry_run
-                        else f"{moved} folder(s) moved out")
-                if counts.get('conflict'):
-                    body += f", {counts['conflict']} already existed (left in place)"
-                if counts.get('failed'):
-                    body += f", {counts['failed']} failed (details in log)"
-        else:
-            body = str(counts)
-        return body + suffix
+        """Thin wrapper around the module-level _format_tool_summary (see its
+        docstring for why this is split out)."""
+        return _format_tool_summary(key, counts, dry_run)
 
     def _finish(self, key, text, color):
         self._running_key = None
@@ -1153,8 +1372,11 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         # modal grab silently -- leaving the user free to press Start and race
         # a download against a scan still mutating the same folders.
         if self._running_key is not None:
-            tool = next((label for k, label, _ in _LIBRARY_TOOLS
-                         if k == self._running_key), self._running_key)
+            if self._running_key == 'run_all':
+                tool = 'Run all tools'
+            else:
+                tool = next((label for k, label, _ in _LIBRARY_TOOLS
+                             if k == self._running_key), self._running_key)
             verb = 'previewing' if getattr(self, '_dry_run_of_current', True) else 'changing files in'
             if not messagebox.askokcancel(
                     'Scan still running',
@@ -1206,6 +1428,16 @@ class App(ctk.CTk):
         self._filter_mode : str  = 'missing'
         self._running     : bool = False
         self._resync_run  : bool = False   # is the active run Auto-sync, not download?
+        # Is the active run an unattended background run? Set by _launch_background,
+        # cleared when the background run ends. Read only as an in-memory "a
+        # background run is active" indicator (the durable record is
+        # background_state.json). A future GUI toggle (Task 12) reads it too.
+        self._background_mode: bool = False
+        # Fires _maybe_resume_background() exactly once, on the first
+        # _on_library_scanned after this app process starts -- later rescans in
+        # the same session (e.g. LibraryToolsDialog's post-run re-scan) must NOT
+        # re-trigger a resume check. See _on_library_scanned/_maybe_resume_background.
+        self._pending_background_resume_check: bool = True
         # A Library Tools worker can outlive its dialog, so this tracks the
         # THREAD, not the window. Without it, closing that dialog mid-scan
         # freed the user to start a download into the same folders a rename
@@ -1219,6 +1451,15 @@ class App(ctk.CTk):
         self._search_after = None        # debounce handle for the search box
         self._settings    = _load_settings()
         resolver_client.set_sharing(self._settings.get('share_matches', True))
+        # Push the persisted cookie-support setting into VideoDownload's
+        # module state once at startup -- see _on_cookies_toggle/
+        # _on_cookie_browser_change for the "changes take effect without a
+        # restart" half of this. configure_cookies() is never called with
+        # this omitted, but VideoDownload's own module-level defaults
+        # (False/None) already match this default, so behavior is identical
+        # even if this call were skipped.
+        configure_cookies(self._settings.get('use_browser_cookies', False),
+                          self._settings.get('cookie_browser', 'chrome'))
         self._sync_ready  : bool = (
             ffmpegAvailable and audiosync is not None
             and audiosync.is_available())
@@ -1452,9 +1693,47 @@ class App(ctk.CTk):
                 'enrich_after_scan', bool(self._enrich_var.get())))
         enrich_cb.grid(row=0, column=7, padx=(12, 4), pady=15)
 
+        # Opt-in browser-cookie support for yt-dlp (off by default). Reduces
+        # bot-detection frequency per SPEC-background-mode.md; the browser's
+        # cookie store is read by yt-dlp itself -- no cookie value is ever
+        # handled here, only the browser name string.
+        self._cookies_var = tk.BooleanVar(
+            value=self._settings.get('use_browser_cookies', False))
+        cookies_cb = ctk.CTkCheckBox(
+            foot, text='Use browser cookies', variable=self._cookies_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18,
+            command=self._on_cookies_toggle)
+        cookies_cb.grid(row=0, column=8, padx=(12, 4), pady=15)
+
+        self._cookie_browser_var = tk.StringVar(
+            value=self._settings.get('cookie_browser', 'chrome'))
+        ctk.CTkOptionMenu(
+            foot, variable=self._cookie_browser_var,
+            values=['chrome', 'firefox', 'edge'], width=100, height=34,
+            command=self._on_cookie_browser_change,
+            font=_font).grid(row=0, column=9, padx=4, pady=15)
+
+        # Unattended background-mode toggle (Task 12). Deliberately not
+        # persisted to settings.json -- a multi-day unattended run should
+        # require the user to explicitly re-arm it each time, not silently
+        # resume from a stale "left it checked" state. Read at Start-click
+        # time in _start_download, not on toggle.
+        self._background_var = tk.BooleanVar(value=False)
+        background_cb = ctk.CTkCheckBox(
+            foot, text='Run in background', variable=self._background_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18)
+        background_cb.grid(row=0, column=10, padx=(12, 4), pady=15)
+
         # Progress + status (right side of footer)
         prog_frame = ctk.CTkFrame(foot, fg_color='transparent')
-        prog_frame.grid(row=0, column=8, padx=(8, 16), pady=15, sticky='e')
+        prog_frame.grid(row=0, column=11, padx=(8, 16), pady=15, sticky='e')
+
+        self._background_badge_lbl = ctk.CTkLabel(
+            prog_frame, text='', font=ctk.CTkFont(size=10, weight='bold'),
+            text_color=_BLUE, anchor='e', width=190)
+        self._background_badge_lbl.pack()
 
         self._progress = ctk.CTkProgressBar(prog_frame, width=190, height=8,
                                              corner_radius=4)
@@ -1473,10 +1752,38 @@ class App(ctk.CTk):
         self._settings[key] = value
         _save_settings(self._settings)
 
+    def _tool_dry_run_prefs(self):
+        """Per-tool dry-run checkbox state, persisted across LibraryToolsDialog
+        sessions (and readable without one being open, e.g. by
+        _launch_background). Defaults every tool to dry-run True when never
+        explicitly set -- matches this codebase's existing safety
+        convention."""
+        saved = self._settings.get('library_tool_dry_run', {})
+        return {key: saved.get(key, True) for key, _, _ in _LIBRARY_TOOLS}
+
+    def _on_tool_dry_run_change(self, key, value):
+        prefs = dict(self._settings.get('library_tool_dry_run', {}))
+        prefs[key] = value
+        self._persist_setting('library_tool_dry_run', prefs)
+
     def _on_share_toggle(self):
         on = bool(self._share_var.get())
         resolver_client.set_sharing(on)
         self._persist_setting('share_matches', on)
+
+    def _on_cookies_toggle(self):
+        self._persist_setting('use_browser_cookies', bool(self._cookies_var.get()))
+        self._push_cookie_config()
+
+    def _on_cookie_browser_change(self, *_):
+        self._persist_setting('cookie_browser', self._cookie_browser_var.get())
+        self._push_cookie_config()
+
+    def _push_cookie_config(self):
+        """Re-push the current toggle/dropdown state into VideoDownload so a
+        change takes effect on the next download without an app restart."""
+        configure_cookies(bool(self._cookies_var.get()),
+                          self._cookie_browser_var.get())
 
     def _maybe_start_enrichment(self):
         """Runs library_enrichment.enrich_library() in a background thread
@@ -1608,6 +1915,9 @@ class App(ctk.CTk):
 
     def _on_library_scanned(self, songs):
         self._songs = songs
+        if self._pending_background_resume_check:
+            self._pending_background_resume_check = False
+            self._maybe_resume_background()
         self._apply_filter()
         n = len(songs)
         unprobed = [s for s in songs if s.has_video and s.res == '...']
@@ -1926,7 +2236,9 @@ class App(ctk.CTk):
             return
         LibraryToolsDialog(self, self._songs_folder,
                             on_close=lambda: self._load_library(self._songs_folder),
-                            on_run_state=self._set_tool_running)
+                            on_run_state=self._set_tool_running,
+                            dry_run_prefs=self._tool_dry_run_prefs(),
+                            on_dry_run_change=self._on_tool_dry_run_change)
 
     def _set_tool_running(self, running):
         """Called FROM THE WORKER THREAD when a Library Tools scan starts/stops.
@@ -1951,6 +2263,24 @@ class App(ctk.CTk):
             # tree. Covers the case where the dialog was closed mid-run and its
             # own on_close reload was deliberately skipped for that reason.
             self._load_library(self._songs_folder)
+
+    def _set_background_mode(self, active):
+        """Single choke point for self._background_mode -- keeps the footer's
+        background-run badge in sync with it everywhere it changes, instead of
+        duplicating the badge update at each of the 6 call sites that toggle
+        this flag. Guards on the badge existing: _build_ui always creates it
+        before any of these call sites can run in the real app, but several
+        pre-existing bare-instance tests construct App via object.__new__
+        without a full _build_ui and don't stub this particular label. Looked
+        up via __dict__ rather than getattr(..., default) -- ctk.CTk/tk.Tk's
+        own __getattr__ recurses into itself (chasing a likewise-missing
+        self.tk) on such an uninitialized instance, which getattr's default
+        does not protect against since it's a RecursionError, not
+        AttributeError."""
+        self._background_mode = active
+        badge = self.__dict__.get('_background_badge_lbl')
+        if badge is not None:
+            badge.configure(text='● Background' if active else '')
 
     def _update_buttons(self):
         checked    = [s for s in self._songs if s.checked]
@@ -2011,7 +2341,10 @@ class App(ctk.CTk):
 
         if not self._confirm_batch(work, 'download'):
             return
-        self._launch(work, replace=replace, resync=False)
+        if self._background_var.get():
+            self._launch_background(work, replace=replace, resync=False)
+        else:
+            self._launch(work, replace=replace, resync=False)
 
     def _start_resync(self):
         if self._running:
@@ -2057,7 +2390,63 @@ class App(ctk.CTk):
             args=(targets, quality, replace, resync),
             daemon=True).start()
 
-    def _dl_thread(self, targets, quality, replace, resync):
+    def _launch_background(self, targets, replace, resync):
+        """Start an unattended background run: the same per-song download loop
+        as _launch, but a YouTube throttle triggers a long, escalating backoff
+        and an automatic resume instead of ending the run, and true completion
+        hands off to a single Library Tools pass.
+
+        Mirrors _launch (validation, _running/_stop_evt/progress setup, pending
+        row marking) but additionally captures the initial background_state.json
+        snapshot -- phase, target list, and each Library Tool's dry-run
+        preference -- before the worker starts, so the state survives a restart
+        from the very first moment. Wired to the "Run in background" checkbox
+        in the footer via _start_download.
+        """
+        if self._running or not targets:
+            return
+        quality = quality_format(1080 if self._quality_var.get() == '1080p' else 720)
+
+        self._running = True
+        self._set_background_mode(True)
+        self._resync_run = resync
+        self._stop_evt.clear()
+        self._progress.set(0)
+        self._update_buttons()
+
+        for s in targets:
+            s.status = '○  Pending'
+            s.stag   = 'dim'
+            self._update_row(s)
+
+        # Persist the run's identity up front. tool_dry_run reads each tool's
+        # persisted dry-run preference (_tool_dry_run_prefs), defaulting to
+        # dry-run True for any tool the user never explicitly toggled in the
+        # Library Tools dialog -- matches this codebase's
+        # test_dry_run_defaults_on_for_every_tool safety convention. The
+        # download loop rewrites only the volatile fields (resume_at,
+        # throttle_count, remaining_folders, phase) from here on.
+        _save_background_state({
+            'phase': 'downloading',
+            'resume_at': None,
+            'throttle_count': 0,
+            'songs_folder': self._songs_folder,
+            'quality': self._quality_var.get(),
+            'replace': replace,
+            'resync': resync,
+            'remaining_folders': [s.folder for s in targets],
+            'tool_dry_run': self._tool_dry_run_prefs(),
+        })
+        log.info('Background mode started: %d target(s), replace=%s, resync=%s',
+                 len(targets), replace, resync)
+
+        threading.Thread(
+            target=self._dl_thread,
+            args=(targets, quality, replace, resync),
+            kwargs={'background_mode': True},
+            daemon=True).start()
+
+    def _dl_thread(self, targets, quality, replace, resync, background_mode=False):
         total = len(targets)
         done = skipped = errors = 0
         # adaptive pacing: pause between songs that hit YouTube, scaled by how
@@ -2067,7 +2456,21 @@ class App(ctk.CTk):
         pace = 1.0
         clean_streak = 0
         prev_hit_network = False
-        for i, s in enumerate(targets):
+        # Background-mode-only long-backoff bookkeeping. Untouched (and never
+        # read) on the default non-background path, whose behavior must stay
+        # byte-identical. throttle_count is the escalation depth WITHIN the
+        # current throttle episode (0-indexed, feeds next_resume_at);
+        # episode_started_at marks the first 'stop' of the current episode, or
+        # None when not mid-episode -- record_throttle_episode needs that start
+        # time when the episode finally resolves.
+        throttle_count = 0
+        episode_started_at = None
+        # A while loop (not `for i, s in enumerate`) so background mode can retry
+        # the SAME song after a long backoff (a bare `continue` without advancing
+        # i) rather than skipping past the song that got throttled.
+        i = 0
+        while i < total:
+            s = targets[i]
             if self._stop_evt.is_set():
                 self._queue.put(('stopped', i, total, done, skipped, errors))
                 return
@@ -2099,8 +2502,26 @@ class App(ctk.CTk):
                     clean_streak = 0
 
             if result == 'stop':
-                self._queue.put(('rate_limited', s, i, total))
-                return
+                if not background_mode:
+                    # Default (non-background) behavior, unchanged: the short
+                    # per-song retry is exhausted, so end the run and warn.
+                    self._queue.put(('rate_limited', s, i, total))
+                    return
+                # Background mode: long escalating backoff instead of giving up.
+                # Extracted to keep this loop readable; the helper does the
+                # persist-then-wait and returns updated escalation bookkeeping.
+                throttle_count, episode_started_at, stopped = \
+                    self._handle_background_throttle(
+                        s, i, total, targets, throttle_count,
+                        episode_started_at, done, skipped, errors)
+                if stopped:
+                    # Manual Stop fired mid-wait; background_stopped already
+                    # posted. End the run, leaving background_state.json intact.
+                    return
+                # Wait elapsed without cancellation: retry the SAME song. Do not
+                # advance i and do not record the episode yet -- the episode is
+                # only "resolved" once the song actually succeeds below.
+                continue
             if result == 'stopped':
                 self._queue.put(('stopped', i, total, done, skipped, errors))
                 return
@@ -2120,7 +2541,273 @@ class App(ctk.CTk):
                         s.res = stored
                 self._queue.put(('song_done', s, i, total))
 
-        self._queue.put(('finished', total, done, skipped, errors))
+            # Reaching any non-throttle outcome for a song that had been
+            # throttled means the block lifted: the episode is resolved. The
+            # helper records it (and resets the escalation) when there was one
+            # in progress, and is a no-op otherwise.
+            if background_mode:
+                episode_started_at, throttle_count = \
+                    self._resolve_background_episode(
+                        episode_started_at, throttle_count)
+
+            i += 1
+
+        if not background_mode:
+            self._queue.put(('finished', total, done, skipped, errors))
+            return
+
+        # Background mode, download phase truly complete: every target reached a
+        # non-throttle outcome and no resume_at is pending (a throttle would have
+        # `continue`d, a Stop would have returned). Hand off to a single Library
+        # Tools pass, then mark the whole run done.
+        self._run_background_library_tools(done, skipped, errors)
+
+    def _handle_background_throttle(self, s, i, total, targets, throttle_count,
+                                    episode_started_at, done, skipped, errors):
+        """Background-mode-only: called when a song returns 'stop'. Computes the
+        long-backoff resume_at, persists state (before waiting -- a crash during
+        the wait must not lose resume_at or which songs are still to do), posts
+        the background_throttled queue message, then waits cancellably.
+
+        Returns (throttle_count, episode_started_at, stopped). The caller must
+        `return` from _dl_thread if stopped is True (a manual Stop fired mid-wait
+        -- background_stopped was already posted), otherwise `continue` the outer
+        while loop WITHOUT advancing i, so the same song is retried."""
+        now = time.time()
+        if episode_started_at is None:
+            episode_started_at = now
+        resume_at = next_resume_at(
+            throttle_count, now, schedule=get_active_schedule())
+        throttle_count += 1
+        # Persist BEFORE waiting (spec: a crash during the wait must not lose
+        # resume_at or which songs are still to do). Preserve the launch-captured
+        # identity (songs_folder/quality/replace/resync/tool_dry_run); only the
+        # volatile fields change here.
+        state = _load_background_state()
+        state.update({
+            'phase': 'downloading',
+            'resume_at': resume_at,
+            'throttle_count': throttle_count,
+            'remaining_folders': [t.folder for t in targets[i:]],
+        })
+        _save_background_state(state)
+        self._queue.put(('background_throttled', s, i, total, resume_at))
+        log.info('Background mode: throttled on %s; resuming at unix %s '
+                 '(escalation step %d)', s.label, resume_at, throttle_count - 1)
+        # Cancellable wait -- a manual Stop must still work mid-backoff.
+        if self._stop_evt.wait(max(0, resume_at - now)):
+            # Stopped during the long wait. End the background run cleanly but
+            # LEAVE background_state.json in place: it holds a valid resume_at
+            # and remaining_folders, so a deliberate Stop is intentionally
+            # indistinguishable from an interrupted run for a hypothetical
+            # future resume-on-launch (Task 13) -- both are simply "an
+            # unfinished background run". Only reaching 'done' clears the state.
+            log.info('Background mode: stopped by user during backoff wait')
+            self._queue.put(('background_stopped', i, total,
+                             done, skipped, errors))
+            return throttle_count, episode_started_at, True
+        return throttle_count, episode_started_at, False
+
+    def _resolve_background_episode(self, episode_started_at, throttle_count):
+        """Background-mode-only: called after any non-throttle song outcome. If a
+        throttle episode was in progress (episode_started_at is not None), the
+        block has lifted -- record it (triggering the adaptive schedule recompute
+        inside record_throttle_episode) and reset the escalation bookkeeping.
+        Safe to call unconditionally when background_mode is True: a no-op
+        (returns the inputs unchanged) if there was nothing to resolve.
+
+        Returns (episode_started_at, throttle_count), always (None, 0) when an
+        episode actually resolved. escalation_steps_used is the 0-indexed step
+        the block finally cleared on (throttle_count - 1)."""
+        if episode_started_at is None:
+            return episode_started_at, throttle_count
+        # Deliberately NOT schedule=get_active_schedule() -- see
+        # maybe_recompute_schedule's docstring. Passing the already-adapted
+        # schedule back in here would compound every recompute cycle instead
+        # of independently re-deriving from the fixed default (the
+        # /review-found Critical bug: a stable signal still collapsed the
+        # schedule to the crash-prevention floor within ~7 cycles). This must
+        # always use record_throttle_episode's own LONG_BACKOFF_SECONDS
+        # default. (next_resume_at's schedule=get_active_schedule() in
+        # _handle_background_throttle above is correct and different --
+        # waiting must use the live/adapted schedule; only the recompute-
+        # feeding call must not.)
+        record_throttle_episode(
+            episode_started_at, time.time(), throttle_count - 1)
+        log.info('Background mode: throttle episode resolved after %d '
+                 'escalation step(s)', throttle_count - 1)
+        return None, 0
+
+    def _run_background_library_tools(self, done, skipped, errors):
+        """Background-mode hand-off after downloads complete: run one Library
+        Tools "Run all" pass in _RUN_ALL_ORDER, then mark the run 'done' and
+        clear the persisted state.
+
+        Reads each tool's dry-run preference from the background_state.json
+        snapshot captured at launch (defaulting to True/dry-run when a tool has
+        no captured preference -- matching test_dry_run_defaults_on_for_every_tool
+        -- so a run is never silently forced live), rather than from a live
+        LibraryToolsDialog that may not be open during an unattended run.
+        Mirrors _run_all_worker's "one tool's failure is logged, never aborts
+        the batch" rule."""
+        state = _load_background_state()
+        state.update({'phase': 'library_tools', 'resume_at': None})
+        _save_background_state(state)
+        tool_dry_run = state.get('tool_dry_run') or {}
+        songs_folder = state.get('songs_folder') or self._songs_folder
+        self._queue.put(('background_library_tools', len(_RUN_ALL_ORDER)))
+        log.info('Background mode: downloads complete (%d done, %d skipped, %d '
+                 'error(s)); starting Library Tools pass', done, skipped, errors)
+
+        tools_ok = 0
+        for key in _RUN_ALL_ORDER:
+            dry_run = tool_dry_run.get(key, True)
+            try:
+                counts = _run_library_tool(songs_folder, key, dry_run)
+                log.info('Background Library Tools: %s -> %s', key,
+                         _format_tool_summary(key, counts, dry_run))
+                tools_ok += 1
+            except Exception:
+                # Don't lose the rest of the batch to one bad step.
+                log.exception('Background Library Tools: %s failed', key)
+
+        _clear_background_state()
+        log.info('Background mode: run complete (%d/%d tools ok)',
+                 tools_ok, len(_RUN_ALL_ORDER))
+        self._queue.put(('background_done', done, skipped, errors, tools_ok))
+
+    def _maybe_resume_background(self):
+        """Dispatcher for Task 13's auto-resume-on-launch. Called exactly once
+        per app session, from _on_library_scanned's one-shot gate, after the
+        very first post-startup library scan lands.
+
+        Fully automatic -- no confirmation dialog -- per SPEC-background-mode.md's
+        success criteria ("come back days later, and find the app picked back
+        up on its own"). A songs_folder mismatch (the persisted run targeted a
+        different library than the one just scanned) means do nothing: never
+        force-switch or resume against the wrong library.
+        """
+        state = _load_background_state()
+        if not state:
+            # No persisted state at all is the overwhelmingly common case --
+            # it's true on every normal launch that never had a background
+            # run, including every app's very first-ever launch. Logging it
+            # every single time would just be routine noise with no signal in
+            # it, so this one branch stays silent; the two branches below
+            # (a real songs_folder mismatch, or a state file that exists but
+            # has nothing left to resume) are the ones worth a log line,
+            # since those are the "something happened but nothing visibly
+            # resumed" cases a user would actually go looking for in log.txt.
+            return
+        persisted_folder = state.get('songs_folder')
+        # Windows paths are case- and trailing-slash-insensitive; normalize
+        # both sides before comparing so a persisted 'C:/Songs' still matches
+        # a freshly-loaded 'c:/songs/' instead of silently failing to resume.
+        if (persisted_folder is None or
+                os.path.normcase(os.path.normpath(persisted_folder)) !=
+                os.path.normcase(os.path.normpath(self._songs_folder))):
+            log.info('Background mode: persisted run was for %r, current '
+                     'library is %r -- not resuming',
+                     persisted_folder, self._songs_folder)
+            return
+        phase = state.get('phase')
+        if phase == 'library_tools':
+            self._resume_background_library_tools(state)
+        elif phase == 'downloading':
+            self._resume_background_downloading(state)
+        else:
+            # phase == 'done', or any other/missing value: nothing to resume.
+            log.info('Background mode: persisted state has phase=%r, '
+                     'nothing to resume', phase)
+
+    def _resume_background_library_tools(self, state):
+        """The download phase already finished before the app closed/crashed;
+        only the Library Tools pass was interrupted. done/skipped/errors from
+        that finished download phase were never persisted (only Library Tools
+        progress matters for a resume at this phase) -- the 0s passed below
+        only affect this call's own log line, not correctness."""
+        self._running = True
+        self._set_background_mode(True)
+        self._update_buttons()
+        self._status_lbl.configure(text='Resuming background run: finishing Library Tools...')
+        log.info('Background mode: resuming at startup mid-Library-Tools')
+        threading.Thread(target=self._run_background_library_tools,
+                          args=(0, 0, 0), daemon=True).start()
+
+    def _resume_background_downloading(self, state):
+        """The download phase was still in progress (or mid-backoff-wait) when
+        the app last closed. Re-derives the actual remaining work from the
+        FRESH scan rather than trusting the persisted remaining_folders list
+        blindly -- the library may have changed while the app was closed (a
+        video added manually, a folder removed)."""
+        remaining = set(state.get('remaining_folders') or [])
+        targets = [s for s in self._songs if s.folder in remaining and not s.has_video]
+        if not targets:
+            # Everything that was pending now has video (or the folders are
+            # gone) -- nothing left to download, go straight to the Library
+            # Tools hand-off.
+            self._resume_background_library_tools(state)
+            return
+
+        resume_at = state.get('resume_at')
+        replace = bool(state.get('replace'))
+        resync = bool(state.get('resync'))
+
+        self._running = True
+        self._set_background_mode(True)
+        self._stop_evt.clear()
+        self._update_buttons()
+        self._status_lbl.configure(text='Resuming background run...')
+        log.info('Background mode: resuming at startup, %d song(s) still pending', len(targets))
+
+        def _worker():
+            if resume_at is not None:
+                wait_for = max(0, resume_at - time.time())
+                if wait_for > 0:
+                    log.info('Background mode: waiting %.0fs for the persisted '
+                             'resume_at before retrying', wait_for)
+                    if self._stop_evt.wait(wait_for):
+                        self.after(0, self._on_resume_wait_stopped)
+                        return
+            # Deliberate simplification: once the persisted resume_at has
+            # elapsed (or there was none to wait on), the block is presumed
+            # lifted and the resumed run starts a FRESH escalation at
+            # throttle_count=0 rather than trying to thread Task 11's
+            # in-memory throttle_count/episode_started_at across a process
+            # restart. If YouTube is still actually blocking, the very next
+            # song will produce a new 'stop' and re-escalate normally through
+            # the existing Task 11 logic -- a reasonable, simple tradeoff, not
+            # a bug to fix.
+            self.after(0, lambda: self._finish_resume_and_launch(targets, replace, resync))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_resume_and_launch(self, targets, replace, resync):
+        """Bounced onto the main thread via self.after(0, ...) so there's no
+        cross-thread race with _launch_background's own state (Tkinter
+        callbacks are single-threaded).
+
+        _resume_background_downloading deliberately set self._running = True
+        up front (so Stop works during the pre-resume wait, matching Task 11's
+        cancellable-wait pattern). _launch_background's own guard
+        (`if self._running or not targets: return`) would silently no-op if
+        called while that's still True -- reset it first so the guard re-arms
+        cleanly. _launch_background then re-sets self._running = True itself
+        and saves a fresh background_state.json snapshot (new
+        remaining_folders, throttle_count reset to 0, resume_at reset to None)
+        exactly as it does for a fresh Start-click."""
+        self._running = False
+        self._launch_background(targets, replace, resync)
+
+    def _on_resume_wait_stopped(self):
+        """A manual Stop pressed during the pre-resume wait. background_state.json
+        is deliberately left in place here (same policy as Task 11's mid-backoff
+        Stop) -- a manual Stop is indistinguishable from an interrupted run, so
+        a future resume attempt can still pick it up next launch."""
+        self._running = False
+        self._set_background_mode(False)
+        self._update_buttons()
+        self._status_lbl.configure(text='Background run stopped before resuming.')
 
     def _run_summary(self, done, skipped, errors):
         parts = []
@@ -2219,6 +2906,48 @@ class App(ctk.CTk):
                 text='Done. ' + self._run_summary(done, skipped, errors))
             self._update_buttons()
             # Re-apply filter so has_video status reflects new downloads
+            self._apply_filter()
+            self._flush_pending_update()
+
+        elif kind == 'background_throttled':
+            # Background mode hit a throttle and is waiting out a long backoff
+            # rather than ending the run. Keep _running True -- the run is still
+            # alive, just paused until resume_at.
+            _, s, i, total, resume_at = msg
+            when = time.strftime('%H:%M', time.localtime(resume_at))
+            s.status = f'⏳  Throttled, resuming {when}'
+            s.stag   = 'busy'
+            self._update_row(s)
+            self._status_lbl.configure(
+                text=f'YouTube throttled. Backing off, resuming at {when} '
+                     '(background mode keeps retrying)')
+
+        elif kind == 'background_library_tools':
+            _, n_tools = msg
+            self._status_lbl.configure(
+                text=f'Downloads complete. Running {n_tools} Library Tools...')
+
+        elif kind == 'background_done':
+            _, done, skipped, errors, tools_ok = msg
+            self._running = False
+            self._set_background_mode(False)
+            self._progress.set(1.0)
+            self._status_lbl.configure(
+                text='Background run complete. '
+                     + self._run_summary(done, skipped, errors)
+                     + f'; {tools_ok}/{len(_RUN_ALL_ORDER)} Library Tools ran')
+            self._update_buttons()
+            self._apply_filter()
+            self._flush_pending_update()
+
+        elif kind == 'background_stopped':
+            _, i, total, done, skipped, errors = msg
+            self._running = False
+            self._set_background_mode(False)
+            self._update_buttons()
+            self._status_lbl.configure(
+                text='Background run stopped. '
+                     + self._run_summary(done, skipped, errors))
             self._apply_filter()
             self._flush_pending_update()
 

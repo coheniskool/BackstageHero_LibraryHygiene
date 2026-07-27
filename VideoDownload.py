@@ -16,6 +16,7 @@ library_common.ensure_stdio_not_none()
 
 import configparser
 import glob
+import json
 import logging
 import logging.handlers
 import random
@@ -82,10 +83,6 @@ ffplayPath      = shutil.which('ffplay')
 # a console window for a split second. This flag suppresses that on Windows and
 # is a harmless 0 everywhere else.
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-
-# tv_embedded gets DASH streams (needed for bestvideo above 360p) without PO tokens.
-# android_vr / android are fallbacks if embedded is blocked.
-YOUTUBE_CLIENTS = ['tv_embedded', 'android_vr', 'android']
 
 # strip these from titles before searching so we don't get playthrough results
 # longer forms first, otherwise 'RB3' strips inside '(RB3 version)' and leaves '( version)'
@@ -203,6 +200,243 @@ SONG_DELAY_MAX = 3.0
 
 # if YouTube rate-limits us, wait and retry the same song before giving up
 BOT_BACKOFF_SECONDS = [60, 180, 420]
+
+# Background-mode-only. A separate, much longer backoff layered ABOVE the
+# short per-song retry above -- it only comes into play once
+# run_song_with_backoff has already exhausted BOT_BACKOFF_SECONDS and
+# returned 'stop'. It is not a replacement for the short retry, and nothing
+# here changes BOT_BACKOFF_SECONDS' own behavior.
+#
+# 1h / 4h / 12h / 24h, capped and repeating at 24h. This is a starting-point
+# schedule, not a measured fact -- how long YouTube's throttle actually lasts
+# is unknown. A later task (gap-logging + adaptive recompute, tracked
+# separately) may replace this with a schedule derived from real observed
+# throttle-and-resume data; next_resume_at() below accepts a schedule
+# override for exactly that purpose.
+LONG_BACKOFF_SECONDS = [3600, 14400, 43200, 86400]
+
+
+def next_resume_at(throttle_count, now, schedule=LONG_BACKOFF_SECONDS):
+    """Unix timestamp to resume at, given how many consecutive long-backoff
+    throttles have happened so far in this run (0-indexed).
+
+    Indexes into `schedule`, clamping to the last (repeating) entry once
+    `throttle_count` runs past the list's length -- this must never raise
+    IndexError no matter how large `throttle_count` gets, since background
+    mode retries indefinitely and never gives up on its own."""
+    index = min(throttle_count, len(schedule) - 1)
+    return now + schedule[index]
+
+
+# --- Gap logging + adaptive backoff (Task 8 of SPEC-background-mode.md) ------
+#
+# Every completed throttle episode (first 'stop' -> the retry that finally
+# succeeds) is recorded to its own file so the LONG_BACKOFF_SECONDS *guess*
+# above can eventually be replaced by a schedule derived from what YouTube's
+# throttle actually does in this user's environment. Kept in this module (next
+# to the schedule it recomputes) rather than in gui.py so all backoff-related
+# logic lives in one place.
+#
+# Its own file, NOT folded into background_state.json or settings.json: those
+# hold run state and UI prefs respectively; this holds an append-only episode
+# log plus the one derived schedule. Atomic writes (temp + os.replace), same
+# discipline gui.py's _save_background_state uses -- a multi-day unattended run
+# is exactly the crash-mid-write scenario that discipline exists for.
+_THROTTLE_HISTORY_FILE = os.path.join(updater.data_dir(), 'throttle_history.json')
+
+# Keep only the most recent N episodes. Rationale: (1) an app pointed at a real
+# library and left running for days/weeks could accumulate throttle episodes
+# indefinitely, and an unbounded append-only file is a slow leak; (2) more
+# importantly, a schedule recomputed from episodes months old would be fitting
+# to a YouTube throttle policy that may have since changed -- a recent window
+# tracks current behavior better than an all-time average. 50 is comfortably
+# more than the 5-episode recompute threshold, so the median stays stable.
+_THROTTLE_HISTORY_MAX = 50
+
+# Number of recorded episodes before the schedule is allowed to recompute from
+# real data (spec Resolved Decision: 5). Below this we keep using the guess.
+_RECOMPUTE_THRESHOLD = 5
+
+# Crash-prevention clamp ONLY -- NOT the 1h policy floor the user explicitly
+# declined. The user chose throughput over an extra safety margin: if the data
+# says YouTube unblocks in under an hour, the schedule is allowed to shrink
+# below an hour (that is the whole point of the adaptive recompute). This 5-min
+# minimum exists purely so a degenerate/corrupt history (a negative gap from
+# clock skew, an empty window slipping through, a future formula tuned too
+# aggressively) can never produce a near-zero wait that turns the retry loop
+# into a busy-loop hammering YouTube. It is a floor on *machine safety*, not on
+# *politeness* -- those are different concerns and must not be conflated.
+_MIN_BACKOFF_SECONDS = 300
+
+
+def _load_throttle_data():
+    """Returns {'episodes': list, 'schedule': list|None}, defensively -- any
+    read/parse failure yields the empty shape rather than raising, same
+    contract as gui.py's _load_background_state(). Tolerates a bare-list file
+    (treated as episodes) so an older format can't crash a load."""
+    try:
+        with open(_THROTTLE_HISTORY_FILE, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return {'episodes': [], 'schedule': None}
+    if isinstance(data, list):
+        return {'episodes': data, 'schedule': None}
+    if isinstance(data, dict):
+        episodes = data.get('episodes')
+        schedule = data.get('schedule')
+        return {
+            'episodes': episodes if isinstance(episodes, list) else [],
+            'schedule': schedule if isinstance(schedule, list) and schedule else None,
+        }
+    return {'episodes': [], 'schedule': None}
+
+
+def _save_throttle_data(data):
+    """Atomic write (temp file + os.replace), mirroring _save_background_state.
+    Swallows failures rather than crashing a long unattended run -- losing a
+    single episode record is acceptable; taking down the run over it is not."""
+    try:
+        tmp_path = _THROTTLE_HISTORY_FILE + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        os.replace(tmp_path, _THROTTLE_HISTORY_FILE)
+    except Exception:
+        pass
+
+
+def record_throttle_episode(started_at, resolved_at, escalation_steps_used,
+                            schedule=LONG_BACKOFF_SECONDS):
+    """Append one completed throttle episode and, if enough have accumulated,
+    recompute and persist an adaptive schedule.
+
+    Load-modify-save: reads the existing episode list, appends
+    {started_at, resolved_at, escalation_steps_used}, trims to the most recent
+    _THROTTLE_HISTORY_MAX, then writes the whole file back atomically. The
+    recomputed schedule (if any) is persisted in the *same* file alongside the
+    raw records, so a restart keeps a schedule that took real data to earn --
+    get_active_schedule() below is how the rest of background mode reads it.
+
+    Returns the episodes list actually persisted (useful for callers/tests)."""
+    data = _load_throttle_data()
+    episodes = data['episodes']
+    episodes.append({
+        'started_at': started_at,
+        'resolved_at': resolved_at,
+        'escalation_steps_used': escalation_steps_used,
+    })
+    # Trim from the front -- keep the most recent window (see _THROTTLE_HISTORY_MAX).
+    if len(episodes) > _THROTTLE_HISTORY_MAX:
+        episodes = episodes[-_THROTTLE_HISTORY_MAX:]
+
+    new_schedule = maybe_recompute_schedule(episodes, schedule=schedule)
+    if new_schedule is not None:
+        old_schedule = data.get('schedule') or list(schedule)
+        direction = ('grew' if sum(new_schedule) > sum(old_schedule)
+                     else 'shrank' if sum(new_schedule) < sum(old_schedule)
+                     else 'unchanged')
+        log.info('Background mode: adaptive backoff schedule %s after %d episodes '
+                 '(old=%s new=%s)', direction, len(episodes), old_schedule, new_schedule)
+        data['schedule'] = new_schedule
+
+    data['episodes'] = episodes
+    _save_throttle_data(data)
+    return episodes
+
+
+def get_active_schedule():
+    """The schedule background mode should actually back off on: the persisted,
+    adaptively-recomputed one if it exists, otherwise the LONG_BACKOFF_SECONDS
+    starting guess. This is what survives a restart -- the recomputed schedule
+    is written to disk by record_throttle_episode, so a relaunch mid-run keeps
+    using the earned schedule rather than falling back to the guess."""
+    schedule = _load_throttle_data()['schedule']
+    return list(schedule) if schedule else list(LONG_BACKOFF_SECONDS)
+
+
+def _median(values):
+    """Plain median. No numpy dependency in this project -- and a hand-rolled
+    median is more robust than a mean for the tiny (n>=5), noisy, right-censored
+    samples this feeds (one clock-skew outlier shouldn't swing the schedule)."""
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def maybe_recompute_schedule(history, schedule=LONG_BACKOFF_SECONDS):
+    """Derive a new LONG_BACKOFF_SECONDS-shaped schedule from observed throttle
+    episodes, or None to signal "keep using the current schedule".
+
+    Returns None (a no-op signal, chosen over returning the unchanged schedule
+    so callers can cheaply tell "nothing to persist") when there are fewer than
+    _RECOMPUTE_THRESHOLD episodes.
+
+    ---- The judgment call, spelled out (this is the high-reasoning bit) ----
+    The signal we drive from is `escalation_steps_used`: which step of the
+    schedule the block finally cleared on. We deliberately do NOT derive step
+    values from the raw `resolved_at - started_at` gaps, even though the data is
+    there. The reason is the right-censoring the spec Notes flag: the observed
+    gap is a product of BOTH YouTube's real block length AND our own schedule --
+    if our first wait is 1h and the real block was 10min, every gap reads ~1h,
+    so feeding gaps back in would just re-encode our own schedule into itself
+    and learn nothing. Escalation depth ("where did it clear?") is the more
+    honest signal: it's censored too, but it tells us the *shape* of where
+    blocks resolve relative to our steps, which is exactly what we can act on.
+
+    Direction (grow vs. shrink) is driven off the MEDIAN escalation depth versus
+    the schedule's own midpoint:
+      - clears consistently at step 0-1 (median low)  -> we're over-waiting -> SHRINK
+      - clears consistently at the last step (median high) -> real block is longer
+        than our top step -> GROW
+      - clears around the middle -> schedule is about right -> ~unchanged
+    We scale the DEFAULT `schedule` (not the previously-recomputed one) by a
+    single ratio derived from that median. Scaling the default each time keeps
+    the function stateless and idempotent for a given history -- no compounding
+    drift from repeated recomputes -- which is also what makes it testable on a
+    fabricated history alone.
+
+    ratio = (median_depth + 1) / (midpoint + 1), midpoint = (len-1)/2
+
+    Growth is bounded, never unbounded (spec: "grows or stays capped at the
+    top"): each episode's depth is clamped into [0, max_index + 1] before the
+    median, so even a run that repeated at the top 100 times reads as one step
+    past the end -- a clear "grow" signal without letting a runaway count blow
+    the schedule up. For the default 4-step schedule that caps a single
+    recompute at 2x. Negative/garbage depths clamp up to 0 (a "shrink" signal),
+    so degenerate input can only ever push toward the crash-prevention floor,
+    never past it.
+
+    Every resulting step is finally clamped to _MIN_BACKOFF_SECONDS -- the
+    crash-prevention floor, NOT the declined policy floor (see that constant)."""
+    if not schedule:
+        return None
+    if len(history) < _RECOMPUTE_THRESHOLD:
+        return None
+
+    max_index = len(schedule) - 1
+    # Clamp each observed depth into [0, max_index + 1]: below 0 is corrupt
+    # (treat as an early clear -> shrink); above max_index means it repeated at
+    # the top (treat as one-past-the-end -> a bounded grow signal). This is the
+    # single guard that keeps growth from ever being unbounded.
+    depths = []
+    for record in history:
+        try:
+            depth = int(record.get('escalation_steps_used', 0))
+        except (TypeError, ValueError):
+            depth = 0
+        depths.append(max(0, min(depth, max_index + 1)))
+
+    median_depth = _median(depths)
+    midpoint = max_index / 2.0
+    ratio = (median_depth + 1) / (midpoint + 1)
+
+    return [
+        max(_MIN_BACKOFF_SECONDS, int(round(step * ratio)))
+        for step in schedule
+    ]
+
 
 # default lead-in when we can't fingerprint-match - most music videos have a few seconds of intro
 DEFAULT_START_TIME = -3000
@@ -396,14 +630,71 @@ def video_id_of(url):
     return m.group(1) if m else url
 
 
+# Optional, opt-in browser-cookie support for yt-dlp requests -- off by
+# default, matching today's behavior exactly. gui.py's settings.json is the
+# source of truth for the toggle/browser choice, but it lives entirely
+# outside this module, so configure_cookies() is the one push: gui.py calls
+# it once at startup (with whatever was persisted) and again whenever the
+# toggle/dropdown changes, so a change takes effect on the next download
+# without an app restart. Only a browser *name* string ever passes through
+# here -- yt-dlp itself reads that browser's cookie store; no cookie value is
+# ever read, logged, or persisted by this code.
+USE_BROWSER_COOKIES = False
+COOKIE_BROWSER = None
+
+# yt-dlp's own supported --cookies-from-browser browser names. Kept here as a
+# defense-in-depth guard: today's only caller (gui.py's footer dropdown) is
+# hardcoded to a 3-item subset of this list, but configure_cookies() has no
+# way to know that -- a future caller (a config file, a different UI element)
+# could otherwise pass an unsupported string straight through to yt-dlp.
+_SUPPORTED_COOKIE_BROWSERS = frozenset({
+    'brave', 'chrome', 'chromium', 'edge', 'firefox', 'opera', 'safari',
+    'vivaldi', 'whale',
+})
+
+
+def configure_cookies(use_cookies, browser):
+    """Push gui.py's persisted cookie-support setting into this module.
+
+    use_cookies=False (the default, and what happens if this is never
+    called at all) leaves _base_opts()'s output byte-identical to before
+    this feature existed. An unsupported browser name is logged and leaves
+    cookie support disabled rather than raising -- matching this module's
+    existing defensive-failure style (e.g. _load_throttle_data/
+    _save_throttle_data) -- so a bad value never reaches _base_opts()."""
+    global USE_BROWSER_COOKIES, COOKIE_BROWSER
+    if use_cookies and browser and browser.lower() in _SUPPORTED_COOKIE_BROWSERS:
+        USE_BROWSER_COOKIES = True
+        COOKIE_BROWSER = browser.lower()
+        return
+
+    if use_cookies and browser and browser.lower() not in _SUPPORTED_COOKIE_BROWSERS:
+        log.warning('configure_cookies: unsupported browser %r, cookie '
+                     'support left disabled', browser)
+    USE_BROWSER_COOKIES = False
+    COOKIE_BROWSER = None
+
+
 def _base_opts():
-    return {
+    # No player_client override here on purpose: a hardcoded list (previously
+    # ['tv_embedded', 'android_vr', 'android']) goes stale the moment yt-dlp's
+    # maintainers deprecate or remove a client upstream -- tv_embedded was
+    # removed as broken in yt-dlp's 2026.01.31 release, which meant every
+    # download wasted its first attempt on a dead client for months before
+    # this was caught. yt-dlp's own built-in default is maintainer-managed and
+    # stays current without this project having to track it by hand.
+    opts = {
         'quiet': True,
         'no_warnings': True,
         'noplaylist': 1,
-        'extractor_args': {'youtube': {'player_client': YOUTUBE_CLIENTS}},
         'sleep_interval_requests': 1,
     }
+    if USE_BROWSER_COOKIES and COOKIE_BROWSER:
+        # yt-dlp's Python-API equivalent of --cookies-from-browser: a
+        # 1-tuple of (browser_name,). yt-dlp reads that browser's own cookie
+        # store directly -- nothing here touches a cookie value.
+        opts['cookiesfrombrowser'] = (COOKIE_BROWSER,)
+    return opts
 
 
 def search_candidates(query, n=SEARCH_RESULTS):
