@@ -18,7 +18,7 @@ Full design background: [`SPEC-library-enrichment.md`](SPEC-library-enrichment.m
 # Scan a library and write/update the sidecar
 python library_enricher.py --library-path "C:\path\to\Songs"
 
-# See what would happen without writing anything
+# Preview without touching song.ini or other library files (sidecar cache still written)
 python library_enricher.py --library-path "C:\path\to\Songs" --dry-run -v
 
 # Recompute every song, ignoring the incremental skip
@@ -56,7 +56,7 @@ GUI already knows the library path from its own folder picker.
 | Flag | Meaning |
 |---|---|
 | `--library-path` | Root folder containing your song subfolders. Prompted for interactively if omitted. |
-| `--dry-run` | Compute everything, print a summary, write nothing. |
+| `--dry-run` | Preview mode: never touches `song.ini` or other library files. Still writes the enrichment sidecar cache (same as a normal run), so the work carries over to your next run. |
 | `--force` | Recompute every song, ignoring the incremental (unchanged) skip. |
 | `--ch-data` | Clone Hero user data directory (for `scores.bin`). Prompted for interactively if omitted; leave blank there (or pass `--ch-data ""`) to skip high scores for that run. |
 | `--chorus-cache` | Chorus response cache file path. Defaults to a file next to the sidecar. |

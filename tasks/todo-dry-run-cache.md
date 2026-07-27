@@ -21,14 +21,14 @@ See [`plan-dry-run-cache.md`](plan-dry-run-cache.md) for full detail, acceptance
 - [x] `pytest tests/test_library_enricher_cli.py -v` still green
 
 ## Task 4: Update docs (needs Task 1)
-- [ ] `README_ENRICHER.md:59` — `--dry-run` table row no longer says "write nothing"
-- [ ] `SPEC-library-enrichment.md:37` — `--dry-run` bullet updated to match, consistent with `SPEC-dry-run-cache.md`'s redefinition
-- [ ] Manual read-check: docstring (Task 1), CLI help (Task 3), and both docs all describe the same `--dry-run` behavior
+- [x] `README_ENRICHER.md:59` — `--dry-run` table row no longer says "write nothing"
+- [x] `SPEC-library-enrichment.md:37` — `--dry-run` bullet updated to match, consistent with `SPEC-dry-run-cache.md`'s redefinition
+- [x] Manual read-check: docstring (Task 1), CLI help (Task 3), and both docs all describe the same `--dry-run` behavior (also caught and fixed a second stale line, README_ENRICHER.md:21's "without writing anything" usage comment, not originally enumerated but the same class of miss)
 
 ## ▶ Checkpoint (final)
-- [ ] `pytest tests/ -v` full suite green
-- [ ] Diff review: exactly 5 files touched (`library_enrichment.py`, `library_enricher.py`, `tests/test_library_enrichment.py`, `README_ENRICHER.md`, `SPEC-library-enrichment.md`)
-- [ ] No scope creep into `--no-cache-write` (deferred) or other tools' `dry_run` handling (out of scope per spec)
+- [x] `pytest tests/ -v` full suite green, except one pre-existing flake unrelated to this change (`tests/test_resolver_db.py::test_client_stats_matches_naive_multiquery` — fails only under full-suite ordering, passes in isolation, touches resolver_db/stats which nothing here modified; not fixed, out of scope)
+- [x] Diff review: `library_enrichment.py`, `library_enricher.py`, `tests/test_library_enrichment.py`, `tests/test_library_enricher_integration.py` (unplanned but same-cause fix), `README_ENRICHER.md`, `SPEC-library-enrichment.md`, plus the new `SPEC-dry-run-cache.md`/`tasks/plan-dry-run-cache.md`/`tasks/todo-dry-run-cache.md`
+- [x] No scope creep into `--no-cache-write` (deferred) or other tools' `dry_run` handling (out of scope per spec)
 
 ---
 

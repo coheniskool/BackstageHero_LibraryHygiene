@@ -34,7 +34,7 @@ python library_enricher.py --library-path /path/to/Songs [--dry-run] [--force] [
 ### CLI Flags
 
 - `--library-path <path>`: Required. Root folder containing song subfolders (each with `song.ini`).
-- `--dry-run`: Print a summary of what would be written (counts per field, problems found) without touching the sidecar.
+- `--dry-run`: Never mutates library files (`song.ini`, etc. — this tool never does regardless). Still writes the enrichment sidecar, since that's a read-only computation cache rather than a library mutation — see `SPEC-dry-run-cache.md` for the rationale and the incremental-reuse this enables.
 - `--force`: Recompute all songs, ignoring mtime/hash cache. (Default: skip unchanged songs.)
 - `--ch-data <path>`: Clone Hero user data directory (contains `scores.bin`). Not yet auto-detected (prompted for interactively if omitted — see Commands); the directory itself is confirmed to follow Unity's `persistentDataPath` convention: Windows `%USERPROFILE%\AppData\LocalLow\srylain Inc_\Clone Hero`, Mac `~/Library/Application Support/com.srylain.CloneHero`, Linux `~/.config/unity3d/srylain Inc_/Clone Hero`. If not found, high scores are skipped with a warning. (Source: [Clone Hero Wiki — Data Locations](https://wiki.clonehero.net/books/clone-hero-manual/page/data-locations), confirmed against a real install 2026-07-20.)
 - `--chorus-cache <path>`: Local Chorus cache file (default: sidecar dir). Reuse across runs.
