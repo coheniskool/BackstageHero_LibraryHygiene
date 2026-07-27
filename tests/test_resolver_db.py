@@ -78,11 +78,24 @@ def test_client_stats_windows_and_sharing(conn):
     assert s['sharing_7d'] == 2    # a, c
 
 
-def test_client_stats_matches_naive_multiquery(conn):
+def test_client_stats_matches_naive_multiquery(conn, monkeypatch):
     """The consolidated query must return exactly what six independent COUNT(*)
-    queries (the pre-E19 form) would have returned on the same data."""
+    queries (the pre-E19 form) would have returned on the same data.
+
+    Two of the 20 pings (i=1, i=7) sit exactly on the 24h/7d window
+    boundaries, which client_stats() includes via `>=` (db.py:261-265). That
+    makes this comparison dependent on the test's `now` and client_stats()'s
+    own internal `now = int(time.time())` (db.py:253) being the *same*
+    instant -- true almost always, but not guaranteed, and a real clock tick
+    between the two independent time.time() calls silently drops those
+    boundary entries from client_stats()'s result while `naive()` (which
+    reuses the test's frozen `now`) still counts them. Freeze the clock so
+    the comparison is deterministic regardless of how long the test setup
+    takes on a given run.
+    """
     import time
     now = int(time.time())
+    monkeypatch.setattr(time, 'time', lambda: float(now))
     DAY = 86400
     for i in range(20):
         _set_last_seen(conn, f'c{i}', now - i * DAY, sharing=(i % 2))
