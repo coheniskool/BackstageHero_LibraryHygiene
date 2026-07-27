@@ -3,22 +3,22 @@
 See [`plan-dry-run-cache.md`](plan-dry-run-cache.md) for full detail, acceptance criteria, and verification steps. Spec: [`../SPEC-dry-run-cache.md`](../SPEC-dry-run-cache.md) (amends [`../SPEC-library-enrichment.md`](../SPEC-library-enrichment.md)).
 
 ## Task 1: Remove the `dry_run` gate on the sidecar write
-- [ ] `library_enrichment.py:217-218` — drop the `if not dry_run:` guard; `_save_sidecar(sidecar_path, sidecar)` runs unconditionally
-- [ ] `library_enrichment.py` `enrich_library()` docstring (lines 167-179, esp. line 175) — replace `"dry_run=True computes everything but writes nothing."` with wording matching the new "no library mutations, sidecar always written" behavior
-- [ ] Manual read-check: gate is gone, no other logic in `enrich_library()` touched
+- [x] `library_enrichment.py:217-218` — drop the `if not dry_run:` guard; `_save_sidecar(sidecar_path, sidecar)` runs unconditionally
+- [x] `library_enrichment.py` `enrich_library()` docstring (lines 167-179, esp. line 175) — replace `"dry_run=True computes everything but writes nothing."` with wording matching the new "no library mutations, sidecar always written" behavior
+- [x] Manual read-check: gate is gone, no other logic in `enrich_library()` touched
 
 ## Task 2: Update dry-run test coverage (needs Task 1)
-- [ ] `tests/test_library_enrichment.py:63` — rename `test_enrich_library_dry_run_writes_nothing` → `test_enrich_library_dry_run_writes_sidecar`; invert assertion to confirm the sidecar exists and contains the computed entry
-- [ ] Add `test_dry_run_then_real_run_skips_everything` — dry run then real run against the same unchanged library; assert second call's `songs_processed == 0` and `songs_skipped == <song count>`
-- [ ] Confirm `test_enrich_library_incremental_skips_unchanged_song` (line 73) and `test_enrich_library_force_reprocesses_unchanged_song` (line 86) still pass unmodified
-- [ ] `pytest tests/test_library_enrichment.py -v` green
-- [ ] `pytest tests/ -v` full suite green
+- [x] `tests/test_library_enrichment.py:63` — rename `test_enrich_library_dry_run_writes_nothing` → `test_enrich_library_dry_run_writes_sidecar`; invert assertion to confirm the sidecar exists and contains the computed entry
+- [x] Add `test_dry_run_then_real_run_skips_everything` — dry run then real run against the same unchanged library; assert second call's `songs_processed == 0` and `songs_skipped == <song count>`
+- [x] Confirm `test_enrich_library_incremental_skips_unchanged_song` (line 73) and `test_enrich_library_force_reprocesses_unchanged_song` (line 86) still pass unmodified
+- [x] `pytest tests/test_library_enrichment.py -v` green
+- [x] `pytest tests/ -v` full suite green (also caught and fixed an unplanned regression: `tests/test_library_enricher_integration.py::test_full_cli_run_dry_run_leaves_no_trace` asserted the old contract — renamed to `test_full_cli_run_dry_run_persists_sidecar` and inverted)
 
 ## Task 3: Update CLI `--dry-run` help text (needs Task 1)
-- [ ] `library_enricher.py:45` — reword `--dry-run` help text; no longer claims the sidecar isn't written
-- [ ] Leave the `"Dry run: ..."` vs `"Enrichment complete: ..."` print distinction in `main()` (line 115) unchanged
-- [ ] `python library_enricher.py --help` prints cleanly
-- [ ] `pytest tests/test_library_enricher_cli.py -v` still green
+- [x] `library_enricher.py:45` — reword `--dry-run` help text; no longer claims the sidecar isn't written
+- [x] Leave the `"Dry run: ..."` vs `"Enrichment complete: ..."` print distinction in `main()` (line 115) unchanged
+- [x] `python library_enricher.py --help` prints cleanly
+- [x] `pytest tests/test_library_enricher_cli.py -v` still green
 
 ## Task 4: Update docs (needs Task 1)
 - [ ] `README_ENRICHER.md:59` — `--dry-run` table row no longer says "write nothing"
