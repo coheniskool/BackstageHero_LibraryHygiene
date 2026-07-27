@@ -1443,6 +1443,16 @@ class App(ctk.CTk):
         # freed the user to start a download into the same folders a rename
         # sweep was still working through.
         self._tool_running: bool = False
+        # Guards against a second _maybe_start_enrichment() (fired after a
+        # rescan while a prior enrichment thread is still running) from
+        # spawning a concurrent enrich_library() call -- two concurrent
+        # calls each build their own CachedChorusClient against the same
+        # default cache file, racing os.replace() on the same .tmp path
+        # (WinError 32) and silently clobbering each other's cached entries.
+        # A real Lock, unlike _tool_running, because it's set on the main
+        # thread and cleared on the background thread.
+        self._enrichment_lock = threading.Lock()
+        self._enrichment_running: bool = False
         self._polling     : bool = False
         self._stop_evt    = threading.Event()
         self._queue       : queue.Queue = queue.Queue()
@@ -1793,9 +1803,17 @@ class App(ctk.CTk):
         no need to route anything through self._queue and no risk of a
         cross-thread widget access bug. A failure here costs the user an
         optional booklet-data file, never the app itself -- same philosophy
-        as _export_library_csv, logged via `log` and otherwise ignored."""
+        as _export_library_csv, logged via `log` and otherwise ignored.
+
+        A no-op (skip + log) if an enrichment run is already in flight from
+        an earlier scan -- see self._enrichment_lock's comment in __init__."""
         if not self._enrich_var.get() or not self._songs_folder:
             return
+        with self._enrichment_lock:
+            if self._enrichment_running:
+                log.info('Library enrichment already running; skipping')
+                return
+            self._enrichment_running = True
         threading.Thread(target=self._run_enrichment, daemon=True).start()
 
     def _run_enrichment(self):
@@ -1803,6 +1821,9 @@ class App(ctk.CTk):
             library_enrichment.enrich_library(self._songs_folder)
         except Exception as e:
             log.warning('Library enrichment failed: %s', e)
+        finally:
+            with self._enrichment_lock:
+                self._enrichment_running = False
 
     def _startup(self):
         saved = _load_songs_path()
