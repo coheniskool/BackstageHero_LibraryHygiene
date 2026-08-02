@@ -57,6 +57,7 @@ import metadata_enrichment
 import dedupe_report
 import static_art
 import library_enrichment
+import songbook
 
 log = logging.getLogger('backstagehero')
 
@@ -1401,6 +1402,261 @@ class LibraryToolsDialog(ctk.CTkToplevel):
         self.geometry(f'+{pw - w // 2}+{ph - h // 2}')
 
 
+class SongbookDialog(ctk.CTkToplevel):
+    """Manual, on-demand "Generate Songbook" panel -- turns the already-
+    scanned library into a printable PDF via songbook.py. Shares
+    LibraryToolsDialog's CTkToplevel boilerplate and background-thread
+    pattern (thread -> self.after(0, ...) finish, no shared self._queue),
+    but has no dry-run concept: this only reads Artist/Title and writes a
+    new PDF/HTML pair next to the library, it never mutates the library
+    itself, so there is nothing here for a scan-in-progress to race with.
+    """
+
+    _ACCENT_LABELS = (('red', 'Red'), ('olive', 'Olive'), ('denim', 'Denim'))
+    _COVER_LABELS = (('olive', 'Olive'), ('denim', 'Denim'), ('red', 'Red'), ('yellow', 'Yellow'))
+
+    def __init__(self, parent, songs_folder, songs, options=None, on_option_change=None):
+        super().__init__(parent)
+        self._songs_folder = songs_folder
+        self._songs = list(songs)
+        self._prefs = dict(options or {})
+        self._on_option_change = on_option_change
+        self._generating = False
+        self._result = None
+        self._accent_buttons = {}
+        self._cover_buttons = {}
+
+        self.title('Generate Songbook')
+        self.geometry('460x560')
+        self.minsize(420, 480)
+        self.resizable(True, True)
+        self.configure(fg_color=_BG)
+        self.grab_set()
+        self.protocol('WM_DELETE_WINDOW', self._close)
+        try:
+            ico = _asset_path('icon.ico')
+            if os.path.exists(ico):
+                self.iconbitmap(ico)
+        except Exception:
+            pass
+
+        self._build()
+        self.after(50, self._center)
+
+    def _build(self):
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(self, text='Generate Songbook',
+                     font=ctk.CTkFont(size=16, weight='bold'),
+                     text_color=_TEXT).grid(row=0, column=0, padx=20, pady=(18, 2), sticky='w')
+        ctk.CTkLabel(
+            self,
+            text='Builds a print-and-bind PDF songbook from your library\'s '
+                 'Artist/Title data -- regenerated fresh every time.',
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            wraplength=400, justify='left').grid(row=1, column=0, padx=20, sticky='w')
+
+        columns = int(self._prefs.get('columns', songbook.DEFAULT_COLUMN_COUNT))
+        col_row = ctk.CTkFrame(self, fg_color='transparent')
+        col_row.grid(row=2, column=0, padx=20, pady=(16, 0), sticky='w')
+        ctk.CTkLabel(col_row, text='Columns per page', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).pack(side='left', padx=(0, 10))
+        self._col_buttons = {}
+        for n in (2, 3, 4):
+            btn = ctk.CTkButton(
+                col_row, text=str(n), width=36, height=26, font=ctk.CTkFont(size=11),
+                command=lambda n=n: self._on_columns_change(n))
+            btn.pack(side='left', padx=2)
+            self._col_buttons[n] = btn
+        self._refresh_columns_buttons(columns)
+
+        margin = float(self._prefs.get('binding_margin', songbook.DEFAULT_BINDING_MARGIN))
+        margin_row = ctk.CTkFrame(self, fg_color='transparent')
+        margin_row.grid(row=3, column=0, padx=20, pady=(16, 0), sticky='ew')
+        margin_row.grid_columnconfigure(0, weight=1)
+        top = ctk.CTkFrame(margin_row, fg_color='transparent')
+        top.grid(row=0, column=0, sticky='ew')
+        top.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(top, text='Binding margin', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).grid(row=0, column=0, sticky='w')
+        self._margin_lbl = ctk.CTkLabel(top, text=f'{margin:.2f} in',
+                                        font=ctk.CTkFont(size=11), text_color=_TEXT)
+        self._margin_lbl.grid(row=0, column=1, sticky='e')
+        self._margin_slider = ctk.CTkSlider(
+            margin_row, from_=0.6, to=1.3, number_of_steps=14,
+            command=self._on_margin_change, height=16,
+            button_color=_BLUE, button_hover_color='#7aaef8', progress_color=_BLUE)
+        self._margin_slider.set(margin)
+        self._margin_slider.grid(row=1, column=0, sticky='ew', pady=(4, 0))
+
+        accent = self._prefs.get('accent', 'denim')
+        accent_row = ctk.CTkFrame(self, fg_color='transparent')
+        accent_row.grid(row=4, column=0, padx=20, pady=(16, 0), sticky='w')
+        ctk.CTkLabel(accent_row, text='Accent color', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).pack(side='left', padx=(0, 10))
+        for key, label in self._ACCENT_LABELS:
+            btn = ctk.CTkButton(
+                accent_row, text=label, width=64, height=26, font=ctk.CTkFont(size=10),
+                fg_color=songbook.ACCENT_COLOR_CHOICES[key], text_color='#11111b',
+                hover_color=songbook.ACCENT_COLOR_CHOICES[key],
+                command=lambda k=key: self._on_accent_change(k))
+            btn.pack(side='left', padx=2)
+            self._accent_buttons[key] = btn
+        self._refresh_swatch_selection(self._accent_buttons, accent)
+
+        cover = self._prefs.get('cover', 'red')
+        cover_row = ctk.CTkFrame(self, fg_color='transparent')
+        cover_row.grid(row=5, column=0, padx=20, pady=(12, 0), sticky='w')
+        ctk.CTkLabel(cover_row, text='Cover color', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).pack(side='left', padx=(0, 10))
+        for key, label in self._COVER_LABELS:
+            btn = ctk.CTkButton(
+                cover_row, text=label, width=64, height=26, font=ctk.CTkFont(size=10),
+                fg_color=songbook.COVER_COLOR_CHOICES[key], text_color='#11111b',
+                hover_color=songbook.COVER_COLOR_CHOICES[key],
+                command=lambda k=key: self._on_cover_change(k))
+            btn.pack(side='left', padx=2)
+            self._cover_buttons[key] = btn
+        self._refresh_swatch_selection(self._cover_buttons, cover)
+
+        self._status_lbl = ctk.CTkLabel(
+            self, text='Ready', font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            wraplength=400, justify='left')
+        self._status_lbl.grid(row=6, column=0, padx=20, pady=(20, 0), sticky='w')
+
+        btn_row = ctk.CTkFrame(self, fg_color='transparent')
+        btn_row.grid(row=7, column=0, padx=20, pady=(10, 0), sticky='ew')
+        self._open_btn = ctk.CTkButton(
+            btn_row, text='Open', width=80, height=28, state='disabled',
+            fg_color='#313244', hover_color='#414160',
+            font=ctk.CTkFont(size=11), command=self._open_pdf)
+        self._open_btn.pack(side='left')
+        self._generate_btn = ctk.CTkButton(
+            btn_row, text='Generate', width=110, height=28,
+            fg_color=_BLUE, hover_color='#7aaef8', text_color='#11111b',
+            font=ctk.CTkFont(size=11, weight='bold'), command=self._generate)
+        self._generate_btn.pack(side='right')
+
+        ctk.CTkButton(self, text='Close', width=100,
+                      fg_color='transparent', border_width=1,
+                      border_color=_BORDER, hover_color='#30304a',
+                      text_color=_SUBTEXT, font=ctk.CTkFont(size=12),
+                      command=self._close).grid(row=8, column=0, pady=18)
+
+    def _refresh_columns_buttons(self, selected):
+        self._prefs['columns'] = selected
+        for n, btn in self._col_buttons.items():
+            if n == selected:
+                btn.configure(fg_color=_BLUE, text_color='#11111b', hover_color='#7aaef8')
+            else:
+                btn.configure(fg_color=_SURFACE, text_color=_TEXT, hover_color='#30304a')
+
+    def _refresh_swatch_selection(self, buttons, selected_key):
+        # The swatch's own hex IS its fg_color; "selected" is shown with a
+        # bright border instead of a different fill, so the true color stays
+        # visible either way.
+        for key, btn in buttons.items():
+            if key == selected_key:
+                btn.configure(border_width=2, border_color=_TEXT)
+            else:
+                btn.configure(border_width=0)
+
+    def _on_columns_change(self, value):
+        self._refresh_columns_buttons(value)
+        self._persist('columns', value)
+
+    def _on_margin_change(self, value):
+        rounded = round(round(value / 0.05) * 0.05, 2)
+        self._prefs['binding_margin'] = rounded
+        self._margin_lbl.configure(text=f'{rounded:.2f} in')
+        self._persist('binding_margin', rounded)
+
+    def _on_accent_change(self, key):
+        self._prefs['accent'] = key
+        self._refresh_swatch_selection(self._accent_buttons, key)
+        self._persist('accent', key)
+
+    def _on_cover_change(self, key):
+        self._prefs['cover'] = key
+        self._refresh_swatch_selection(self._cover_buttons, key)
+        self._persist('cover', key)
+
+    def _persist(self, key, value):
+        if self._on_option_change is not None:
+            self._on_option_change(key, value)
+
+    def _generate(self):
+        if self._generating:
+            return
+        self._generating = True
+        self._generate_btn.configure(state='disabled')
+        self._open_btn.configure(state='disabled')
+        self._result = None
+        self._status_lbl.configure(text='Generating...', text_color=_BLUE)
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        result = None
+        try:
+            result = songbook.generate_songbook(
+                self._songs_folder, songs=self._songs,
+                column_count=self._prefs.get('columns', songbook.DEFAULT_COLUMN_COUNT),
+                binding_margin=self._prefs.get('binding_margin', songbook.DEFAULT_BINDING_MARGIN),
+                accent_color=songbook.ACCENT_COLOR_CHOICES.get(
+                    self._prefs.get('accent', 'denim'), songbook.DEFAULT_ACCENT_COLOR),
+                cover_color=songbook.COVER_COLOR_CHOICES.get(
+                    self._prefs.get('cover', 'red'), songbook.DEFAULT_COVER_COLOR),
+                synced_label=time.strftime('%B %d, %Y').upper())
+            text = (f"Done -- {result['page_count']} pages, "
+                    f"{result['stats']['totalArtists']} artists, "
+                    f"{result['stats']['totalSongs']} songs.")
+            color = _GREEN
+        except songbook.EmptyLibraryError as e:
+            text, color = str(e), _RED
+        except songbook.BrowserNotFoundError as e:
+            text, color = str(e), _RED
+        except Exception as e:
+            log.exception('Songbook generation failed')
+            text, color = f'Error: {e}', _RED
+        try:
+            self.after(0, lambda: self._finish(text, color, result))
+        except Exception:
+            pass
+
+    def _finish(self, text, color, result):
+        self._generating = False
+        if not self.winfo_exists():
+            return
+        self._generate_btn.configure(state='normal')
+        self._status_lbl.configure(text=text, text_color=color)
+        if result is not None:
+            self._result = result
+            self._open_btn.configure(state='normal')
+
+    def _open_pdf(self):
+        if self._result is not None:
+            _open_in_file_manager(str(self._result['pdf_path']))
+
+    def _close(self):
+        if self._generating:
+            if not messagebox.askokcancel(
+                    'Generation still running',
+                    'The songbook is still being generated.\n\n'
+                    'Closing this window will not stop it -- it finishes on its own '
+                    'and writes the PDF regardless.\n\nClose anyway?',
+                    parent=self):
+                return
+        self.grab_release()
+        self.destroy()
+
+    def _center(self):
+        self.update_idletasks()
+        pw = self.master.winfo_x() + self.master.winfo_width() // 2
+        ph = self.master.winfo_y() + self.master.winfo_height() // 2
+        w, h = self.winfo_width(), self.winfo_height()
+        self.geometry(f'+{pw - w // 2}+{ph - h // 2}')
+
+
 class App(ctk.CTk):
 
     def __init__(self):
@@ -1521,13 +1777,19 @@ class App(ctk.CTk):
             folder_row, text='No folder selected',
             font=ctk.CTkFont(size=11), text_color=_SUBTEXT, anchor='e')
         self._folder_lbl.grid(row=0, column=0, padx=(0, 10), sticky='e')
+        self._songbook_btn = ctk.CTkButton(
+            folder_row, text='Generate Songbook', state='disabled',
+            width=140, height=28, font=ctk.CTkFont(size=11),
+            fg_color='#313244', hover_color='#414160',
+            command=self._open_songbook_dialog)
+        self._songbook_btn.grid(row=0, column=1, padx=(0, 8))
         ctk.CTkButton(folder_row, text='Library Tools',
                       width=110, height=28, font=ctk.CTkFont(size=11),
                       fg_color='#313244', hover_color='#414160',
-                      command=self._open_library_tools).grid(row=0, column=1, padx=(0, 8))
+                      command=self._open_library_tools).grid(row=0, column=2, padx=(0, 8))
         ctk.CTkButton(folder_row, text='Change folder',
                       width=115, height=28, font=ctk.CTkFont(size=11),
-                      command=self._pick_folder).grid(row=0, column=2)
+                      command=self._pick_folder).grid(row=0, column=3)
 
         # Filter / search bar
         fbar = ctk.CTkFrame(self, fg_color=_SURFACE, corner_radius=0, height=50)
@@ -1775,6 +2037,24 @@ class App(ctk.CTk):
         prefs = dict(self._settings.get('library_tool_dry_run', {}))
         prefs[key] = value
         self._persist_setting('library_tool_dry_run', prefs)
+
+    _SONGBOOK_OPTION_DEFAULTS = {
+        'columns': songbook.DEFAULT_COLUMN_COUNT,
+        'binding_margin': songbook.DEFAULT_BINDING_MARGIN,
+        'accent': 'denim',
+        'cover': 'red',
+    }
+
+    def _songbook_options(self):
+        """Persisted Generate Songbook settings, same shape as
+        _tool_dry_run_prefs: defaults for anything never explicitly set."""
+        saved = self._settings.get('songbook_options', {})
+        return {**self._SONGBOOK_OPTION_DEFAULTS, **saved}
+
+    def _on_songbook_option_change(self, key, value):
+        opts = dict(self._settings.get('songbook_options', {}))
+        opts[key] = value
+        self._persist_setting('songbook_options', opts)
 
     def _on_share_toggle(self):
         on = bool(self._share_var.get())
@@ -2261,6 +2541,17 @@ class App(ctk.CTk):
                             dry_run_prefs=self._tool_dry_run_prefs(),
                             on_dry_run_change=self._on_tool_dry_run_change)
 
+    def _open_songbook_dialog(self):
+        # Unlike _open_library_tools, the button itself is kept disabled
+        # whenever there's nothing to generate from or a mutation is running
+        # (see _update_buttons) -- these checks are a defensive backstop
+        # against a click racing that state change, not the primary gate.
+        if self._running or self._tool_running or not self._songs_folder or not self._songs:
+            return
+        SongbookDialog(self, self._songs_folder, self._songs,
+                       options=self._songbook_options(),
+                       on_option_change=self._on_songbook_option_change)
+
     def _set_tool_running(self, running):
         """Called FROM THE WORKER THREAD when a Library Tools scan starts/stops.
 
@@ -2324,6 +2615,15 @@ class App(ctk.CTk):
         all_vis_on = bool(self._filtered) and all(s.checked for s in self._filtered)
         self._sel_btn.configure(
             text='Deselect all' if all_vis_on else 'Select all')
+
+        # Generate Songbook only reads Artist/Title and writes a new PDF/HTML
+        # pair -- it doesn't need anything checked, just a scanned library,
+        # and it's disabled directly here rather than click-then-message
+        # (see _open_songbook_dialog) since it's a much lower-friction action
+        # than a library-wide hygiene scan.
+        can_generate_songbook = (bool(self._songs_folder) and bool(self._songs)
+                                 and not self._running and not self._tool_running)
+        self._songbook_btn.configure(state='normal' if can_generate_songbook else 'disabled')
 
     _BIG_BATCH = 25   # confirm before kicking off a run this large
 
