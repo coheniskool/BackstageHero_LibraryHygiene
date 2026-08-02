@@ -1427,8 +1427,8 @@ class SongbookDialog(ctk.CTkToplevel):
         self._cover_buttons = {}
 
         self.title('Generate Songbook')
-        self.geometry('460x560')
-        self.minsize(420, 480)
+        self.geometry('460x620')
+        self.minsize(420, 540)
         self.resizable(True, True)
         self.configure(fg_color=_BG)
         self.grab_set()
@@ -1519,13 +1519,32 @@ class SongbookDialog(ctk.CTkToplevel):
             self._cover_buttons[key] = btn
         self._refresh_swatch_selection(self._cover_buttons, cover)
 
+        stdev_multiplier = float(self._prefs.get('stdev_multiplier', songbook.DEFAULT_STDEV_MULTIPLIER))
+        multiplier_row = ctk.CTkFrame(self, fg_color='transparent')
+        multiplier_row.grid(row=6, column=0, padx=20, pady=(16, 0), sticky='ew')
+        multiplier_row.grid_columnconfigure(0, weight=1)
+        top = ctk.CTkFrame(multiplier_row, fg_color='transparent')
+        top.grid(row=0, column=0, sticky='ew')
+        top.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(top, text='"Heavy Hitters" threshold', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).grid(row=0, column=0, sticky='w')
+        self._multiplier_lbl = ctk.CTkLabel(top, text=f'{stdev_multiplier:g}σ',
+                                            font=ctk.CTkFont(size=11), text_color=_TEXT)
+        self._multiplier_lbl.grid(row=0, column=1, sticky='e')
+        self._multiplier_slider = ctk.CTkSlider(
+            multiplier_row, from_=0.5, to=3.0, number_of_steps=25,
+            command=self._on_multiplier_change, height=16,
+            button_color=_BLUE, button_hover_color='#7aaef8', progress_color=_BLUE)
+        self._multiplier_slider.set(stdev_multiplier)
+        self._multiplier_slider.grid(row=1, column=0, sticky='ew', pady=(4, 0))
+
         self._status_lbl = ctk.CTkLabel(
             self, text='Ready', font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
             wraplength=400, justify='left')
-        self._status_lbl.grid(row=6, column=0, padx=20, pady=(20, 0), sticky='w')
+        self._status_lbl.grid(row=7, column=0, padx=20, pady=(20, 0), sticky='w')
 
         btn_row = ctk.CTkFrame(self, fg_color='transparent')
-        btn_row.grid(row=7, column=0, padx=20, pady=(10, 0), sticky='ew')
+        btn_row.grid(row=8, column=0, padx=20, pady=(10, 0), sticky='ew')
         self._open_btn = ctk.CTkButton(
             btn_row, text='Open', width=80, height=28, state='disabled',
             fg_color='#313244', hover_color='#414160',
@@ -1541,7 +1560,7 @@ class SongbookDialog(ctk.CTkToplevel):
                       fg_color='transparent', border_width=1,
                       border_color=_BORDER, hover_color='#30304a',
                       text_color=_SUBTEXT, font=ctk.CTkFont(size=12),
-                      command=self._close).grid(row=8, column=0, pady=18)
+                      command=self._close).grid(row=9, column=0, pady=18)
 
     def _refresh_columns_buttons(self, selected):
         self._prefs['columns'] = selected
@@ -1581,6 +1600,12 @@ class SongbookDialog(ctk.CTkToplevel):
         self._refresh_swatch_selection(self._cover_buttons, key)
         self._persist('cover', key)
 
+    def _on_multiplier_change(self, value):
+        rounded = round(value, 1)
+        self._prefs['stdev_multiplier'] = rounded
+        self._multiplier_lbl.configure(text=f'{rounded:g}σ')
+        self._persist('stdev_multiplier', rounded)
+
     def _persist(self, key, value):
         if self._on_option_change is not None:
             self._on_option_change(key, value)
@@ -1606,6 +1631,8 @@ class SongbookDialog(ctk.CTkToplevel):
                     self._prefs.get('accent', 'denim'), songbook.DEFAULT_ACCENT_COLOR),
                 cover_color=songbook.COVER_COLOR_CHOICES.get(
                     self._prefs.get('cover', 'red'), songbook.DEFAULT_COVER_COLOR),
+                stdev_multiplier=self._prefs.get(
+                    'stdev_multiplier', songbook.DEFAULT_STDEV_MULTIPLIER),
                 synced_label=time.strftime('%B %d, %Y').upper())
             text = (f"Done -- {result['page_count']} pages, "
                     f"{result['stats']['totalArtists']} artists, "
@@ -2043,6 +2070,7 @@ class App(ctk.CTk):
         'binding_margin': songbook.DEFAULT_BINDING_MARGIN,
         'accent': 'denim',
         'cover': 'red',
+        'stdev_multiplier': songbook.DEFAULT_STDEV_MULTIPLIER,
     }
 
     def _songbook_options(self):

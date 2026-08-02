@@ -128,6 +128,30 @@ def test_changing_cover_updates_selection_and_persists(dialog):
     assert dialog._changes == [('cover', 'yellow')]
 
 
+def test_changing_stdev_multiplier_rounds_and_persists(dialog):
+    dialog._on_multiplier_change(2.34)
+    assert dialog._prefs['stdev_multiplier'] == 2.3
+    assert dialog._changes == [('stdev_multiplier', 2.3)]
+    assert '2.3' in dialog._multiplier_lbl.cget('text')
+
+
+def test_generate_passes_stdev_multiplier_through(dialog, root, monkeypatch):
+    seen = {}
+
+    def fake_generate(*a, **k):
+        seen.update(k)
+        return {'pdf_path': None, 'html_path': None, 'page_count': 1,
+                'stats': {'totalArtists': 1, 'totalSongs': 1}}
+    monkeypatch.setattr(gui.songbook, 'generate_songbook', fake_generate)
+    dialog._on_multiplier_change(2.0)
+
+    dialog._generate()
+    ok = _pump(root, 5.0, until=lambda: not dialog._generating)
+
+    assert ok
+    assert seen['stdev_multiplier'] == 2.0
+
+
 # --- generate: success/failure/busy-guard -----------------------------------
 
 def test_generate_success_updates_status_and_enables_open(dialog, root, monkeypatch, tmp_path):

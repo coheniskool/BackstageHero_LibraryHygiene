@@ -115,13 +115,21 @@ def bucket_by_letter(sorted_entries):
                          for l in letter_order if l in buckets]}
 
 
-def compute_stats_and_toc(buckets):
+# Default multiplier for the "Most Requested"/"Heavy Hitters" threshold
+# (mean + multiplier*stdev). Placed ahead of compute_stats_and_toc() since a
+# default argument value is bound at module-load time, not call time.
+DEFAULT_STDEV_MULTIPLIER = 1.5
+
+
+def compute_stats_and_toc(buckets, stdev_multiplier=DEFAULT_STDEV_MULTIPLIER):
     """(stats_dict, toc_list) from a bucket_by_letter() result.
 
-    stats = {totalSongs, totalArtists, mean, stdev, threshold} where
-    threshold = mean + 1.5*stdev (songs-per-artist). toc lists artists over
-    that threshold, sorted alphabetically (not by count), matching the
-    "Most Requested" page's own copy ("average + 1.5 stdev").
+    stats = {totalSongs, totalArtists, mean, stdev, threshold, stdevMultiplier}
+    where threshold = mean + stdev_multiplier*stdev (songs-per-artist). toc
+    lists artists over that threshold, sorted alphabetically (not by count).
+    stdevMultiplier is carried in stats so render_html's TOC subhead can
+    display the actual value used, not a hardcoded one -- it's a user-facing
+    knob (SongbookDialog), not a fixed constant.
 
     Uses population stdev (statistics.pstdev): this describes the exact,
     fully-known set of artists in the library, not a sample drawn from a
@@ -136,7 +144,7 @@ def compute_stats_and_toc(buckets):
     counts = [count for _, count in artists]
     mean = statistics.mean(counts) if counts else 0.0
     stdev = statistics.pstdev(counts) if counts else 0.0
-    threshold = mean + 1.5 * stdev
+    threshold = mean + stdev_multiplier * stdev
 
     toc = sorted(
         ({'name': name, 'count': count} for name, count in artists if count > threshold),
@@ -148,6 +156,7 @@ def compute_stats_and_toc(buckets):
         'mean': mean,
         'stdev': stdev,
         'threshold': threshold,
+        'stdevMultiplier': stdev_multiplier,
     }
     return stats, toc
 
@@ -465,6 +474,7 @@ def _render_cover_page(stats, cover_color, binding_margin_in, synced_label):
 
 def _render_toc_page(toc, stats, accent_color, binding_margin_in):
     threshold = stats.get('threshold', 0)
+    stdev_multiplier = stats.get('stdevMultiplier', DEFAULT_STDEV_MULTIPLIER)
     entries = ''.join(f"""
           <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #b8b0a0; break-inside: avoid;">
             <span style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 13px; text-transform: uppercase; color: #2E2E2E;">{_esc(entry['name'])}</span>
@@ -477,10 +487,10 @@ def _render_toc_page(toc, stats, accent_color, binding_margin_in):
     <section class="page" style="padding: 0.55in 0.55in 0.55in {binding_margin_in}; background: #E9E1D4;">
       <div style="height: 100%; display: flex; flex-direction: column;">
         <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 5px solid #2E2E2E; padding-bottom: 10px; margin-bottom: 6px; flex: none;">
-          <h2 style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 34px; margin: 0; text-transform: uppercase; color: #2E2E2E; letter-spacing: 1px;">Most Requested</h2>
+          <h2 style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 34px; margin: 0; text-transform: uppercase; color: #2E2E2E; letter-spacing: 1px;">Heavy Hitters</h2>
           <span style="font-family: 'Courier New', monospace; font-size: 12px; color: {accent_color}; font-weight: 700;">HEAVY HITTERS</span>
         </div>
-        <p style="font-family: 'Courier New', monospace; font-size: 11px; color: #5a5550; margin: 0 0 18px; flex: none;">Artists with more than average + 1.5&sigma; songs in the library ({threshold:.2f}+). Sorted A&ndash;Z; page shows where the artist's songs begin.</p>
+        <p style="font-family: 'Courier New', monospace; font-size: 11px; color: #5a5550; margin: 0 0 18px; flex: none;">Artists with more than average + {stdev_multiplier:g}&sigma; songs in the library ({threshold:.2f}+). Sorted A&ndash;Z; page shows where the artist's songs begin.</p>
         <div style="column-count: 2; column-gap: 36px; flex: 1; overflow: hidden;">{entries}
         </div>
       </div>
@@ -626,6 +636,7 @@ class EmptyLibraryError(RuntimeError):
 def generate_songbook(songs_folder, songs=None, column_count=DEFAULT_COLUMN_COUNT,
                        binding_margin=DEFAULT_BINDING_MARGIN,
                        accent_color=DEFAULT_ACCENT_COLOR, cover_color=DEFAULT_COVER_COLOR,
+                       stdev_multiplier=DEFAULT_STDEV_MULTIPLIER,
                        synced_label='', out_path=None):
     """Generate a songbook PDF (+ sibling .html) for a library.
 
@@ -645,7 +656,7 @@ def generate_songbook(songs_folder, songs=None, column_count=DEFAULT_COLUMN_COUN
             f'No songs with both an artist and a title were found in {songs_folder!r}.')
 
     buckets = bucket_by_letter(dedupe_and_sort(entries))
-    stats, toc = compute_stats_and_toc(buckets)
+    stats, toc = compute_stats_and_toc(buckets, stdev_multiplier=stdev_multiplier)
     paginated = paginate(buckets, toc, column_count=column_count,
                          binding_margin=binding_margin)
     html_str = render_html(paginated, stats, accent_color=accent_color,
@@ -676,6 +687,9 @@ def parse_args(argv=None):
                         help='Accent color for the TOC/badges (default: denim).')
     parser.add_argument('--cover', choices=sorted(COVER_COLOR_CHOICES), default='red',
                         help='Cover poster color (default: red).')
+    parser.add_argument('--stdev-multiplier', type=float, default=DEFAULT_STDEV_MULTIPLIER,
+                        help='How many standard deviations above the mean an artist\'s '
+                             'song count must be to make the "Heavy Hitters" TOC (default: 1.5).')
     parser.add_argument('--out', type=str, default=None,
                         help='Output PDF path (default: <library-path>/Clone Hero Songbook.pdf).')
     return parser.parse_args(argv)
@@ -686,7 +700,7 @@ def main(argv=None):
     result = generate_songbook(
         args.library_path, column_count=args.columns, binding_margin=args.binding_margin,
         accent_color=ACCENT_COLOR_CHOICES[args.accent], cover_color=COVER_COLOR_CHOICES[args.cover],
-        out_path=args.out)
+        stdev_multiplier=args.stdev_multiplier, out_path=args.out)
     print(f"Wrote {result['pdf_path']} ({result['page_count']} pages, "
           f"{result['stats']['totalArtists']} artists, {result['stats']['totalSongs']} songs).")
 

@@ -157,7 +157,30 @@ def test_stats_exact_numbers():
     assert stats['mean'] == expected_mean
     assert stats['stdev'] == expected_stdev
     assert stats['threshold'] == expected_threshold
+    assert stats['stdevMultiplier'] == sb.DEFAULT_STDEV_MULTIPLIER
     assert toc == [{'name': 'Prolific Artist', 'count': 9}]
+
+
+def test_stats_custom_stdev_multiplier_changes_threshold_and_toc_membership():
+    # Same 1/1/1/9 fixture as test_stats_exact_numbers, but a much larger
+    # multiplier should push the threshold high enough that even the
+    # 9-song artist no longer qualifies for the TOC.
+    buckets = {'letters': [
+        {'letter': 'A', 'artists': [
+            {'name': 'Artist One', 'songs': ['S1']},
+            {'name': 'Artist Two', 'songs': ['S1']},
+            {'name': 'Artist Three', 'songs': ['S1']},
+            {'name': 'Prolific Artist', 'songs': [f'S{i}' for i in range(9)]},
+        ]},
+    ]}
+    counts = [1, 1, 1, 9]
+    mean, stdev = statistics.mean(counts), statistics.pstdev(counts)
+
+    stats, toc = sb.compute_stats_and_toc(buckets, stdev_multiplier=3.0)
+
+    assert stats['threshold'] == mean + 3.0 * stdev
+    assert stats['stdevMultiplier'] == 3.0
+    assert toc == [], 'threshold*3 should exceed even the 9-song artist'
 
 
 def test_toc_sorted_alphabetically_not_by_count():
@@ -176,7 +199,8 @@ def test_toc_sorted_alphabetically_not_by_count():
 def test_stats_empty_library():
     stats, toc = sb.compute_stats_and_toc({'letters': []})
     assert stats == {'totalSongs': 0, 'totalArtists': 0, 'mean': 0.0,
-                      'stdev': 0.0, 'threshold': 0.0}
+                      'stdev': 0.0, 'threshold': 0.0,
+                      'stdevMultiplier': sb.DEFAULT_STDEV_MULTIPLIER}
     assert toc == []
 
 
@@ -416,6 +440,24 @@ def test_render_html_uses_requested_colors():
     assert '#B5A642' in html
 
 
+def test_render_html_toc_subhead_shows_the_actual_stdev_multiplier():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0,
+             'threshold': 2.0, 'stdevMultiplier': 2.5}
+    html = sb.render_html(paginated, stats)
+    assert '2.5&sigma;' in html
+    assert '1.5&sigma;' not in html
+
+
+def test_render_html_toc_subhead_defaults_multiplier_when_stats_omits_it():
+    # Older callers (or hand-built test stats dicts) that never set
+    # stdevMultiplier must still render something sane, not a KeyError.
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats)
+    assert f'{sb.DEFAULT_STDEV_MULTIPLIER}' in html
+
+
 def test_render_html_escapes_html_in_titles_so_layout_matches_measurement():
     # Real library data contains literal '<i>' etc in titles (e.g. "Parody of
     # <i>Beat It</i>"). paginate() measured those characters as plain text, so
@@ -546,6 +588,14 @@ def test_generate_songbook_raises_on_empty_library(tmp_path):
         sb.generate_songbook(str(tmp_path))
 
 
+def test_generate_songbook_passes_through_stdev_multiplier(tmp_path):
+    _library(tmp_path)
+    result = sb.generate_songbook(str(tmp_path), stdev_multiplier=2.5)
+    assert result['stats']['stdevMultiplier'] == 2.5
+    html_text = result['html_path'].read_text(encoding='utf-8')
+    assert '2.5&sigma;' in html_text
+
+
 def test_parse_args_defaults():
     args = sb.parse_args(['--library-path', 'C:/Songs'])
     assert args.library_path == 'C:/Songs'
@@ -553,13 +603,16 @@ def test_parse_args_defaults():
     assert args.binding_margin == sb.DEFAULT_BINDING_MARGIN
     assert args.accent == 'denim'
     assert args.cover == 'red'
+    assert args.stdev_multiplier == sb.DEFAULT_STDEV_MULTIPLIER
     assert args.out is None
 
 
 def test_parse_args_overrides():
     args = sb.parse_args([
         '--library-path', 'C:/Songs', '--columns', '4', '--binding-margin', '1.1',
-        '--accent', 'red', '--cover', 'olive', '--out', 'C:/out.pdf'])
+        '--accent', 'red', '--cover', 'olive', '--stdev-multiplier', '2.0',
+        '--out', 'C:/out.pdf'])
+    assert args.stdev_multiplier == 2.0
     assert args.columns == 4
     assert args.binding_margin == 1.1
     assert args.accent == 'red'
