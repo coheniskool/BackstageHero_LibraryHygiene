@@ -1,6 +1,8 @@
 import statistics
 from pathlib import Path
 
+import pytest
+
 import songbook as sb
 
 
@@ -493,3 +495,73 @@ def test_render_pdf_raises_when_browser_missing(tmp_path, monkeypatch):
     import pytest
     with pytest.raises(sb.BrowserNotFoundError):
         sb.render_pdf('<html></html>', tmp_path / 'out.pdf')
+
+
+# --- generate_songbook orchestrator + CLI ---------------------------------------
+
+def _library(tmp_path):
+    _write_song(tmp_path, 'a', 'Sublime', 'Santeria')
+    _write_song(tmp_path, 'b', 'Sublime', 'What I Got')
+    _write_song(tmp_path, 'c', 'Sum 41', 'Fat Lip')
+    return tmp_path
+
+
+def test_generate_songbook_from_folder_path_cli_mode(tmp_path):
+    _library(tmp_path)
+    result = sb.generate_songbook(str(tmp_path))
+
+    assert result['pdf_path'] == tmp_path / 'Clone Hero Songbook.pdf'
+    assert result['html_path'] == tmp_path / 'Clone Hero Songbook.html'
+    assert result['html_path'].exists()
+    assert result['stats']['totalArtists'] == 2
+    assert result['stats']['totalSongs'] == 3
+    assert result['page_count'] >= 1
+    try:
+        sb._find_browser()
+    except sb.BrowserNotFoundError:
+        pytest.skip('no Chrome/Edge installed on this machine to assert the PDF itself')
+    assert result['pdf_path'].exists()
+
+
+def test_generate_songbook_from_song_list_gui_mode_skips_rescan(tmp_path):
+    _library(tmp_path)
+    songs = [_FakeSong(str(p)) for p in tmp_path.iterdir() if p.is_dir()]
+    result = sb.generate_songbook(str(tmp_path), songs=songs)
+    assert result['stats']['totalArtists'] == 2
+    assert result['html_path'].exists()
+
+
+def test_generate_songbook_passes_through_layout_and_color_options(tmp_path):
+    _library(tmp_path)
+    result = sb.generate_songbook(str(tmp_path), column_count=2,
+                                  binding_margin=1.1, accent_color='#3B5998',
+                                  cover_color='#B5A642')
+    html_text = result['html_path'].read_text(encoding='utf-8')
+    assert '#3B5998' in html_text
+    assert '#B5A642' in html_text
+
+
+def test_generate_songbook_raises_on_empty_library(tmp_path):
+    with pytest.raises(sb.EmptyLibraryError):
+        sb.generate_songbook(str(tmp_path))
+
+
+def test_parse_args_defaults():
+    args = sb.parse_args(['--library-path', 'C:/Songs'])
+    assert args.library_path == 'C:/Songs'
+    assert args.columns == 3
+    assert args.binding_margin == sb.DEFAULT_BINDING_MARGIN
+    assert args.accent == 'denim'
+    assert args.cover == 'red'
+    assert args.out is None
+
+
+def test_parse_args_overrides():
+    args = sb.parse_args([
+        '--library-path', 'C:/Songs', '--columns', '4', '--binding-margin', '1.1',
+        '--accent', 'red', '--cover', 'olive', '--out', 'C:/out.pdf'])
+    assert args.columns == 4
+    assert args.binding_margin == 1.1
+    assert args.accent == 'red'
+    assert args.cover == 'olive'
+    assert args.out == 'C:/out.pdf'

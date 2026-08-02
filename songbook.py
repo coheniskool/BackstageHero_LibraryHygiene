@@ -9,6 +9,7 @@
 # existing separation -- callable from gui.py's button, from a standalone CLI,
 # and from tests with no Tk/customtkinter involved.
 
+import argparse
 import html
 import math
 import os
@@ -607,3 +608,88 @@ def render_pdf(html_str, out_pdf_path):
     ], check=True, capture_output=True)
     os.replace(tmp_pdf, out_pdf_path)
     return out_pdf_path
+
+
+# --- orchestrator + CLI -----------------------------------------------------------
+#
+# The single entry point gui.py's button calls, mirroring _run_library_tool's
+# module-level-dispatch reasoning: it works identically with or without a GUI
+# open, so the CLI below is a thin argument-parsing shell around it.
+
+OUTPUT_BASENAME = 'Clone Hero Songbook'
+
+
+class EmptyLibraryError(RuntimeError):
+    """Raised when a library has no usable (artist, title) pairs to print."""
+
+
+def generate_songbook(songs_folder, songs=None, column_count=DEFAULT_COLUMN_COUNT,
+                       binding_margin=DEFAULT_BINDING_MARGIN,
+                       accent_color=DEFAULT_ACCENT_COLOR, cover_color=DEFAULT_COVER_COLOR,
+                       synced_label='', out_path=None):
+    """Generate a songbook PDF (+ sibling .html) for a library.
+
+    `songs`, when given, is used directly (the GUI's already-scanned in-memory
+    list) -- no folder re-walk. When omitted, songs_folder itself is walked
+    (the standalone CLI path). Regenerates fully every call, like
+    gui.py's _export_library_csv() -- never an incremental update.
+
+    Returns {'pdf_path', 'html_path', 'page_count', 'stats'}. Raises
+    EmptyLibraryError if there is nothing to print, or BrowserNotFoundError
+    if render_pdf() can't find Chrome/Edge -- both left uncaught, since a
+    dialog-less caller and a GUI dialog want to handle them differently.
+    """
+    entries = parse_entries(songs if songs is not None else songs_folder)
+    if not entries:
+        raise EmptyLibraryError(
+            f'No songs with both an artist and a title were found in {songs_folder!r}.')
+
+    buckets = bucket_by_letter(dedupe_and_sort(entries))
+    stats, toc = compute_stats_and_toc(buckets)
+    paginated = paginate(buckets, toc, column_count=column_count,
+                         binding_margin=binding_margin)
+    html_str = render_html(paginated, stats, accent_color=accent_color,
+                           cover_color=cover_color, binding_margin=binding_margin,
+                           synced_label=synced_label)
+
+    pdf_path = Path(out_path) if out_path else Path(songs_folder) / f'{OUTPUT_BASENAME}.pdf'
+    result_path = render_pdf(html_str, pdf_path)
+
+    return {
+        'pdf_path': result_path,
+        'html_path': result_path.with_suffix('.html'),
+        'page_count': len(paginated['pages']) + 2,  # + cover + TOC
+        'stats': stats,
+    }
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description='Generate a printable Clone Hero karaoke songbook PDF from a library folder.')
+    parser.add_argument('--library-path', type=str, required=True,
+                        help='Path to your Clone Hero songs library folder.')
+    parser.add_argument('--columns', type=int, default=DEFAULT_COLUMN_COUNT, choices=(2, 3, 4),
+                        help='Song-list columns per page (default: 3).')
+    parser.add_argument('--binding-margin', type=float, default=DEFAULT_BINDING_MARGIN,
+                        help='Spine-side page margin in inches, 0.6-1.3 (default: 0.9).')
+    parser.add_argument('--accent', choices=sorted(ACCENT_COLOR_CHOICES), default='denim',
+                        help='Accent color for the TOC/badges (default: denim).')
+    parser.add_argument('--cover', choices=sorted(COVER_COLOR_CHOICES), default='red',
+                        help='Cover poster color (default: red).')
+    parser.add_argument('--out', type=str, default=None,
+                        help='Output PDF path (default: <library-path>/Clone Hero Songbook.pdf).')
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    result = generate_songbook(
+        args.library_path, column_count=args.columns, binding_margin=args.binding_margin,
+        accent_color=ACCENT_COLOR_CHOICES[args.accent], cover_color=COVER_COLOR_CHOICES[args.cover],
+        out_path=args.out)
+    print(f"Wrote {result['pdf_path']} ({result['page_count']} pages, "
+          f"{result['stats']['totalArtists']} artists, {result['stats']['totalSongs']} songs).")
+
+
+if __name__ == '__main__':
+    main()

@@ -35,12 +35,13 @@ See [`plan-karaoke-songbook.md`](plan-karaoke-songbook.md) for full detail, exac
   - **Known, undeliverable gap, not a bug**: the cover markup references `./assets/collage-stickers.png` (visible as a punk-sticker collage in `screenshots/01-cover.png`'s middle third) — no `assets/` folder exists anywhere in the handoff bundle, so this asset was never delivered. Left blank rather than fabricated; flagged to Aaron directly, since closing this gap needs either the original asset or a fresh piece of art, not an implementation decision.
   - PIL measurement fidelity (Task 2's concern) and `bindingMargin=0.9` both held up under the real-PDF render — no retuning needed.
 
-## Task 4: Orchestrator + optional CLI entry (needs Task 3)
+## Task 4: Orchestrator + optional CLI entry (needs Task 3) — ✅ DONE 2026-08-02
 — S — **Model: Haiku 4.5** (thin wrapper chaining already-built functions, CLI mirrors an existing pattern)
-- [ ] `generate_songbook(songs_folder, songs=None, ...)` — GUI path (passed-in list) vs CLI path (`songs=None` walks folder); writes `Clone Hero Songbook.pdf`+`.html`, returns result dict or raises
-- [ ] `argparse` CLI (`--library-path`, `--columns`, `--binding-margin`, `--accent`, `--cover`, `--out`) mirroring `dedupe_report.py`'s flag style
-- [ ] Cold-shell CLI run against a tmp folder built from `sample-library.csv`, no GUI import
-- [ ] pytest covering `generate_songbook()` end-to-end (skip real-PDF assertion if no Chrome/Edge present)
+- [x] `generate_songbook(songs_folder, songs=None, ...)` — GUI path (passed-in list, no re-scan) vs CLI path (`songs=None` walks folder); writes `Clone Hero Songbook.pdf`+`.html`, returns `{pdf_path, html_path, page_count, stats}` or raises `EmptyLibraryError`/`BrowserNotFoundError` uncaught (left to the caller — GUI dialog and CLI want to handle each differently)
+- [x] `argparse` CLI (`--library-path`, `--columns`, `--binding-margin`, `--accent`, `--cover`, `--out`) mirroring `dedupe_report.py`'s flag style exactly (`parse_args()`/`main()` split, same help-text tone); `--accent`/`--cover` take named swatches (`denim`/`olive`/`red`/`yellow`) via `ACCENT_COLOR_CHOICES`/`COVER_COLOR_CHOICES`, not raw hex
+- [x] Cold-shell CLI run against a fresh tmp folder (2 real `song.ini` files, no `sample-library.csv` needed for this check) — `python songbook.py --library-path <tmp>` printed `Wrote .../Clone Hero Songbook.pdf (3 pages, 2 artists, 2 songs).` with zero GUI import; `--help` prints cleanly
+- [x] 6 new tests (46 total in the file): folder-path CLI mode (skips the real-PDF assertion if no Chrome/Edge, always asserts the HTML), song-list GUI mode, color/layout passthrough, `EmptyLibraryError` on a library with nothing to print, `parse_args()` defaults and overrides
+- [x] `pytest tests/test_songbook.py -v` — 46/46 passed; `pytest tests/ -v` full suite — 630 passed, 1 pre-existing skip, no regressions
 
 ## Task 5: GUI integration (needs Task 4)
 — L — **Model: Sonnet 5** (new dialog + threading + settings wiring, modeled closely on `LibraryToolsDialog` but editing production `gui.py`; thread-marshalling mistakes surface subtly — an intermittent freeze or a stale status label, not a crash)
