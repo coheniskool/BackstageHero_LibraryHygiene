@@ -17,6 +17,7 @@ import os
 import shutil
 import statistics
 import subprocess
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -436,9 +437,14 @@ def _page_shell_css(binding_margin_in):
     """
 
 
-def _render_cover_page(stats, cover_color, binding_margin_in, synced_label):
+def _render_cover_page(stats, cover_color, binding_margin_in, synced_label,
+                       cover_image_data_uri=None):
     total_artists = stats.get('totalArtists', 0)
     total_songs = stats.get('totalSongs', 0)
+    collage = (
+        f'<img src="{cover_image_data_uri}" style="position: absolute; inset: 0; '
+        f'width: 100%; height: 100%; object-fit: contain; object-position: right center;">'
+        if cover_image_data_uri else '')
     return f"""
     <section class="page" style="padding: 0.55in 0.55in 0.55in {binding_margin_in}; background: #232120; color: #E9E1D4;">
       <div style="position: absolute; inset: 0; background-image: radial-gradient(rgba(233,225,212,0.05) 1px, transparent 1px); background-size: 3px 3px; opacity: 0.6;"></div>
@@ -461,7 +467,7 @@ def _render_cover_page(stats, cover_color, binding_margin_in, synced_label):
 
           <div style="position: relative; margin-top: 34px; display: inline-block; background: #232120; color: #E9E1D4; padding: 9px 20px; font-family: 'Courier New', monospace; font-size: 15px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; transform: rotate(-1deg);">Every Song. Every Screamer.</div>
 
-          <div style="position: relative; flex: 1; margin: 10px -32px 10px 0;"></div>
+          <div style="position: relative; flex: 1; margin: 10px -32px 10px 0; overflow: hidden;">{collage}</div>
 
           <div style="position: relative; margin-top: auto; display: flex; justify-content: space-between; border-top: 3px dashed #232120; padding-top: 14px; font-family: 'Courier New', monospace; font-size: 15px; font-weight: 700;">
             <span>{total_artists} ARTISTS</span><span>{total_songs} SONGS</span>
@@ -528,16 +534,20 @@ def _render_content_page(page, col_width_css, binding_margin_in):
 
 def render_html(paginated, stats, accent_color=DEFAULT_ACCENT_COLOR,
                  cover_color=DEFAULT_COVER_COLOR, binding_margin=DEFAULT_BINDING_MARGIN,
-                 synced_label=''):
-    """Full standalone HTML document string for one songbook: cover, "Most
-    Requested" TOC, then one section per paginate() page. `paginated` is a
+                 synced_label='', cover_image_data_uri=None):
+    """Full standalone HTML document string for one songbook: cover, "Heavy
+    Hitters" TOC, then one section per paginate() page. `paginated` is a
     paginate() result; `stats` is a compute_stats_and_toc() stats dict.
+    cover_image_data_uri, when given, fills the cover's collage area with
+    that image (a "data:image/..." URI -- see _image_to_data_uri()); left
+    blank otherwise, exactly as before this option existed.
     """
     binding_margin_in = f'{binding_margin}in'
     col_width_css = f"{paginated['colWidth']}px"
 
     body = (
-        _render_cover_page(stats, cover_color, binding_margin_in, synced_label)
+        _render_cover_page(stats, cover_color, binding_margin_in, synced_label,
+                          cover_image_data_uri=cover_image_data_uri)
         + _render_toc_page(paginated['toc'], stats, accent_color, binding_margin_in)
         + ''.join(_render_content_page(page, col_width_css, binding_margin_in)
                   for page in paginated['pages'])
@@ -747,6 +757,33 @@ def extract_cover_and_accent_colors(image_path):
             _clamp_for_legibility(accent_rgb, 'accent'))
 
 
+def _image_to_data_uri(image_path, max_dimension=1200):
+    """"data:image/<fmt>;base64,..." for image_path, downscaled if needed and
+    re-encoded through Pillow -- so a source format headless Chrome can't
+    render natively (or a needlessly huge photo) still works, and the
+    output HTML stays one self-contained file (no separate asset to manage
+    alongside it, matching this module's existing single-file .html output).
+    """
+    import base64
+    import io
+
+    from PIL import Image
+    with Image.open(image_path) as img:
+        # .format is lost once .convert() runs (Pillow only tracks it on the
+        # freshly-opened object), so it must be read before converting.
+        # JPEG for a photographic source (keeps file size sane); PNG
+        # otherwise, since re-saving flat/graphic art as JPEG can introduce
+        # visible compression artifacts a lossless format would not.
+        fmt = 'JPEG' if (img.format or '').upper() in ('JPEG', 'JPG') else 'PNG'
+        img = img.convert('RGB')
+        img.thumbnail((max_dimension, max_dimension))
+        buffer = io.BytesIO()
+        img.save(buffer, format=fmt)
+        encoded = base64.b64encode(buffer.getvalue()).decode('ascii')
+    mime = 'jpeg' if fmt == 'JPEG' else 'png'
+    return f'data:image/{mime};base64,{encoded}'
+
+
 # --- orchestrator + CLI -----------------------------------------------------------
 #
 # The single entry point gui.py's button calls, mirroring _run_library_tool's
@@ -764,13 +801,19 @@ def generate_songbook(songs_folder, songs=None, column_count=DEFAULT_COLUMN_COUN
                        binding_margin=DEFAULT_BINDING_MARGIN,
                        accent_color=DEFAULT_ACCENT_COLOR, cover_color=DEFAULT_COVER_COLOR,
                        stdev_multiplier=DEFAULT_STDEV_MULTIPLIER,
-                       synced_label='', out_path=None):
+                       synced_label='', out_path=None, cover_image_path=None):
     """Generate a songbook PDF (+ sibling .html) for a library.
 
     `songs`, when given, is used directly (the GUI's already-scanned in-memory
     list) -- no folder re-walk. When omitted, songs_folder itself is walked
     (the standalone CLI path). Regenerates fully every call, like
     gui.py's _export_library_csv() -- never an incremental update.
+
+    cover_image_path, when given, places that image in the cover's collage
+    area. Does NOT itself call extract_cover_and_accent_colors() -- callers
+    resolve accent_color/cover_color before calling this (same as they
+    already resolve a swatch name to a hex today), keeping this function
+    decoupled from *how* a color was chosen.
 
     Returns {'pdf_path', 'html_path', 'page_count', 'stats'}. Raises
     EmptyLibraryError if there is nothing to print, or BrowserNotFoundError
@@ -786,9 +829,11 @@ def generate_songbook(songs_folder, songs=None, column_count=DEFAULT_COLUMN_COUN
     stats, toc = compute_stats_and_toc(buckets, stdev_multiplier=stdev_multiplier)
     paginated = paginate(buckets, toc, column_count=column_count,
                          binding_margin=binding_margin)
+    cover_image_data_uri = _image_to_data_uri(cover_image_path) if cover_image_path else None
     html_str = render_html(paginated, stats, accent_color=accent_color,
                            cover_color=cover_color, binding_margin=binding_margin,
-                           synced_label=synced_label)
+                           synced_label=synced_label,
+                           cover_image_data_uri=cover_image_data_uri)
 
     pdf_path = Path(out_path) if out_path else Path(songs_folder) / f'{OUTPUT_BASENAME}.pdf'
     result_path = render_pdf(html_str, pdf_path)
@@ -810,24 +855,62 @@ def parse_args(argv=None):
                         help='Song-list columns per page (default: 3).')
     parser.add_argument('--binding-margin', type=float, default=DEFAULT_BINDING_MARGIN,
                         help='Spine-side page margin in inches, 0.6-1.3 (default: 0.9).')
-    parser.add_argument('--accent', choices=sorted(ACCENT_COLOR_CHOICES), default='denim',
-                        help='Accent color for the TOC/badges (default: denim).')
-    parser.add_argument('--cover', choices=sorted(COVER_COLOR_CHOICES), default='red',
-                        help='Cover poster color (default: red).')
+
+    accent_group = parser.add_mutually_exclusive_group()
+    accent_group.add_argument('--accent', choices=sorted(ACCENT_COLOR_CHOICES), default='denim',
+                              help='Accent color for the TOC/badges (default: denim).')
+    accent_group.add_argument('--accent-hex', type=str, default=None,
+                              help='Exact accent color, e.g. "#3B5998" -- overrides --accent.')
+
+    cover_group = parser.add_mutually_exclusive_group()
+    cover_group.add_argument('--cover', choices=sorted(COVER_COLOR_CHOICES), default='red',
+                             help='Cover poster color (default: red).')
+    cover_group.add_argument('--cover-hex', type=str, default=None,
+                             help='Exact cover color, e.g. "#8C2727" -- overrides --cover.')
+
+    parser.add_argument('--album-art', type=str, default=None,
+                        help='Derive both accent and cover color from this image\'s dominant '
+                             'colors instead of --accent/--cover(-hex).')
+    parser.add_argument('--show-album-art-on-cover', action='store_true',
+                        help='Also place --album-art\'s image in the cover\'s collage area '
+                             '(requires --album-art).')
+
     parser.add_argument('--stdev-multiplier', type=float, default=DEFAULT_STDEV_MULTIPLIER,
                         help='How many standard deviations above the mean an artist\'s '
                              'song count must be to make the "Heavy Hitters" TOC (default: 1.5).')
     parser.add_argument('--out', type=str, default=None,
                         help='Output PDF path (default: <library-path>/Clone Hero Songbook.pdf).')
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    # --album-art sets BOTH colors at once, so it can't coexist with any
+    # single-role color flag -- argparse's mutually_exclusive_group can't
+    # express "one arg excludes four others split across two groups," so
+    # this cross-cutting check is done by hand, but still raises the same
+    # way (parser.error -> usage message + SystemExit(2)) a native group would.
+    if args.album_art:
+        raw = list(argv) if argv is not None else sys.argv[1:]
+        conflicting = [f for f in ('--accent', '--cover', '--accent-hex', '--cover-hex')
+                       if any(tok == f or tok.startswith(f + '=') for tok in raw)]
+        if conflicting:
+            parser.error(f"--album-art cannot be combined with {', '.join(conflicting)} "
+                         '(it derives both colors from the image).')
+
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.album_art:
+        accent_color, cover_color = extract_cover_and_accent_colors(args.album_art)
+    else:
+        accent_color = args.accent_hex or ACCENT_COLOR_CHOICES[args.accent]
+        cover_color = args.cover_hex or COVER_COLOR_CHOICES[args.cover]
+
     result = generate_songbook(
         args.library_path, column_count=args.columns, binding_margin=args.binding_margin,
-        accent_color=ACCENT_COLOR_CHOICES[args.accent], cover_color=COVER_COLOR_CHOICES[args.cover],
-        stdev_multiplier=args.stdev_multiplier, out_path=args.out)
+        accent_color=accent_color, cover_color=cover_color,
+        stdev_multiplier=args.stdev_multiplier, out_path=args.out,
+        cover_image_path=args.album_art if args.show_album_art_on_cover else None)
     print(f"Wrote {result['pdf_path']} ({result['page_count']} pages, "
           f"{result['stats']['totalArtists']} artists, {result['stats']['totalSongs']} songs).")
 

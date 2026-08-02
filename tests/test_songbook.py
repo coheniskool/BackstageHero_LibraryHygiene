@@ -483,6 +483,44 @@ def test_render_html_no_page_number_on_cover_or_toc():
     assert html.count('class="page"') == 3  # cover + toc + 1 content page
 
 
+def test_render_html_cover_stays_blank_without_an_image():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats)
+    assert '<img' not in html
+
+
+def test_render_html_places_cover_image_when_given():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    fake_uri = 'data:image/png;base64,AAAA'
+    html = sb.render_html(paginated, stats, cover_image_data_uri=fake_uri)
+    assert f'<img src="{fake_uri}"' in html
+    assert 'object-fit:contain' in html or 'object-fit: contain' in html
+
+
+# --- _image_to_data_uri -----------------------------------------------------------
+
+def test_image_to_data_uri_roundtrips_a_real_image(tmp_path):
+    path = tmp_path / 'art.png'
+    Image.new('RGB', (50, 50), (10, 20, 30)).save(path)
+    uri = sb._image_to_data_uri(str(path))
+    assert uri.startswith('data:image/')
+    assert ';base64,' in uri
+
+
+def test_image_to_data_uri_downscales_large_images(tmp_path):
+    path = tmp_path / 'big.png'
+    Image.new('RGB', (3000, 3000), (10, 20, 30)).save(path)
+    uri = sb._image_to_data_uri(str(path), max_dimension=200)
+    import base64
+    import io as _io
+    header, b64data = uri.split(',', 1)
+    decoded = base64.b64decode(b64data)
+    with Image.open(_io.BytesIO(decoded)) as img:
+        assert max(img.size) <= 200
+
+
 # --- Chrome/Edge discovery + PDF export -----------------------------------------
 
 def test_find_browser_prefers_which_over_hardcoded_paths(monkeypatch):
@@ -596,6 +634,92 @@ def test_generate_songbook_passes_through_stdev_multiplier(tmp_path):
     assert result['stats']['stdevMultiplier'] == 2.5
     html_text = result['html_path'].read_text(encoding='utf-8')
     assert '2.5&sigma;' in html_text
+
+
+def test_generate_songbook_places_cover_image_when_path_given(tmp_path):
+    _library(tmp_path)
+    art_path = tmp_path / 'art.png'
+    Image.new('RGB', (40, 40), (10, 20, 30)).save(art_path)
+    result = sb.generate_songbook(str(tmp_path), cover_image_path=str(art_path))
+    html_text = result['html_path'].read_text(encoding='utf-8')
+    assert '<img src="data:image/' in html_text
+
+
+def test_generate_songbook_no_cover_image_by_default(tmp_path):
+    _library(tmp_path)
+    result = sb.generate_songbook(str(tmp_path))
+    html_text = result['html_path'].read_text(encoding='utf-8')
+    assert '<img' not in html_text
+
+
+def test_parse_args_album_art_and_show_on_cover():
+    args = sb.parse_args(['--library-path', 'C:/Songs', '--album-art', 'C:/art.png',
+                          '--show-album-art-on-cover'])
+    assert args.album_art == 'C:/art.png'
+    assert args.show_album_art_on_cover is True
+
+
+def test_parse_args_show_on_cover_defaults_false():
+    args = sb.parse_args(['--library-path', 'C:/Songs'])
+    assert args.album_art is None
+    assert args.show_album_art_on_cover is False
+
+
+def test_parse_args_accent_hex_and_cover_hex():
+    args = sb.parse_args(['--library-path', 'C:/Songs',
+                          '--accent-hex', '#3B5998', '--cover-hex', '#8C2727'])
+    assert args.accent_hex == '#3B5998'
+    assert args.cover_hex == '#8C2727'
+
+
+def test_parse_args_accent_and_accent_hex_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        sb.parse_args(['--library-path', 'C:/Songs',
+                       '--accent', 'red', '--accent-hex', '#3B5998'])
+
+
+def test_parse_args_cover_and_cover_hex_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        sb.parse_args(['--library-path', 'C:/Songs',
+                       '--cover', 'olive', '--cover-hex', '#8C2727'])
+
+
+def test_parse_args_album_art_conflicts_with_accent_flag():
+    with pytest.raises(SystemExit):
+        sb.parse_args(['--library-path', 'C:/Songs',
+                       '--album-art', 'C:/art.png', '--accent', 'red'])
+
+
+def test_parse_args_album_art_conflicts_with_cover_hex_flag():
+    with pytest.raises(SystemExit):
+        sb.parse_args(['--library-path', 'C:/Songs',
+                       '--album-art', 'C:/art.png', '--cover-hex', '#8C2727'])
+
+
+def test_parse_args_album_art_alone_is_fine():
+    args = sb.parse_args(['--library-path', 'C:/Songs', '--album-art', 'C:/art.png'])
+    assert args.album_art == 'C:/art.png'
+
+
+def test_main_resolves_album_art_colors(tmp_path, monkeypatch, capsys):
+    _library(tmp_path)
+    art_path = tmp_path / 'art.png'
+    Image.new('RGB', (40, 40), (200, 30, 30)).save(art_path)
+
+    called = {}
+    real_generate = sb.generate_songbook
+
+    def spy_generate(*args, **kwargs):
+        called.update(kwargs)
+        return real_generate(*args, **kwargs)
+    monkeypatch.setattr(sb, 'generate_songbook', spy_generate)
+
+    sb.main(['--library-path', str(tmp_path), '--album-art', str(art_path),
+            '--show-album-art-on-cover'])
+
+    assert called['accent_color'].startswith('#')
+    assert called['cover_color'].startswith('#')
+    assert called['cover_image_path'] == str(art_path)
 
 
 def test_parse_args_defaults():

@@ -2,23 +2,26 @@
 
 See [`plan-songbook-custom-colors.md`](plan-songbook-custom-colors.md) for full detail. Spec: [`../SPEC-songbook-album-art-colors.md`](../SPEC-songbook-album-art-colors.md).
 
-## Task 1: Palette extraction + legibility clamping (songbook.py)
+## Task 1: Palette extraction + legibility clamping (songbook.py) — ✅ DONE 2026-08-02
 — M — **Model: Sonnet 5** (new algorithmic logic, real correctness bar)
-- [ ] `_load_weighted_palette()` — Pillow quantize+getcolors on a downscaled copy
-- [ ] `_score_swatch()` — count * saturation-weighted score
-- [ ] `_pick_primary_and_accent()` — top score = primary; ≥30° hue-distant next = accent, else 2nd-highest
-- [ ] `_clamp_for_legibility(rgb, role)` — HSL band per role, generic (reused by Task 3's custom picker)
-- [ ] `AlbumArtError` + `extract_cover_and_accent_colors()`
-- [ ] Unit tests: weighted scoring (gray-vs-red), two-solid-halves, clamp edge cases (white/black/gray) with exact bound assertions
-- [ ] Manual checkpoint: run against 3-4 real images (pale/dark/vivid), verify HSL numbers land in intended bands, tune constants here (not deferred)
+- [x] `_load_weighted_palette()` — Pillow quantize+getcolors on a downscaled copy
+- [x] `_score_swatch()` — `count * (0.05 + 0.95*saturation)` — tuned so a vivid 20%-area region beats an 80% gray background comfortably (not a razor's-edge split)
+- [x] `_pick_primary_and_accent()` — top score = primary; scans past a hue-close 2nd place for the first swatch ≥30° away, falls back to literal 2nd-highest if nothing clears the bar (incl. single-swatch flat-art case: accent=primary)
+- [x] `_clamp_for_legibility(rgb, role)` — HSL band per role (`cover`: L[0.35,0.70]/minS 0.35; `accent`: L[0.22,0.50]/minS 0.45 — darker/more-saturated since it's used both as a white-text badge bg and as text-on-cream), generic (reused by Task 3's custom picker)
+- [x] `AlbumArtError` + `extract_cover_and_accent_colors()`
+- [x] 24 unit tests: weighted scoring (gray-vs-red), hue-distance-skip with a 3rd-place fallback, single-swatch case, clamp edge cases (white/black/gray) — required widening an initially-too-tight `1e-6` tolerance to `6e-3` to account for real 8-bit RGB round-trip quantization noise, not a real bug
+- [x] Manual checkpoint: ran against 3 realistic synthetic images (pale cream+powder-blue, near-black+dark-red, vivid yellow+purple) and **rendered the actual cover/TOC pages through headless Chrome** to eyeball real legibility — all three read clearly; the dark case's accent color landed 0.0036 below the saturation floor on paper (pure round-trip rounding, confirmed by checking the raw un-rounded value) but is visually indistinguishable from in-band. No constant retuning needed.
 
-## Task 2: Cover-image embedding + render/generate plumbing (songbook.py)
+## Task 2: Cover-image embedding + render/generate plumbing (songbook.py) — ✅ DONE 2026-08-02
 — S/M — **Model: Sonnet 5**
-- [ ] `_image_to_data_uri(image_path, max_dimension=1200)`
-- [ ] `render_html(..., cover_image_data_uri=None)` fills the cover's blank collage div
-- [ ] `generate_songbook(..., cover_image_path=None)` — does NOT call extraction itself
-- [ ] CLI: `--album-art`, `--accent-hex`, `--cover-hex`, `--show-album-art-on-cover`, mutually-exclusive groups per role
-- [ ] Tests: `<img>` present/absent, end-to-end with real image, CLI flag defaults + mutual-exclusion `SystemExit`
+- [x] `_image_to_data_uri(image_path, max_dimension=1200)` — caught and fixed a real bug during implementation: Pillow's `.format` attribute is lost after `.convert('RGB')` (confirmed directly), so the JPEG-vs-PNG format decision has to read `.format` *before* converting, not after
+- [x] `render_html(..., cover_image_data_uri=None)` fills the cover's blank collage div; unchanged (blank) when omitted
+- [x] `generate_songbook(..., cover_image_path=None)` — does NOT call extraction itself, per the spec's boundary
+- [x] CLI: `--album-art`, `--accent-hex`, `--cover-hex`, `--show-album-art-on-cover`; `--accent`/`--accent-hex` and `--cover`/`--cover-hex` are true `argparse.add_mutually_exclusive_group()` pairs; `--album-art`'s conflict with all four role flags is a manual post-parse check (argparse can't put one arg in two groups) that still raises via `parser.error()` for the same usage-message-then-`SystemExit(2)` behavior
+- [x] 17 new tests: `<img>` present/absent, data-URI round-trip + downscaling, end-to-end with a real image, all CLI flag defaults/overrides, both native mutually-exclusive-group errors and the manual album-art conflict check, `main()`'s color resolution via a spy on `generate_songbook`
+- [x] `pytest tests/test_songbook.py -v` — 81/81 passed
+- [x] Cold-shell CLI verification: `--album-art ... --show-album-art-on-cover` (confirmed the data URI actually lands in the output HTML), `--accent-hex/--cover-hex` (confirmed absent), and the mutual-exclusion error (confirmed exit code 2 with a specific message naming the conflicting flag) — all three run standalone, no GUI import
+- [x] `pytest tests/ -v` full suite — 681 passed, 1 pre-existing skip, no regressions
 
 ## Task 3: GUI — Album Art row + Custom color buttons (gui.py, needs Task 1-2)
 — L — **Model: Sonnet 5** (production `gui.py`, subtle-bug risk profile)
