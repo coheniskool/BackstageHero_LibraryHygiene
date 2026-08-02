@@ -9,9 +9,12 @@
 # existing separation -- callable from gui.py's button, from a standalone CLI,
 # and from tests with no Tk/customtkinter involved.
 
+import html
 import math
 import os
+import shutil
 import statistics
+import subprocess
 from functools import lru_cache
 from pathlib import Path
 
@@ -368,3 +371,239 @@ def paginate(buckets, toc, column_count=DEFAULT_COLUMN_COUNT,
                 for entry in (toc or [])],
         'colWidth': col_width,
     }
+
+
+# --- HTML rendering ---------------------------------------------------------------
+#
+# Ports the reference prototype's markup/CSS near-verbatim into plain Python
+# string templates (the design is final, not a starting point -- see
+# SPEC-karaoke-songbook.md's Boundaries). The reference relied on a generic
+# <doc-page> web component for page-box sizing/print CSS; that harness is not
+# Clone-Hero-specific, so it is reimplemented directly here instead of ported.
+
+# The reference source disagreed with itself on these: renderVals()'s own
+# `??` fallback says accent=#8C2727/cover=#6B8E23, but the DC props schema
+# declares accent=#3B5998/cover=#8C2727. Empirically, screenshots/01-cover.png
+# and 02-most-requested.png (the design tool's own rendered captures) are red
+# and denim-blue respectively -- i.e. they match the *props schema* defaults,
+# not renderVals()'s internal fallback. Confirmed by directly comparing this
+# port's Task 3 checkpoint render against both screenshots; verified visually,
+# not assumed.
+DEFAULT_ACCENT_COLOR = '#3B5998'
+DEFAULT_COVER_COLOR = '#8C2727'
+
+# Named swatches, matching the reference's DC props schema `options` lists --
+# used by the CLI (Task 4) and GUI (Task 5) to offer the same choices the
+# design tool did, without exposing raw hex to the user.
+ACCENT_COLOR_CHOICES = {'red': '#8C2727', 'olive': '#B5A642', 'denim': '#3B5998'}
+COVER_COLOR_CHOICES = {'olive': '#6B8E23', 'denim': '#3B5998', 'red': '#8C2727', 'yellow': '#B5A642'}
+
+_PAGE_WIDTH_IN = 8.5
+_PAGE_HEIGHT_IN = 11
+
+
+def _esc(text):
+    return html.escape(text or '', quote=True)
+
+
+def _page_shell_css(binding_margin_in):
+    # Each .page is sized to exactly one physical US Letter sheet and forced
+    # onto its own printed page -- both the modern `break-after` and the
+    # older `page-break-after` are set since headless Chrome's print-to-pdf
+    # path is what actually consumes this, not a specific browser's newest
+    # engine version.
+    return f"""
+    * {{ margin: 0; box-sizing: border-box; }}
+    body {{ margin: 0; background: #2E2E2E; }}
+    @page {{ size: {_PAGE_WIDTH_IN}in {_PAGE_HEIGHT_IN}in; margin: 0; }}
+    .page {{
+      width: {_PAGE_WIDTH_IN}in; height: {_PAGE_HEIGHT_IN}in;
+      break-after: page; page-break-after: always;
+      position: relative; overflow: hidden;
+    }}
+    .page:last-child {{ break-after: auto; page-break-after: auto; }}
+    """
+
+
+def _render_cover_page(stats, cover_color, binding_margin_in, synced_label):
+    total_artists = stats.get('totalArtists', 0)
+    total_songs = stats.get('totalSongs', 0)
+    return f"""
+    <section class="page" style="padding: 0.55in 0.55in 0.55in {binding_margin_in}; background: #232120; color: #E9E1D4;">
+      <div style="position: absolute; inset: 0; background-image: radial-gradient(rgba(233,225,212,0.05) 1px, transparent 1px); background-size: 3px 3px; opacity: 0.6;"></div>
+      <div style="position: absolute; inset: 0; background: repeating-linear-gradient(115deg, rgba(0,0,0,0.18) 0px, transparent 2px, transparent 6px); mix-blend-mode: multiply;"></div>
+      <div style="position: absolute; top: -40px; right: -60px; width: 320px; height: 320px; border-radius: 50%; background: radial-gradient(circle, rgba(140,39,39,0.35), transparent 70%); filter: blur(2px);"></div>
+
+      <div style="height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative;">
+        <div style="position: relative; width: 92%; height: 90%; display: flex; flex-direction: column; background: {cover_color}; color: #232120; padding: 40px 32px; box-sizing: border-box; transform: rotate(-0.6deg); box-shadow: 0 14px 34px rgba(0,0,0,0.6);">
+          <div style="position: absolute; inset: 0; background: repeating-linear-gradient(0deg, rgba(0,0,0,0.08) 0px, transparent 3px, transparent 7px);"></div>
+          <div style="position: absolute; inset: 0; background: repeating-linear-gradient(90deg, rgba(0,0,0,0.06) 0px, transparent 3px, transparent 9px);"></div>
+
+          <div style="position: absolute; top: -16px; left: 24px; width: 60px; height: 18px; background: repeating-linear-gradient(45deg, #9c9584, #9c9584 6px, #7a7468 6px, #7a7468 12px); transform: rotate(-30deg); box-shadow: 0 2px 5px rgba(0,0,0,0.5); z-index: 3;"></div>
+          <div style="position: absolute; top: -14px; right: 30px; width: 56px; height: 18px; background: repeating-linear-gradient(45deg, #9c9584, #9c9584 6px, #7a7468 6px, #7a7468 12px); transform: rotate(24deg); box-shadow: 0 2px 5px rgba(0,0,0,0.5); z-index: 3;"></div>
+          <div style="position: absolute; bottom: -14px; left: 40%; width: 56px; height: 18px; background: repeating-linear-gradient(45deg, #9c9584, #9c9584 6px, #7a7468 6px, #7a7468 12px); transform: rotate(-8deg); box-shadow: 0 2px 5px rgba(0,0,0,0.5); z-index: 3;"></div>
+
+          <div style="position: relative; font-family: 'Courier New', monospace; font-size: 11px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase;">VOL. 1 &middot; A LIBRARY OF NOISE</div>
+
+          <div style="position: relative; margin-top: 26px; font-family: 'Courier New', monospace; font-weight: 700; font-size: 58px; line-height: 0.88; text-transform: uppercase; color: #E9E1D4; text-shadow: 3px 3px 0 #232120;">Clone<br>Hero</div>
+          <div style="position: relative; margin-top: 8px; font-family: 'Courier New', monospace; font-weight: 700; font-size: 58px; line-height: 0.88; text-transform: uppercase; color: #232120; -webkit-text-stroke: 2px #E9E1D4;">Songbook</div>
+
+          <div style="position: relative; margin-top: 34px; display: inline-block; background: #232120; color: #E9E1D4; padding: 9px 20px; font-family: 'Courier New', monospace; font-size: 15px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; transform: rotate(-1deg);">Every Song. Every Screamer.</div>
+
+          <div style="position: relative; flex: 1; margin: 10px -32px 10px 0;"></div>
+
+          <div style="position: relative; margin-top: auto; display: flex; justify-content: space-between; border-top: 3px dashed #232120; padding-top: 14px; font-family: 'Courier New', monospace; font-size: 15px; font-weight: 700;">
+            <span>{total_artists} ARTISTS</span><span>{total_songs} SONGS</span>
+          </div>
+          <div style="position: relative; margin-top: 6px; text-align: right; font-family: 'Courier New', monospace; font-size: 10px; font-weight: 700; letter-spacing: 0.5px; opacity: 0.75;">LAST SYNCED: {_esc(synced_label)}</div>
+        </div>
+      </div>
+    </section>
+    """
+
+
+def _render_toc_page(toc, stats, accent_color, binding_margin_in):
+    threshold = stats.get('threshold', 0)
+    entries = ''.join(f"""
+          <div style="display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #b8b0a0; break-inside: avoid;">
+            <span style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 13px; text-transform: uppercase; color: #2E2E2E;">{_esc(entry['name'])}</span>
+            <span style="display: flex; align-items: baseline; gap: 6px; flex: none;">
+              <span style="font-family: 'Courier New', monospace; font-size: 11px; font-weight: 700; color: #2E2E2E;">p.{entry['page']}</span>
+              <span style="font-family: 'Courier New', monospace; font-size: 11px; font-weight: 700; color: #E9E1D4; background: {accent_color}; padding: 2px 7px;">{entry['count']}</span>
+            </span>
+          </div>""" for entry in toc)
+    return f"""
+    <section class="page" style="padding: 0.55in 0.55in 0.55in {binding_margin_in}; background: #E9E1D4;">
+      <div style="height: 100%; display: flex; flex-direction: column;">
+        <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 5px solid #2E2E2E; padding-bottom: 10px; margin-bottom: 6px; flex: none;">
+          <h2 style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 34px; margin: 0; text-transform: uppercase; color: #2E2E2E; letter-spacing: 1px;">Most Requested</h2>
+          <span style="font-family: 'Courier New', monospace; font-size: 12px; color: {accent_color}; font-weight: 700;">HEAVY HITTERS</span>
+        </div>
+        <p style="font-family: 'Courier New', monospace; font-size: 11px; color: #5a5550; margin: 0 0 18px; flex: none;">Artists with more than average + 1.5&sigma; songs in the library ({threshold:.2f}+). Sorted A&ndash;Z; page shows where the artist's songs begin.</p>
+        <div style="column-count: 2; column-gap: 36px; flex: 1; overflow: hidden;">{entries}
+        </div>
+      </div>
+    </section>
+    """
+
+
+def _render_item(item):
+    if item['isLetter']:
+        return f"""
+                <div style="background: #2E2E2E; color: #E9E1D4; height: 64px; margin-bottom: 14px; display: flex; align-items: center; padding-left: 12px; clip-path: polygon(0% 0%, 100% 0%, 100% 78%, 92% 100%, 84% 78%, 76% 100%, 68% 78%, 60% 100%, 52% 78%, 44% 100%, 36% 78%, 28% 100%, 20% 78%, 12% 100%, 4% 78%, 0% 100%);">
+                  <span style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 32px;">{_esc(item['letter'])}</span>
+                </div>"""
+    if item['isArtist']:
+        return f"""
+                <div style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 12.5px; text-transform: uppercase; color: #2E2E2E; margin-top: 9px;">{_esc(item['name'])}</div>"""
+    return f"""
+                <div style="font-family: 'Courier New', monospace; font-size: 10.5px; color: #4a453e; padding-left: 25px; text-indent: -13px; line-height: 1.5;">&mdash; {_esc(item['title'])}</div>"""
+
+
+def _render_content_page(page, col_width_css, binding_margin_in):
+    columns = ''.join(
+        f'<div style="width: {col_width_css};">{"".join(_render_item(item) for item in col)}</div>'
+        for col in page['columns'])
+    return f"""
+    <section class="page" style="padding: 0.55in 0.55in 0.4in {binding_margin_in};background: #E9E1D4;">
+      <div style="height: 100%; display: flex; flex-direction: column;">
+        <div style="display: flex; gap: 20px; flex: 1; overflow: hidden;">{columns}</div>
+        <div style="flex: none; text-align: center; font-family: 'Courier New', monospace; font-size: 11px; color: #2E2E2E; font-weight: 700; padding-top: 8px;">{page['pageNumber']}</div>
+      </div>
+    </section>
+    """
+
+
+def render_html(paginated, stats, accent_color=DEFAULT_ACCENT_COLOR,
+                 cover_color=DEFAULT_COVER_COLOR, binding_margin=DEFAULT_BINDING_MARGIN,
+                 synced_label=''):
+    """Full standalone HTML document string for one songbook: cover, "Most
+    Requested" TOC, then one section per paginate() page. `paginated` is a
+    paginate() result; `stats` is a compute_stats_and_toc() stats dict.
+    """
+    binding_margin_in = f'{binding_margin}in'
+    col_width_css = f"{paginated['colWidth']}px"
+
+    body = (
+        _render_cover_page(stats, cover_color, binding_margin_in, synced_label)
+        + _render_toc_page(paginated['toc'], stats, accent_color, binding_margin_in)
+        + ''.join(_render_content_page(page, col_width_css, binding_margin_in)
+                  for page in paginated['pages'])
+    )
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Clone Hero Songbook</title>
+<style>{_page_shell_css(binding_margin_in)}</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+# --- PDF export ---------------------------------------------------------------
+#
+# No Puppeteer/Node/new pip dependency: shell out to whatever Chrome or Edge
+# is already installed and use its own headless print-to-pdf, the same
+# rendering engine (and same @page/print CSS support) a user would get
+# printing the fallback .html file manually.
+
+class BrowserNotFoundError(RuntimeError):
+    """Raised when neither Chrome nor Edge can be located for PDF export."""
+
+
+_BROWSER_EXECUTABLES = ('chrome', 'msedge')
+
+_BROWSER_INSTALL_PATHS = tuple(
+    os.path.join(program_files, vendor, 'Application', exe)
+    for program_files in (r'C:\Program Files', r'C:\Program Files (x86)')
+    for vendor, exe in (('Google\\Chrome', 'chrome.exe'), ('Microsoft\\Edge', 'msedge.exe'))
+)
+
+
+def _find_browser():
+    """Absolute path to an installed Chrome or Edge, or raise
+    BrowserNotFoundError -- generation must fail loudly here, never silently
+    produce an empty or missing PDF (see SPEC-karaoke-songbook.md Boundaries).
+    """
+    for name in _BROWSER_EXECUTABLES:
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in _BROWSER_INSTALL_PATHS:
+        if os.path.exists(path):
+            return path
+    raise BrowserNotFoundError(
+        'Could not find Chrome or Edge (checked PATH and the standard '
+        'Program Files locations). Install either browser to generate a PDF, '
+        'or open the .html file that was written alongside this error and '
+        'use its Print dialog to save a PDF manually.')
+
+
+def render_pdf(html_str, out_pdf_path):
+    """Write out_pdf_path's sibling .html (kept as a manual-print fallback and
+    for debugging pagination without re-invoking the browser), then shell out
+    to headless Chrome/Edge to print it to out_pdf_path. Returns out_pdf_path
+    on success; raises BrowserNotFoundError or subprocess.CalledProcessError
+    on failure -- never silently produces a missing/empty file.
+    """
+    out_pdf_path = Path(out_pdf_path)
+    out_html_path = out_pdf_path.with_suffix('.html')
+
+    tmp_html = out_html_path.with_suffix('.html.tmp')
+    tmp_html.write_text(html_str, encoding='utf-8')
+    os.replace(tmp_html, out_html_path)
+
+    browser = _find_browser()
+    tmp_pdf = out_pdf_path.with_suffix('.pdf.tmp')
+    subprocess.run([
+        browser, '--headless', '--disable-gpu',
+        f'--print-to-pdf={tmp_pdf}', '--no-pdf-header-footer',
+        out_html_path.resolve().as_uri(),
+    ], check=True, capture_output=True)
+    os.replace(tmp_pdf, out_pdf_path)
+    return out_pdf_path

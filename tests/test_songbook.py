@@ -1,4 +1,5 @@
 import statistics
+from pathlib import Path
 
 import songbook as sb
 
@@ -369,3 +370,126 @@ def test_measure_lines_wraps_long_text():
 def test_measure_lines_never_returns_zero_for_empty_text():
     _skip_without_courier()
     assert sb._measure_lines('', 'song', 200) == 1
+
+
+# --- render_html ---------------------------------------------------------------
+
+def _tiny_paginated():
+    buckets = sb.bucket_by_letter([('Aerosmith', ['Dream On', 'Sweet Emotion'])])
+    toc = [{'name': 'Aerosmith', 'count': 2}]
+    return sb.paginate(buckets, toc, measure=_one_line)
+
+
+def test_render_html_contains_cover_stats():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats)
+    assert '1 ARTISTS' in html
+    assert '2 SONGS' in html
+
+
+def test_render_html_contains_toc_entry_with_page_and_count():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats)
+    assert 'AEROSMITH' in html or 'Aerosmith' in html
+    assert 'p.3' in html
+    assert '>2<' in html  # the TOC count badge
+
+
+def test_render_html_contains_letter_banner_and_song_lines():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats)
+    assert '>A<' in html
+    assert 'Dream On' in html
+    assert 'Sweet Emotion' in html
+
+
+def test_render_html_uses_requested_colors():
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats, accent_color='#3B5998', cover_color='#B5A642')
+    assert '#3B5998' in html
+    assert '#B5A642' in html
+
+
+def test_render_html_escapes_html_in_titles_so_layout_matches_measurement():
+    # Real library data contains literal '<i>' etc in titles (e.g. "Parody of
+    # <i>Beat It</i>"). paginate() measured those characters as plain text, so
+    # the rendered page must show them as literal text too, not interpret them
+    # as markup -- otherwise the wrap point Chrome renders no longer matches
+    # the wrap point the pagination math computed.
+    buckets = sb.bucket_by_letter([('Weird Al', ['<script>alert(1)</script> Song'])])
+    paginated = sb.paginate(buckets, [], measure=_one_line)
+    stats = {'totalSongs': 1, 'totalArtists': 1, 'mean': 1.0, 'stdev': 0.0, 'threshold': 1.0}
+    html = sb.render_html(paginated, stats)
+    assert '<script>alert(1)</script>' not in html
+    assert '&lt;script&gt;' in html
+
+
+def test_render_html_no_page_number_on_cover_or_toc():
+    # Only content pages get a footer page number; this doubles as a coarse
+    # structural check that exactly one content page was rendered.
+    paginated = _tiny_paginated()
+    stats = {'totalSongs': 2, 'totalArtists': 1, 'mean': 2.0, 'stdev': 0.0, 'threshold': 2.0}
+    html = sb.render_html(paginated, stats)
+    assert html.count('class="page"') == 3  # cover + toc + 1 content page
+
+
+# --- Chrome/Edge discovery + PDF export -----------------------------------------
+
+def test_find_browser_prefers_which_over_hardcoded_paths(monkeypatch):
+    monkeypatch.setattr(sb.shutil, 'which',
+                        lambda name: r'C:\fake\chrome.exe' if name == 'chrome' else None)
+    assert sb._find_browser() == r'C:\fake\chrome.exe'
+
+
+def test_find_browser_falls_back_to_edge(monkeypatch):
+    monkeypatch.setattr(sb.shutil, 'which',
+                        lambda name: r'C:\fake\msedge.exe' if name == 'msedge' else None)
+    assert sb._find_browser() == r'C:\fake\msedge.exe'
+
+
+def test_find_browser_raises_specific_error_when_neither_found(monkeypatch):
+    monkeypatch.setattr(sb.shutil, 'which', lambda name: None)
+    monkeypatch.setattr(sb.os.path, 'exists', lambda path: False)
+    import pytest
+    with pytest.raises(sb.BrowserNotFoundError):
+        sb._find_browser()
+
+
+def test_render_pdf_writes_html_sibling_and_invokes_browser(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        # Simulate the browser actually producing the PDF file, like a real
+        # `--print-to-pdf` invocation would.
+        out_arg = next(a for a in cmd if a.startswith('--print-to-pdf='))
+        Path(out_arg.split('=', 1)[1]).write_bytes(b'%PDF-fake')
+        calls.append(cmd)
+        return sb.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(sb, '_find_browser', lambda: r'C:\fake\chrome.exe')
+    monkeypatch.setattr(sb.subprocess, 'run', fake_run)
+
+    out_pdf = tmp_path / 'Clone Hero Songbook.pdf'
+    result_path = sb.render_pdf('<html><body>hi</body></html>', out_pdf)
+
+    assert result_path == out_pdf
+    assert out_pdf.exists()
+    assert out_pdf.with_suffix('.html').exists()
+    assert out_pdf.with_suffix('.html').read_text(encoding='utf-8') == \
+        '<html><body>hi</body></html>'
+    assert len(calls) == 1
+    assert '--headless' in calls[0]
+    assert any(a.startswith('--print-to-pdf=') for a in calls[0])
+
+
+def test_render_pdf_raises_when_browser_missing(tmp_path, monkeypatch):
+    def boom():
+        raise sb.BrowserNotFoundError('no browser')
+    monkeypatch.setattr(sb, '_find_browser', boom)
+    import pytest
+    with pytest.raises(sb.BrowserNotFoundError):
+        sb.render_pdf('<html></html>', tmp_path / 'out.pdf')
