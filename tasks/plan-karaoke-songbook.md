@@ -100,5 +100,6 @@ New `tests/test_songbook_dialog.py`, mirroring `tests/test_library_tools_dialog.
 5. Hide Chrome and Edge → confirm a clear, specific GUI error, not a crash or silent no-op.
 
 ## Open items carried into implementation
-- PIL's `×1.08` fudge factor is a starting guess; Task 3's manual checkpoint is where it gets tuned against real screenshots.
-- `bindingMargin`/`accentColor`/`coverColor` default discrepancy resolved via `renderVals()`'s runtime fallbacks — double-check against `screenshots/01-cover.png`'s actual colors during Task 3.
+- ~~PIL's `×1.08` fudge factor is a starting guess~~ **Resolved in Task 2**: naive PIL measurement was ~11% high (whole-pixel glyph rounding); fixed via a ×100 measure-and-divide scale that hits zero error against 3000 real titles, so `×1.08` ports unchanged. Verified against `screenshots/02-most-requested.png`'s actual page numbers: 49/54 exact, remaining 5 traced to the bundled CSV being a different library snapshot than the screenshot's source data (see `tasks/todo-karaoke-songbook.md` Task 2), not an algorithm bug.
+- ~~`bindingMargin` default discrepancy~~ **Resolved in Task 2**: confirmed `0.9` (renderVals()'s value) as canonical, not `0.85`.
+- `accentColor`/`coverColor` default discrepancy still open — double-check against `screenshots/01-cover.png`'s actual colors during Task 3.

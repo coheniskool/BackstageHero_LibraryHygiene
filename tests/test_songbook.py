@@ -175,3 +175,197 @@ def test_stats_empty_library():
     assert stats == {'totalSongs': 0, 'totalArtists': 0, 'mean': 0.0,
                       'stdev': 0.0, 'threshold': 0.0}
     assert toc == []
+
+
+# --- pagination ----------------------------------------------------------------
+#
+# The state-machine tests below inject a synthetic measurer so line counts are
+# exact and font-independent: the risk in this port is the page/column state
+# machine, not glyph metrics, and a test whose behavior silently changed on a
+# machine without Courier New would hide the very bug it exists to catch.
+# Measurement against the real fonts is covered separately at the bottom.
+
+def _one_line(text, kind, max_width):
+    return 1
+
+
+def _buckets(*groups):
+    return {'letters': [
+        {'letter': letter,
+         'artists': [{'name': n, 'songs': list(songs)} for n, songs in artists]}
+        for letter, artists in groups]}
+
+
+def _items(page, col):
+    """Flat [(kind, label)] for one column, for readable assertions."""
+    out = []
+    for item in page['columns'][col]:
+        if item['isLetter']:
+            out.append(('letter', item['letter']))
+        elif item['isArtist']:
+            out.append(('artist', item['name']))
+        else:
+            out.append(('song', item['title']))
+    return out
+
+
+def test_paginate_column_width_math():
+    # contentWidth = 816 - 0.9*96 - 52.8 = 676.8; (676.8 - 20*(n-1)) / n, floored
+    for cols, expected in ((2, 328), (3, 212), (4, 154)):
+        result = sb.paginate(_buckets(('A', [('X', ['S'])])), [],
+                             column_count=cols, measure=_one_line)
+        assert result['colWidth'] == expected, f'{cols} columns'
+
+
+def test_letter_section_starts_a_fresh_page_not_just_a_column():
+    buckets = _buckets(
+        ('A', [('Artist A', ['Song A1'])]),
+        ('B', [('Artist B', ['Song B1'])]),
+    )
+    result = sb.paginate(buckets, [], measure=_one_line)
+
+    assert len(result['pages']) == 2
+    first, second = result['pages']
+    assert first['pageNumber'] == 3
+    assert second['pageNumber'] == 4
+    assert _items(first, 0) == [
+        ('letter', 'A'), ('artist', 'Artist A'), ('song', 'Song A1')]
+    # Columns 1 and 2 stay empty despite ~820px of unused room in each --
+    # this is what makes it a PAGE break rather than a column break.
+    assert first['columns'][1] == []
+    assert first['columns'][2] == []
+    assert _items(second, 0) == [
+        ('letter', 'B'), ('artist', 'Artist B'), ('song', 'Song B1')]
+
+
+def test_first_letter_does_not_emit_a_leading_blank_page():
+    # forceNewPage() must no-op when already at the top of a fresh page, or
+    # every book would open on an empty sheet.
+    result = sb.paginate(_buckets(('A', [('X', ['S'])])), [], measure=_one_line)
+    assert len(result['pages']) == 1
+    assert result['pages'][0]['pageNumber'] == 3
+
+
+def test_orphan_control_moves_artist_and_first_song_together():
+    # Heights with the synthetic measurer: letter 78, artist 26, song 16.
+    # After the letter (900-78=822) and the filler artist (=796), 48 filler
+    # songs leave 28px. The next artist alone WOULD still fit in that 28px --
+    # and would then be stranded, because its first song needs 16 more than
+    # remains. Orphan control must push the pair to the next column instead.
+    filler_songs = [f'Filler Song {i:02d}' for i in range(48)]
+    buckets = _buckets(('A', [
+        ('Filler Artist', filler_songs),
+        ('Orphan Artist', ['Orphan Song']),
+    ]))
+    result = sb.paginate(buckets, [], measure=_one_line)
+
+    page = result['pages'][0]
+    col0, col1 = _items(page, 0), _items(page, 1)
+    assert col0[-1] == ('song', 'Filler Song 47'), 'artist name must not be stranded'
+    assert ('artist', 'Orphan Artist') not in col0
+    assert col1 == [('artist', 'Orphan Artist'), ('song', 'Orphan Song')]
+
+
+def test_orphan_control_skipped_when_pair_cannot_fit_any_column():
+    # An artist name so tall the pair exceeds a whole column (1029+16 > 900).
+    # The rule must NOT fire -- firing would advance() forever hunting for
+    # room that cannot exist. The pair splits instead: the documented
+    # pathological case, not a bug.
+    def measure(text, kind, max_width):
+        return 60 if text == 'Enormous Artist' else 1
+
+    buckets = _buckets(('A', [('Enormous Artist', ['Its Song'])]))
+    result = sb.paginate(buckets, [], measure=measure)
+
+    page = result['pages'][0]
+    assert ('artist', 'Enormous Artist') in _items(page, 1)
+    assert _items(page, 2) == [('song', 'Its Song')]
+
+
+def test_advance_rolls_to_a_new_page_after_the_last_column():
+    # 3 columns, sized so exactly one artist+song pair (26*17+9 + 16 = 467 of
+    # 900) fits per column. The 4th pair therefore has to roll onto a second
+    # page rather than a fourth column.
+    def measure(text, kind, max_width):
+        return 26 if kind == 'artist' else 1
+
+    buckets = _buckets(('A', [(f'Artist {i}', ['S']) for i in range(4)]))
+    result = sb.paginate(buckets, [], measure=measure)
+
+    assert len(result['pages']) == 2
+    assert result['pages'][1]['pageNumber'] == 4
+    assert _items(result['pages'][1], 0) == [('artist', 'Artist 3'), ('song', 'S')]
+
+
+def test_toc_page_numbers_come_from_pagination():
+    buckets = _buckets(
+        ('A', [('Artist A', ['Song A1'])]),
+        ('B', [('Artist B', ['Song B1'])]),
+    )
+    toc = [{'name': 'Artist A', 'count': 1}, {'name': 'Artist B', 'count': 1}]
+    result = sb.paginate(buckets, toc, measure=_one_line)
+
+    assert result['toc'] == [
+        {'name': 'Artist A', 'count': 1, 'page': 3},
+        {'name': 'Artist B', 'count': 1, 'page': 4},
+    ]
+
+
+def test_toc_entry_with_no_matching_artist_falls_back_to_first_page():
+    result = sb.paginate(_buckets(('A', [('Artist A', ['S'])])),
+                         [{'name': 'Ghost Artist', 'count': 99}], measure=_one_line)
+    assert result['toc'] == [{'name': 'Ghost Artist', 'count': 99, 'page': 3}]
+
+
+def test_paginate_empty_library():
+    result = sb.paginate({'letters': []}, [], measure=_one_line)
+    assert result['toc'] == []
+    assert len(result['pages']) == 1
+    assert result['pages'][0]['columns'] == [[], [], []]
+
+
+def test_paginate_is_deterministic():
+    # Spec success criterion: the same library twice must give the same page
+    # count and the same TOC page numbers, with no run-to-run drift.
+    buckets = _buckets(
+        ('A', [(f'Artist A{i}', [f'S{j}' for j in range(9)]) for i in range(12)]),
+        ('B', [(f'Artist B{i}', [f'S{j}' for j in range(7)]) for i in range(9)]),
+    )
+    toc = [{'name': 'Artist A3', 'count': 9}, {'name': 'Artist B5', 'count': 7}]
+    assert sb.paginate(buckets, toc, measure=_one_line) == \
+        sb.paginate(buckets, toc, measure=_one_line)
+
+
+# --- text measurement against the real fonts -------------------------------------
+
+def _skip_without_courier():
+    if sb._font_path('song') is None:
+        import pytest
+        pytest.skip('Courier New not installed')
+
+
+def test_measure_width_matches_canvas_monospace_metrics():
+    # Courier New advances 0.6em/char, so canvas measureText yields len*6.3
+    # at 10.5px. The port must agree closely: naive PIL measurement rounds
+    # each glyph to a whole pixel and lands ~11% high, which would inflate
+    # wrap counts and silently shift every page number in the book.
+    _skip_without_courier()
+    title = 'White & Nerdy (Parody of Ridin)'
+    assert abs(sb._measure_width(title, 'song') - len(title) * 6.3) < 0.5
+
+
+def test_measure_width_matches_canvas_for_bold_artist_font():
+    _skip_without_courier()
+    name = 'A Day To Remember'
+    assert abs(sb._measure_width(name, 'artist') - len(name) * 7.5) < 0.5
+
+
+def test_measure_lines_wraps_long_text():
+    _skip_without_courier()
+    assert sb._measure_lines('Short', 'song', 200) == 1
+    assert sb._measure_lines('x' * 400, 'song', 200) > 1
+
+
+def test_measure_lines_never_returns_zero_for_empty_text():
+    _skip_without_courier()
+    assert sb._measure_lines('', 'song', 200) == 1
