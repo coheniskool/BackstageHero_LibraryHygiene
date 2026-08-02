@@ -1,7 +1,9 @@
+import colorsys
 import statistics
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 import songbook as sb
 
@@ -618,3 +620,179 @@ def test_parse_args_overrides():
     assert args.accent == 'red'
     assert args.cover == 'olive'
     assert args.out == 'C:/out.pdf'
+
+
+# --- album art: palette extraction + legibility clamping ------------------------
+
+def _solid(tmp_path, name, rgb, size=(100, 100)):
+    path = tmp_path / name
+    Image.new('RGB', size, rgb).save(path)
+    return path
+
+
+def _two_region_image(tmp_path, name, bg_rgb, fg_rgb, fg_fraction, size=(100, 100)):
+    """bg_rgb fills the whole canvas; fg_rgb fills a left-hand strip covering
+    roughly fg_fraction of the width (and therefore the area, at fixed height)."""
+    img = Image.new('RGB', size, bg_rgb)
+    fg_width = int(size[0] * fg_fraction)
+    for x in range(fg_width):
+        for y in range(size[1]):
+            img.putpixel((x, y), fg_rgb)
+    path = tmp_path / name
+    img.save(path)
+    return path
+
+
+def _hls(hexcolor):
+    r = int(hexcolor[1:3], 16) / 255
+    g = int(hexcolor[3:5], 16) / 255
+    b = int(hexcolor[5:7], 16) / 255
+    return colorsys.rgb_to_hls(r, g, b)
+
+
+def _hue_degrees(hexcolor):
+    return _hls(hexcolor)[0] * 360
+
+
+# --- _load_weighted_palette / _score_swatch --------------------------------------
+
+def test_score_swatch_prefers_saturation_over_raw_pixel_count():
+    # A vivid color with fewer pixels should still outscore a much larger but
+    # totally desaturated (gray) region -- otherwise a large plain background
+    # would always win, defeating the point of "dominant COLOR" extraction.
+    gray_score = sb._score_swatch(9000, (128, 128, 128))
+    red_score = sb._score_swatch(1000, (220, 30, 30))
+    assert red_score > gray_score
+
+
+def test_score_swatch_is_monotonic_in_count_for_equal_saturation():
+    low = sb._score_swatch(100, (200, 40, 40))
+    high = sb._score_swatch(500, (200, 40, 40))
+    assert high > low
+
+
+def test_load_weighted_palette_finds_both_regions(tmp_path):
+    path = _two_region_image(tmp_path, 'two.png', (128, 128, 128), (220, 30, 30), 0.2)
+    palette = sb._load_weighted_palette(str(path))
+    colors = [rgb for _count, rgb in palette]
+    # allow for quantization rounding -- just check something red-ish and
+    # something gray-ish both made it into the palette
+    assert any(r > 180 and g < 80 and b < 80 for r, g, b in colors), colors
+    assert any(abs(r - g) < 20 and abs(g - b) < 20 for r, g, b in colors), colors
+
+
+# --- _pick_primary_and_accent -----------------------------------------------------
+
+def test_pick_primary_is_the_highest_scored_swatch():
+    scored = [(500, (30, 30, 220)), (2000, (220, 30, 30))]  # red scores higher
+    primary, accent = sb._pick_primary_and_accent(scored)
+    assert primary == (220, 30, 30)
+    assert accent == (30, 30, 220)
+
+
+def test_pick_accent_skips_a_close_hue_third_place_swatch():
+    # red (primary), orange (2nd by score, hue close to red -- must be
+    # skipped), blue (3rd by score, hue far from red -- must be chosen).
+    red = (220, 30, 30)
+    orange = (220, 120, 30)     # ~20 degrees of hue from red
+    blue = (30, 30, 220)        # ~140 degrees of hue from red
+    scored = [(3000, red), (2000, orange), (500, blue)]
+    primary, accent = sb._pick_primary_and_accent(scored)
+    assert primary == red
+    assert accent == blue, 'a hue-close 2nd place must not win over a hue-distant 3rd'
+
+
+def test_pick_accent_falls_back_to_second_place_when_nothing_clears_the_hue_bar():
+    red = (220, 30, 30)
+    orange = (220, 120, 30)     # the ONLY other swatch -- hue-close, but must still be used
+    scored = [(3000, red), (500, orange)]
+    primary, accent = sb._pick_primary_and_accent(scored)
+    assert primary == red
+    assert accent == orange
+
+
+def test_pick_accent_from_a_single_swatch_image_reuses_primary():
+    scored = [(10000, (100, 150, 200))]
+    primary, accent = sb._pick_primary_and_accent(scored)
+    assert primary == accent == (100, 150, 200)
+
+
+# --- _clamp_for_legibility ---------------------------------------------------------
+
+def test_clamp_pure_white_lands_in_band_for_both_roles():
+    for role in ('cover', 'accent'):
+        clamped = sb._clamp_for_legibility((255, 255, 255), role)
+        h, l, s = _hls(clamped)
+        min_l, max_l, min_s = sb._LEGIBILITY_BANDS[role]
+        assert min_l - 6e-3 <= l <= max_l + 6e-3, (role, clamped, l)
+        assert s >= min_s - 6e-3, (role, clamped, s)
+
+
+def test_clamp_pure_black_lands_in_band_for_both_roles():
+    for role in ('cover', 'accent'):
+        clamped = sb._clamp_for_legibility((0, 0, 0), role)
+        h, l, s = _hls(clamped)
+        min_l, max_l, min_s = sb._LEGIBILITY_BANDS[role]
+        assert min_l - 6e-3 <= l <= max_l + 6e-3, (role, clamped, l)
+        assert s >= min_s - 6e-3, (role, clamped, s)
+
+
+def test_clamp_desaturated_gray_gets_saturation_raised():
+    clamped = sb._clamp_for_legibility((140, 140, 140), 'accent')
+    _, _, s = _hls(clamped)
+    _, _, min_s = sb._LEGIBILITY_BANDS['accent']
+    assert s >= min_s - 6e-3
+
+
+def test_clamp_already_in_band_color_is_left_close_to_unchanged():
+    min_l, max_l, min_s = sb._LEGIBILITY_BANDS['cover']
+    mid_l = (min_l + max_l) / 2
+    r, g, b = colorsys.hls_to_rgb(0.55, mid_l, max(min_s, 0.6))
+    rgb = (round(r * 255), round(g * 255), round(b * 255))
+    clamped = sb._clamp_for_legibility(rgb, 'cover')
+    ch, cl, cs = _hls(clamped)
+    # allow small drift from the 8-bit rgb round-trip, not exact equality
+    assert abs(cl - mid_l) < 0.03
+    assert cs >= min_s - 6e-3
+
+
+def test_accent_band_is_darker_and_more_saturated_than_cover_band():
+    # accent must work as white-on-accent AND as accent-colored text on cream,
+    # a stricter bar than cover just needing to not fight fixed dark text.
+    cover_min_l, cover_max_l, cover_min_s = sb._LEGIBILITY_BANDS['cover']
+    accent_min_l, accent_max_l, accent_min_s = sb._LEGIBILITY_BANDS['accent']
+    assert accent_max_l <= cover_max_l
+    assert accent_min_s >= cover_min_s
+
+
+# --- extract_cover_and_accent_colors (orchestration) ------------------------------
+
+def test_extract_colors_from_a_two_color_image_returns_legible_hex(tmp_path):
+    path = _two_region_image(tmp_path, 'art.png', (40, 40, 40), (220, 30, 30), 0.3)
+    cover_hex, accent_hex = sb.extract_cover_and_accent_colors(str(path))
+    assert cover_hex.startswith('#') and len(cover_hex) == 7
+    assert accent_hex.startswith('#') and len(accent_hex) == 7
+    for hexcolor, role in ((cover_hex, 'cover'), (accent_hex, 'accent')):
+        _, l, s = _hls(hexcolor)
+        min_l, max_l, min_s = sb._LEGIBILITY_BANDS[role]
+        assert min_l - 6e-3 <= l <= max_l + 6e-3
+        assert s >= min_s - 6e-3
+
+
+def test_extract_colors_is_deterministic(tmp_path):
+    path = _two_region_image(tmp_path, 'art.png', (40, 40, 40), (220, 30, 30), 0.3)
+    first = sb.extract_cover_and_accent_colors(str(path))
+    second = sb.extract_cover_and_accent_colors(str(path))
+    assert first == second
+
+
+def test_extract_colors_raises_album_art_error_on_bad_file(tmp_path):
+    bad = tmp_path / 'not_an_image.png'
+    bad.write_bytes(b'this is not image data')
+    with pytest.raises(sb.AlbumArtError):
+        sb.extract_cover_and_accent_colors(str(bad))
+
+
+def test_extract_colors_raises_album_art_error_on_missing_file(tmp_path):
+    with pytest.raises(sb.AlbumArtError):
+        sb.extract_cover_and_accent_colors(str(tmp_path / 'nope.png'))

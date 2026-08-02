@@ -10,6 +10,7 @@
 # and from tests with no Tk/customtkinter involved.
 
 import argparse
+import colorsys
 import html
 import math
 import os
@@ -618,6 +619,132 @@ def render_pdf(html_str, out_pdf_path):
     ], check=True, capture_output=True)
     os.replace(tmp_pdf, out_pdf_path)
     return out_pdf_path
+
+
+# --- album art: dominant-color extraction + legibility clamping -------------------
+#
+# Lets a user pick an image (album art, a band photo, whatever) and derive the
+# cover/accent colors from it instead of the fixed named swatches. Pillow-only
+# (already a dependency) -- no numpy/scikit-learn k-means, just palette
+# quantization + a saturation-weighted scoring pass, closer in spirit to
+# Android's Palette API / Vibrant.js than a literal port of either.
+
+class AlbumArtError(RuntimeError):
+    """Raised when an image can't be read/decoded for color extraction."""
+
+
+# HSL bands colors get clamped into after extraction (or a manual color-picker
+# pick -- see gui.py's SongbookDialog, which reuses _clamp_for_legibility()
+# directly). (min_lightness, max_lightness, min_saturation), each in [0, 1].
+#
+# 'cover' just needs to not fight the fixed dark (#232120) poster text -- a
+# wide band centered on mid-tones. 'accent' is used BOTH as a white-text badge
+# background AND as accent-colored text sitting directly on the cream TOC
+# page, a stricter bar than cover: darker-leaning (so white text reads) and
+# more saturated (so it reads as a real "accent," not a muddy near-gray).
+# Starting values -- calibrated against real album art during Task 1's own
+# manual verification pass, not guessed once and left unchecked.
+_LEGIBILITY_BANDS = {
+    'cover': (0.35, 0.70, 0.35),
+    'accent': (0.22, 0.50, 0.45),
+}
+
+# Hue distance (degrees) two swatches must clear for the weaker one to count
+# as a distinct "accent" rather than just a duller shade of the primary color.
+_ACCENT_HUE_DISTANCE_DEGREES = 30
+
+# Downscaling before quantization -- extraction only needs a rough color
+# census, not full resolution, and this keeps a large photo fast to process.
+_PALETTE_SAMPLE_MAX_DIMENSION = 200
+_PALETTE_COLOR_COUNT = 8
+
+
+def _load_weighted_palette(image_path, num_colors=_PALETTE_COLOR_COUNT):
+    """[(pixel_count, (r, g, b)), ...] for an image, via Pillow palette
+    quantization on a downscaled copy. Raises AlbumArtError if the file can't
+    be opened/decoded at all.
+    """
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            img = img.convert('RGB')
+            img.thumbnail((_PALETTE_SAMPLE_MAX_DIMENSION, _PALETTE_SAMPLE_MAX_DIMENSION))
+            # MEDIANCUT works on every Pillow version this project supports
+            # (>=9.0); FASTOCTREE gives better real-photo results but needs
+            # >=9.1 -- ask-first per SPEC-songbook-album-art-colors.md before
+            # bumping that floor.
+            quantized = img.quantize(colors=num_colors, method=Image.Quantize.MEDIANCUT)
+            return quantized.convert('RGB').getcolors(maxcolors=num_colors)
+    except AlbumArtError:
+        raise
+    except Exception as e:
+        raise AlbumArtError(f'Could not read image {image_path!r}: {e}') from e
+
+
+def _score_swatch(count, rgb):
+    """Weight a palette entry by both its pixel count and how vivid it is, so
+    a large flat/desaturated background loses to a smaller but vivid color --
+    the whole point of "dominant COLOR" extraction rather than "most pixels."
+    """
+    r, g, b = (c / 255 for c in rgb)
+    _, _, saturation = colorsys.rgb_to_hls(r, g, b)
+    return count * (0.05 + 0.95 * saturation)
+
+
+def _pick_primary_and_accent(scored_swatches):
+    """(primary_rgb, accent_rgb) from a [(count, rgb), ...] list.
+
+    primary = highest-scored swatch. accent = the first swatch (in score
+    order) whose hue clears _ACCENT_HUE_DISTANCE_DEGREES from primary's --
+    skipping past a hue-close 2nd place if a hue-distant one scores lower but
+    is still meaningfully different. If nothing clears that bar (a genuinely
+    near-monochrome image), falls back to the 2nd-highest-scored swatch
+    outright -- a monochrome image still needs *some* accent. A single-swatch
+    image (flat single-color art) reuses primary as accent too.
+    """
+    ranked = sorted(scored_swatches, key=lambda item: item[0], reverse=True)
+    primary = ranked[0][1]
+    if len(ranked) == 1:
+        return primary, primary
+
+    primary_hue = colorsys.rgb_to_hls(*(c / 255 for c in primary))[0] * 360
+    for _score, rgb in ranked[1:]:
+        hue = colorsys.rgb_to_hls(*(c / 255 for c in rgb))[0] * 360
+        distance = min(abs(hue - primary_hue), 360 - abs(hue - primary_hue))
+        if distance >= _ACCENT_HUE_DISTANCE_DEGREES:
+            return primary, rgb
+    return primary, ranked[1][1]
+
+
+def _clamp_for_legibility(rgb, role):
+    """Hex color with rgb's lightness/saturation clamped into role's safe
+    band. Reused verbatim for a manual color-picker pick (gui.py) -- this
+    function has no idea whether its input came from palette extraction or
+    the OS color dialog, by design (see SPEC-songbook-album-art-colors.md).
+    """
+    r, g, b = (c / 255 for c in rgb)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    min_l, max_l, min_s = _LEGIBILITY_BANDS[role]
+    l = min(max(l, min_l), max_l)
+    s = max(s, min_s)
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return '#{:02X}{:02X}{:02X}'.format(
+        round(r2 * 255), round(g2 * 255), round(b2 * 255))
+
+
+def extract_cover_and_accent_colors(image_path):
+    """(cover_hex, accent_hex) derived from image_path's dominant colors,
+    each already clamped for legibility. Raises AlbumArtError on an
+    unreadable/corrupt/unsupported file -- callers (gui.py's SongbookDialog,
+    this module's own CLI) show it directly, no wrapping needed.
+    """
+    palette = _load_weighted_palette(image_path)
+    if not palette:
+        raise AlbumArtError(f'No usable colors found in {image_path!r}.')
+    scored = [(_score_swatch(count, rgb), rgb) for count, rgb in palette]
+    primary_rgb, accent_rgb = _pick_primary_and_accent(scored)
+    return (_clamp_for_legibility(primary_rgb, 'cover'),
+            _clamp_for_legibility(accent_rgb, 'accent'))
 
 
 # --- orchestrator + CLI -----------------------------------------------------------
