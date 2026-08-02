@@ -1690,7 +1690,11 @@ class App(ctk.CTk):
         super().__init__()
         self.title(f'BackstageHero  v{__version__}')
         self.geometry('1020x680')
-        self.minsize(900, 520)
+        # Width floor matches the footer's actual minimum content width (six
+        # primary buttons + the progress/status area with its spacer column
+        # collapsed to 0) -- below this the progress bar clips off the right
+        # edge again, same as minsize=900 did before the two-row footer.
+        self.minsize(1000, 520)
         self.configure(fg_color=_BG)
 
         # Window + taskbar icon
@@ -1920,28 +1924,48 @@ class App(ctk.CTk):
         self._tree.bind('<Button-1>', self._on_tree_click)
         self._tree.bind('<Button-3>', self._on_tree_right_click)
 
-        # Footer
-        foot = ctk.CTkFrame(self, fg_color=_SURFACE, corner_radius=0, height=64)
+        # Footer -- two rows: primary actions + the progress/status area
+        # share the top row; secondary toggles live on their own row below.
+        # Splitting it this way (rather than one row of ever-more columns)
+        # is deliberate: three separate features each tacked another
+        # checkbox onto the single footer row over time, and each time
+        # nobody updated the row's lone stretch-column weight to match --
+        # which silently pushed the progress bar and scan-status label off
+        # the right edge of the window. Keeping the progress/status area on
+        # a row that only primary, rarely-changing buttons share means a
+        # future toggle added to the secondary row can never again crowd it
+        # off-screen.
+        # Height is left to size naturally to its two rows of content
+        # (no fixed height / grid_propagate(False)) -- a hardcoded pixel
+        # height is exactly the kind of magic number that caused the
+        # horizontal version of this bug (see the weight-column comment
+        # below); auto-sizing means a future row-1 addition can never
+        # silently clip itself the way it clipped the progress bar.
+        foot = ctk.CTkFrame(self, fg_color=_SURFACE, corner_radius=0)
         foot.grid(row=3, column=0, sticky='ew', pady=(1, 0))
-        foot.grid_propagate(False)
-        foot.grid_columnconfigure(7, weight=1)
+        # Spacer column between the last primary button and prog_frame --
+        # absorbs any extra window width so prog_frame stays pinned to the
+        # right edge instead of drifting with unrelated content.
+        foot.grid_columnconfigure(6, weight=1)
 
         _fbtn = dict(height=34, corner_radius=7)
         _font  = ctk.CTkFont(size=12)
         _font_bold = ctk.CTkFont(size=13, weight='bold')
+        _row0_pady = (12, 4)
+        _row1_pady = (4, 12)
 
         self._sel_btn = ctk.CTkButton(
             foot, text='Select all', width=105, font=_font,
             fg_color=_BORDER, hover_color='#44445a', text_color=_TEXT,
             command=self._select_all_visible, **_fbtn)
-        self._sel_btn.grid(row=0, column=0, padx=(12, 4), pady=15)
+        self._sel_btn.grid(row=0, column=0, padx=(12, 4), pady=_row0_pady)
 
         self._clr_btn = ctk.CTkButton(
             foot, text='Clear all', width=90, font=_font,
             fg_color='transparent', hover_color='#30304a',
             text_color=_SUBTEXT, border_color=_BORDER, border_width=1,
             command=self._clear_all, **_fbtn)
-        self._clr_btn.grid(row=0, column=1, padx=4, pady=15)
+        self._clr_btn.grid(row=0, column=1, padx=4, pady=_row0_pady)
 
         q = self._settings.get('quality', '720p')
         self._quality_var = tk.StringVar(value=q if q in ('720p', '1080p') else '720p')
@@ -1949,85 +1973,29 @@ class App(ctk.CTk):
             foot, variable=self._quality_var,
             values=['720p', '1080p'], width=88, height=34,
             command=lambda *_: self._persist_setting('quality', self._quality_var.get()),
-            font=_font).grid(row=0, column=2, padx=4, pady=15)
+            font=_font).grid(row=0, column=2, padx=4, pady=_row0_pady)
 
         self._start_btn = ctk.CTkButton(
             foot, text='▶  Search & Download', width=175, font=_font_bold,
             command=self._start_download, **_fbtn)
-        self._start_btn.grid(row=0, column=3, padx=4, pady=15)
+        self._start_btn.grid(row=0, column=3, padx=4, pady=_row0_pady)
 
         self._resync_btn = ctk.CTkButton(
             foot, text='↺  Auto-sync', width=120, font=_font,
             fg_color='#313244', hover_color='#414160', text_color=_TEXT,
             command=self._start_resync, **_fbtn)
-        self._resync_btn.grid(row=0, column=4, padx=4, pady=15)
+        self._resync_btn.grid(row=0, column=4, padx=4, pady=_row0_pady)
 
         self._stop_btn = ctk.CTkButton(
             foot, text='■  Stop', width=90, font=_font,
             fg_color='#4a1a2a', hover_color='#6a2a3e', text_color=_RED,
             state='disabled', command=self._stop, **_fbtn)
-        self._stop_btn.grid(row=0, column=5, padx=4, pady=15)
+        self._stop_btn.grid(row=0, column=5, padx=4, pady=_row0_pady)
 
-        # Opt-in/out of contributing confirmed matches back to the community pool.
-        self._share_var = tk.BooleanVar(
-            value=self._settings.get('share_matches', True))
-        share_cb = ctk.CTkCheckBox(
-            foot, text='Share matches', variable=self._share_var,
-            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
-            checkbox_width=18, checkbox_height=18,
-            command=self._on_share_toggle)
-        share_cb.grid(row=0, column=6, padx=(12, 4), pady=15)
-
-        # Booklet-data enrichment (instruments/NPS/features/high scores) --
-        # runs in a background thread after each scan settles, same
-        # threading.Thread pattern as _probe_resolutions/_scan_library, not
-        # a subprocess -- no interpreter-path or stdout-piping fragility.
-        self._enrich_var = tk.BooleanVar(
-            value=self._settings.get('enrich_after_scan', True))
-        enrich_cb = ctk.CTkCheckBox(
-            foot, text='Enrich after scan', variable=self._enrich_var,
-            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
-            checkbox_width=18, checkbox_height=18,
-            command=lambda: self._persist_setting(
-                'enrich_after_scan', bool(self._enrich_var.get())))
-        enrich_cb.grid(row=0, column=7, padx=(12, 4), pady=15)
-
-        # Opt-in browser-cookie support for yt-dlp (off by default). Reduces
-        # bot-detection frequency per SPEC-background-mode.md; the browser's
-        # cookie store is read by yt-dlp itself -- no cookie value is ever
-        # handled here, only the browser name string.
-        self._cookies_var = tk.BooleanVar(
-            value=self._settings.get('use_browser_cookies', False))
-        cookies_cb = ctk.CTkCheckBox(
-            foot, text='Use browser cookies', variable=self._cookies_var,
-            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
-            checkbox_width=18, checkbox_height=18,
-            command=self._on_cookies_toggle)
-        cookies_cb.grid(row=0, column=8, padx=(12, 4), pady=15)
-
-        self._cookie_browser_var = tk.StringVar(
-            value=self._settings.get('cookie_browser', 'chrome'))
-        ctk.CTkOptionMenu(
-            foot, variable=self._cookie_browser_var,
-            values=['chrome', 'firefox', 'edge'], width=100, height=34,
-            command=self._on_cookie_browser_change,
-            font=_font).grid(row=0, column=9, padx=4, pady=15)
-
-        # Unattended background-mode toggle (Task 12). Deliberately not
-        # persisted to settings.json -- a multi-day unattended run should
-        # require the user to explicitly re-arm it each time, not silently
-        # resume from a stale "left it checked" state. Read at Start-click
-        # time in _start_download, not on toggle.
-        self._background_var = tk.BooleanVar(value=False)
-        background_cb = ctk.CTkCheckBox(
-            foot, text='Run in background', variable=self._background_var,
-            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
-            checkbox_width=18, checkbox_height=18)
-        background_cb.grid(row=0, column=10, padx=(12, 4), pady=15)
-
-        # Progress + status (right side of footer)
+        # Progress + status -- pinned to the right edge of the primary row
+        # by the weighted spacer column above (column 6).
         prog_frame = ctk.CTkFrame(foot, fg_color='transparent')
-        prog_frame.grid(row=0, column=11, padx=(8, 16), pady=15, sticky='e')
+        prog_frame.grid(row=0, column=7, padx=(8, 16), pady=_row0_pady, sticky='e')
 
         self._background_badge_lbl = ctk.CTkLabel(
             prog_frame, text='', font=ctk.CTkFont(size=10, weight='bold'),
@@ -2044,6 +2012,66 @@ class App(ctk.CTk):
             font=ctk.CTkFont(size=10), text_color=_SUBTEXT,
             anchor='e', width=190)
         self._status_lbl.pack()
+
+        # Secondary toggles -- their own row so new ones never compete with
+        # the primary row's buttons or the progress/status area for space.
+
+        # Opt-in/out of contributing confirmed matches back to the community pool.
+        self._share_var = tk.BooleanVar(
+            value=self._settings.get('share_matches', True))
+        share_cb = ctk.CTkCheckBox(
+            foot, text='Share matches', variable=self._share_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18,
+            command=self._on_share_toggle)
+        share_cb.grid(row=1, column=0, padx=(12, 4), pady=_row1_pady, sticky='w')
+
+        # Booklet-data enrichment (instruments/NPS/features/high scores) --
+        # runs in a background thread after each scan settles, same
+        # threading.Thread pattern as _probe_resolutions/_scan_library, not
+        # a subprocess -- no interpreter-path or stdout-piping fragility.
+        self._enrich_var = tk.BooleanVar(
+            value=self._settings.get('enrich_after_scan', True))
+        enrich_cb = ctk.CTkCheckBox(
+            foot, text='Enrich after scan', variable=self._enrich_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18,
+            command=lambda: self._persist_setting(
+                'enrich_after_scan', bool(self._enrich_var.get())))
+        enrich_cb.grid(row=1, column=1, padx=4, pady=_row1_pady, sticky='w')
+
+        # Opt-in browser-cookie support for yt-dlp (off by default). Reduces
+        # bot-detection frequency per SPEC-background-mode.md; the browser's
+        # cookie store is read by yt-dlp itself -- no cookie value is ever
+        # handled here, only the browser name string.
+        self._cookies_var = tk.BooleanVar(
+            value=self._settings.get('use_browser_cookies', False))
+        cookies_cb = ctk.CTkCheckBox(
+            foot, text='Use browser cookies', variable=self._cookies_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18,
+            command=self._on_cookies_toggle)
+        cookies_cb.grid(row=1, column=2, padx=4, pady=_row1_pady, sticky='w')
+
+        self._cookie_browser_var = tk.StringVar(
+            value=self._settings.get('cookie_browser', 'chrome'))
+        ctk.CTkOptionMenu(
+            foot, variable=self._cookie_browser_var,
+            values=['chrome', 'firefox', 'edge'], width=100, height=34,
+            command=self._on_cookie_browser_change,
+            font=_font).grid(row=1, column=3, padx=4, pady=_row1_pady, sticky='w')
+
+        # Unattended background-mode toggle (Task 12). Deliberately not
+        # persisted to settings.json -- a multi-day unattended run should
+        # require the user to explicitly re-arm it each time, not silently
+        # resume from a stale "left it checked" state. Read at Start-click
+        # time in _start_download, not on toggle.
+        self._background_var = tk.BooleanVar(value=False)
+        background_cb = ctk.CTkCheckBox(
+            foot, text='Run in background', variable=self._background_var,
+            font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=18, checkbox_height=18)
+        background_cb.grid(row=1, column=4, padx=4, pady=_row1_pady, sticky='w')
 
         self._update_buttons()
 
