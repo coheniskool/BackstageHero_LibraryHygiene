@@ -495,7 +495,6 @@ def _render_toc_page(toc, stats, accent_color, binding_margin_in):
       <div style="height: 100%; display: flex; flex-direction: column;">
         <div style="display: flex; align-items: baseline; gap: 14px; border-bottom: 5px solid #2E2E2E; padding-bottom: 10px; margin-bottom: 6px; flex: none;">
           <h2 style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 34px; margin: 0; text-transform: uppercase; color: #2E2E2E; letter-spacing: 1px;">Heavy Hitters</h2>
-          <span style="font-family: 'Courier New', monospace; font-size: 12px; color: {accent_color}; font-weight: 700;">HEAVY HITTERS</span>
         </div>
         <p style="font-family: 'Courier New', monospace; font-size: 11px; color: #5a5550; margin: 0 0 18px; flex: none;">Artists with more than average + {stdev_multiplier:g}&sigma; songs in the library ({threshold:.2f}+). Sorted A&ndash;Z; page shows where the artist's songs begin.</p>
         <div style="column-count: 2; column-gap: 36px; flex: 1; overflow: hidden;">{entries}
@@ -505,10 +504,10 @@ def _render_toc_page(toc, stats, accent_color, binding_margin_in):
     """
 
 
-def _render_item(item):
+def _render_item(item, accent_color):
     if item['isLetter']:
         return f"""
-                <div style="background: #2E2E2E; color: #E9E1D4; height: 64px; margin-bottom: 14px; display: flex; align-items: center; padding-left: 12px; clip-path: polygon(0% 0%, 100% 0%, 100% 78%, 92% 100%, 84% 78%, 76% 100%, 68% 78%, 60% 100%, 52% 78%, 44% 100%, 36% 78%, 28% 100%, 20% 78%, 12% 100%, 4% 78%, 0% 100%);">
+                <div style="background: {accent_color}; color: #E9E1D4; height: 64px; margin-bottom: 14px; display: flex; align-items: center; padding-left: 12px; clip-path: polygon(0% 0%, 100% 0%, 100% 78%, 92% 100%, 84% 78%, 76% 100%, 68% 78%, 60% 100%, 52% 78%, 44% 100%, 36% 78%, 28% 100%, 20% 78%, 12% 100%, 4% 78%, 0% 100%);">
                   <span style="font-family: 'Courier New', monospace; font-weight: 700; font-size: 32px;">{_esc(item['letter'])}</span>
                 </div>"""
     if item['isArtist']:
@@ -518,9 +517,10 @@ def _render_item(item):
                 <div style="font-family: 'Courier New', monospace; font-size: 10.5px; color: #4a453e; padding-left: 25px; text-indent: -13px; line-height: 1.5;">&mdash; {_esc(item['title'])}</div>"""
 
 
-def _render_content_page(page, col_width_css, binding_margin_in):
+def _render_content_page(page, col_width_css, binding_margin_in, accent_color):
     columns = ''.join(
-        f'<div style="width: {col_width_css};">{"".join(_render_item(item) for item in col)}</div>'
+        f'<div style="width: {col_width_css};">'
+        f'{"".join(_render_item(item, accent_color) for item in col)}</div>'
         for col in page['columns'])
     return f"""
     <section class="page" style="padding: 0.55in 0.55in 0.4in {binding_margin_in};background: #E9E1D4;">
@@ -549,7 +549,7 @@ def render_html(paginated, stats, accent_color=DEFAULT_ACCENT_COLOR,
         _render_cover_page(stats, cover_color, binding_margin_in, synced_label,
                           cover_image_data_uri=cover_image_data_uri)
         + _render_toc_page(paginated['toc'], stats, accent_color, binding_margin_in)
-        + ''.join(_render_content_page(page, col_width_css, binding_margin_in)
+        + ''.join(_render_content_page(page, col_width_css, binding_margin_in, accent_color)
                   for page in paginated['pages'])
     )
 
