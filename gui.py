@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from VideoDownload import (
     read_metadata, build_query, run_song_with_backoff,
@@ -243,6 +243,10 @@ class Song:
     checked  : bool = False
     status   : str  = ''    # live status text during a run
     stag     : str  = ''    # colour tag: 'done'|'error'|'busy'|'dim'|''
+
+
+def _hex_to_rgb(hexcolor):
+    return tuple(int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
 
 
 def _open_in_file_manager(path):
@@ -1427,8 +1431,8 @@ class SongbookDialog(ctk.CTkToplevel):
         self._cover_buttons = {}
 
         self.title('Generate Songbook')
-        self.geometry('460x620')
-        self.minsize(420, 540)
+        self.geometry('460x720')
+        self.minsize(420, 620)
         self.resizable(True, True)
         self.configure(fg_color=_BG)
         self.grab_set()
@@ -1502,7 +1506,16 @@ class SongbookDialog(ctk.CTkToplevel):
                 command=lambda k=key: self._on_accent_change(k))
             btn.pack(side='left', padx=2)
             self._accent_buttons[key] = btn
-        self._refresh_swatch_selection(self._accent_buttons, accent)
+        accent_custom_hex = self._prefs.get('accent_custom_hex') or _SURFACE
+        accent_custom_btn = ctk.CTkButton(
+            accent_row, text='Custom…', width=64, height=26, font=ctk.CTkFont(size=10),
+            fg_color=accent_custom_hex, text_color='#11111b', hover_color=accent_custom_hex,
+            command=self._on_custom_accent)
+        accent_custom_btn.pack(side='left', padx=2)
+        self._accent_buttons['custom'] = accent_custom_btn
+        accent_source = self._prefs.get('accent_source', 'swatch')
+        self._refresh_swatch_selection(
+            self._accent_buttons, 'custom' if accent_source == 'custom' else accent)
 
         cover = self._prefs.get('cover', 'red')
         cover_row = ctk.CTkFrame(self, fg_color='transparent')
@@ -1517,11 +1530,58 @@ class SongbookDialog(ctk.CTkToplevel):
                 command=lambda k=key: self._on_cover_change(k))
             btn.pack(side='left', padx=2)
             self._cover_buttons[key] = btn
-        self._refresh_swatch_selection(self._cover_buttons, cover)
+        cover_custom_hex = self._prefs.get('cover_custom_hex') or _SURFACE
+        cover_custom_btn = ctk.CTkButton(
+            cover_row, text='Custom…', width=64, height=26, font=ctk.CTkFont(size=10),
+            fg_color=cover_custom_hex, text_color='#11111b', hover_color=cover_custom_hex,
+            command=self._on_custom_cover)
+        cover_custom_btn.pack(side='left', padx=2)
+        self._cover_buttons['custom'] = cover_custom_btn
+        cover_source = self._prefs.get('cover_source', 'swatch')
+        self._refresh_swatch_selection(
+            self._cover_buttons, 'custom' if cover_source == 'custom' else cover)
+
+        album_row = ctk.CTkFrame(self, fg_color='transparent')
+        album_row.grid(row=6, column=0, padx=20, pady=(16, 0), sticky='ew')
+        ctk.CTkLabel(album_row, text='Album art', font=ctk.CTkFont(size=11),
+                     text_color=_SUBTEXT).pack(side='left', padx=(0, 10))
+        self._art_thumb_lbl = ctk.CTkLabel(album_row, text='', width=28, height=28,
+                                           fg_color=_SURFACE, corner_radius=4)
+        self._art_thumb_lbl.pack(side='left', padx=(0, 8))
+        self._choose_art_btn = ctk.CTkButton(
+            album_row, text='Choose Image…', width=110, height=26, font=ctk.CTkFont(size=10),
+            fg_color='#313244', hover_color='#414160', command=self._on_choose_image)
+        self._choose_art_btn.pack(side='left', padx=2)
+        self._clear_art_btn = ctk.CTkButton(
+            album_row, text='Clear', width=50, height=26, font=ctk.CTkFont(size=10),
+            fg_color='#313244', hover_color='#414160', state='disabled',
+            command=self._on_clear_image)
+        self._clear_art_btn.pack(side='left', padx=2)
+
+        show_on_cover_row = ctk.CTkFrame(self, fg_color='transparent')
+        show_on_cover_row.grid(row=7, column=0, padx=20, pady=(6, 0), sticky='w')
+        self._show_on_cover_var = tk.BooleanVar(
+            value=bool(self._prefs.get('show_album_art_on_cover', False)))
+        self._show_on_cover_checkbox = ctk.CTkCheckBox(
+            show_on_cover_row, text='Also show this image on the cover',
+            variable=self._show_on_cover_var, font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
+            checkbox_width=16, checkbox_height=16, state='disabled',
+            command=lambda: self._persist('show_album_art_on_cover', self._show_on_cover_var.get()))
+        self._show_on_cover_checkbox.pack(side='left')
+
+        album_art_path = self._prefs.get('album_art_path', '')
+        if album_art_path and os.path.exists(album_art_path):
+            self._load_album_art_preview(album_art_path)
+            self._clear_art_btn.configure(state='normal')
+            self._show_on_cover_checkbox.configure(state='normal')
+        elif album_art_path:
+            # persisted path is gone (moved/deleted) -- routine, not an error;
+            # just drop it and keep whatever swatch/custom each role already has
+            self._prefs['album_art_path'] = ''
 
         stdev_multiplier = float(self._prefs.get('stdev_multiplier', songbook.DEFAULT_STDEV_MULTIPLIER))
         multiplier_row = ctk.CTkFrame(self, fg_color='transparent')
-        multiplier_row.grid(row=6, column=0, padx=20, pady=(16, 0), sticky='ew')
+        multiplier_row.grid(row=8, column=0, padx=20, pady=(16, 0), sticky='ew')
         multiplier_row.grid_columnconfigure(0, weight=1)
         top = ctk.CTkFrame(multiplier_row, fg_color='transparent')
         top.grid(row=0, column=0, sticky='ew')
@@ -1541,10 +1601,10 @@ class SongbookDialog(ctk.CTkToplevel):
         self._status_lbl = ctk.CTkLabel(
             self, text='Ready', font=ctk.CTkFont(size=11), text_color=_SUBTEXT,
             wraplength=400, justify='left')
-        self._status_lbl.grid(row=7, column=0, padx=20, pady=(20, 0), sticky='w')
+        self._status_lbl.grid(row=9, column=0, padx=20, pady=(20, 0), sticky='w')
 
         btn_row = ctk.CTkFrame(self, fg_color='transparent')
-        btn_row.grid(row=8, column=0, padx=20, pady=(10, 0), sticky='ew')
+        btn_row.grid(row=10, column=0, padx=20, pady=(10, 0), sticky='ew')
         self._open_btn = ctk.CTkButton(
             btn_row, text='Open', width=80, height=28, state='disabled',
             fg_color='#313244', hover_color='#414160',
@@ -1560,7 +1620,7 @@ class SongbookDialog(ctk.CTkToplevel):
                       fg_color='transparent', border_width=1,
                       border_color=_BORDER, hover_color='#30304a',
                       text_color=_SUBTEXT, font=ctk.CTkFont(size=12),
-                      command=self._close).grid(row=9, column=0, pady=18)
+                      command=self._close).grid(row=11, column=0, pady=18)
 
     def _refresh_columns_buttons(self, selected):
         self._prefs['columns'] = selected
@@ -1592,13 +1652,17 @@ class SongbookDialog(ctk.CTkToplevel):
 
     def _on_accent_change(self, key):
         self._prefs['accent'] = key
+        self._prefs['accent_source'] = 'swatch'
         self._refresh_swatch_selection(self._accent_buttons, key)
         self._persist('accent', key)
+        self._persist('accent_source', 'swatch')
 
     def _on_cover_change(self, key):
         self._prefs['cover'] = key
+        self._prefs['cover_source'] = 'swatch'
         self._refresh_swatch_selection(self._cover_buttons, key)
         self._persist('cover', key)
+        self._persist('cover_source', 'swatch')
 
     def _on_multiplier_change(self, value):
         rounded = round(value, 1)
@@ -1606,9 +1670,111 @@ class SongbookDialog(ctk.CTkToplevel):
         self._multiplier_lbl.configure(text=f'{rounded:g}σ')
         self._persist('stdev_multiplier', rounded)
 
+    def _on_custom_accent(self):
+        self._pick_custom_color('accent', self._accent_buttons)
+
+    def _on_custom_cover(self):
+        self._pick_custom_color('cover', self._cover_buttons)
+
+    def _pick_custom_color(self, role, buttons):
+        """Shared per-role "pick a custom color" path -- also what loading
+        album art calls (once per role) with its two extracted colors, since
+        album art is "custom, but both roles at once, computed instead of
+        picked" (see SPEC-songbook-album-art-colors.md)."""
+        current_hex = self._prefs.get(f'{role}_custom_hex') or getattr(
+            songbook, f'DEFAULT_{role.upper()}_COLOR')
+        rgb, hexcolor = colorchooser.askcolor(initialcolor=current_hex, parent=self)
+        if hexcolor is None:
+            return  # Cancel -- must be a no-op, never a fallback color
+        self._apply_custom_color(role, buttons, rgb)
+
+    def _apply_custom_color(self, role, buttons, rgb):
+        clamped_hex = songbook._clamp_for_legibility(rgb, role)
+        self._prefs[f'{role}_source'] = 'custom'
+        self._prefs[f'{role}_custom_hex'] = clamped_hex
+        buttons['custom'].configure(fg_color=clamped_hex, hover_color=clamped_hex)
+        self._refresh_swatch_selection(buttons, 'custom')
+        self._persist(f'{role}_source', 'custom')
+        self._persist(f'{role}_custom_hex', clamped_hex)
+
     def _persist(self, key, value):
         if self._on_option_change is not None:
             self._on_option_change(key, value)
+
+    _IMAGE_FILETYPES = (
+        ('Image files', '*.png *.jpg *.jpeg *.bmp *.gif *.webp'),
+        ('All files', '*.*'),
+    )
+
+    def _on_choose_image(self):
+        path = filedialog.askopenfilename(
+            title='Choose album art', filetypes=self._IMAGE_FILETYPES, parent=self)
+        if not path:
+            return  # Cancel -- no-op, same as the custom color picker
+        threading.Thread(target=self._extract_album_art_worker, args=(path,),
+                         daemon=True).start()
+
+    def _extract_album_art_worker(self, path):
+        try:
+            cover_hex, accent_hex = songbook.extract_cover_and_accent_colors(path)
+        except songbook.AlbumArtError as e:
+            # `e` is cleared by Python the instant this except block exits
+            # (standard Python 3 behavior, to avoid a traceback reference
+            # cycle) -- the message must be captured into a plain local
+            # BEFORE the lambda, or the deferred self.after() call raises
+            # NameError once it actually runs on a later mainloop tick.
+            message = str(e)
+            try:
+                self.after(0, lambda: self._on_album_art_error(message))
+            except Exception:
+                pass
+            return
+        try:
+            self.after(0, lambda: self._on_album_art_loaded(path, cover_hex, accent_hex))
+        except Exception:
+            pass
+
+    def _on_album_art_loaded(self, path, cover_hex, accent_hex):
+        if not self.winfo_exists():
+            return
+        self._prefs['album_art_path'] = path
+        self._persist('album_art_path', path)
+        # Album art sets BOTH roles at once -- the same per-role "apply a
+        # custom color" path the Custom… buttons use, just called twice with
+        # computed colors instead of once with a picked one. Already clamped
+        # by extract_cover_and_accent_colors(), so this second clamp pass is
+        # a harmless no-op, not a real second adjustment.
+        self._apply_custom_color('cover', self._cover_buttons, _hex_to_rgb(cover_hex))
+        self._apply_custom_color('accent', self._accent_buttons, _hex_to_rgb(accent_hex))
+        self._load_album_art_preview(path)
+        self._clear_art_btn.configure(state='normal')
+        self._show_on_cover_checkbox.configure(state='normal')
+        self._status_lbl.configure(text='Album art loaded.', text_color=_SUBTEXT)
+
+    def _on_album_art_error(self, message):
+        if not self.winfo_exists():
+            return
+        self._status_lbl.configure(text=message, text_color=_RED)
+
+    def _load_album_art_preview(self, path):
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(path) as img:
+                img = img.convert('RGB')
+                img.thumbnail((28, 28))
+                self._art_thumb_lbl.configure(
+                    text='', image=ctk.CTkImage(img, size=img.size))
+        except Exception:
+            log.warning('Could not load album art preview: %s', path)
+
+    def _on_clear_image(self):
+        self._prefs['album_art_path'] = ''
+        self._persist('album_art_path', '')
+        self._show_on_cover_var.set(False)
+        self._persist('show_album_art_on_cover', False)
+        self._art_thumb_lbl.configure(text='', image=None)
+        self._clear_art_btn.configure(state='disabled')
+        self._show_on_cover_checkbox.configure(state='disabled')
 
     def _generate(self):
         if self._generating:
@@ -1620,20 +1786,35 @@ class SongbookDialog(ctk.CTkToplevel):
         self._status_lbl.configure(text='Generating...', text_color=_BLUE)
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def _resolve_role_color(self, role):
+        """This role's effective hex: its own custom pick (which may have
+        come from a swatch click, the Custom… picker, or album art -- all
+        three funnel through the same accent_source/cover_source + *_hex
+        state) or a resolved swatch name."""
+        if self._prefs.get(f'{role}_source', 'swatch') == 'custom':
+            return self._prefs.get(f'{role}_custom_hex') or getattr(
+                songbook, f'DEFAULT_{role.upper()}_COLOR')
+        choices = songbook.ACCENT_COLOR_CHOICES if role == 'accent' else songbook.COVER_COLOR_CHOICES
+        default_key = 'denim' if role == 'accent' else 'red'
+        return choices.get(self._prefs.get(role, default_key),
+                           getattr(songbook, f'DEFAULT_{role.upper()}_COLOR'))
+
     def _worker(self):
         result = None
         try:
+            album_art_path = self._prefs.get('album_art_path', '')
+            cover_image_path = (album_art_path
+                                if album_art_path and self._show_on_cover_var.get() else None)
             result = songbook.generate_songbook(
                 self._songs_folder, songs=self._songs,
                 column_count=self._prefs.get('columns', songbook.DEFAULT_COLUMN_COUNT),
                 binding_margin=self._prefs.get('binding_margin', songbook.DEFAULT_BINDING_MARGIN),
-                accent_color=songbook.ACCENT_COLOR_CHOICES.get(
-                    self._prefs.get('accent', 'denim'), songbook.DEFAULT_ACCENT_COLOR),
-                cover_color=songbook.COVER_COLOR_CHOICES.get(
-                    self._prefs.get('cover', 'red'), songbook.DEFAULT_COVER_COLOR),
+                accent_color=self._resolve_role_color('accent'),
+                cover_color=self._resolve_role_color('cover'),
                 stdev_multiplier=self._prefs.get(
                     'stdev_multiplier', songbook.DEFAULT_STDEV_MULTIPLIER),
-                synced_label=time.strftime('%B %d, %Y').upper())
+                synced_label=time.strftime('%B %d, %Y').upper(),
+                cover_image_path=cover_image_path)
             text = (f"Done -- {result['page_count']} pages, "
                     f"{result['stats']['totalArtists']} artists, "
                     f"{result['stats']['totalSongs']} songs.")
@@ -2099,6 +2280,12 @@ class App(ctk.CTk):
         'accent': 'denim',
         'cover': 'red',
         'stdev_multiplier': songbook.DEFAULT_STDEV_MULTIPLIER,
+        'accent_source': 'swatch',
+        'cover_source': 'swatch',
+        'accent_custom_hex': '',
+        'cover_custom_hex': '',
+        'album_art_path': '',
+        'show_album_art_on_cover': False,
     }
 
     def _songbook_options(self):

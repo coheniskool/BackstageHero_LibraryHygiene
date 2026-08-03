@@ -117,7 +117,11 @@ def test_changing_margin_rounds_to_nearest_quarter_step_and_persists(dialog):
 def test_changing_accent_updates_selection_and_persists(dialog):
     dialog._on_accent_change('red')
     assert dialog._prefs['accent'] == 'red'
-    assert dialog._changes == [('accent', 'red')]
+    # also persists accent_source='swatch' -- a swatch click always reverts
+    # that role away from 'custom' (Custom picker or album art), even if it
+    # was already 'swatch' before this click
+    assert ('accent', 'red') in dialog._changes
+    assert ('accent_source', 'swatch') in dialog._changes
     assert dialog._accent_buttons['red'].cget('border_width') == 2
     assert dialog._accent_buttons['denim'].cget('border_width') == 0
 
@@ -125,7 +129,8 @@ def test_changing_accent_updates_selection_and_persists(dialog):
 def test_changing_cover_updates_selection_and_persists(dialog):
     dialog._on_cover_change('yellow')
     assert dialog._prefs['cover'] == 'yellow'
-    assert dialog._changes == [('cover', 'yellow')]
+    assert ('cover', 'yellow') in dialog._changes
+    assert ('cover_source', 'swatch') in dialog._changes
 
 
 def test_changing_stdev_multiplier_rounds_and_persists(dialog):
@@ -274,3 +279,188 @@ def test_generate_end_to_end_through_real_songbook_module(dialog, root):
     assert dialog._result is not None
     assert dialog._result['html_path'].exists()
     assert dialog._result['stats']['totalArtists'] == 2
+
+
+# --- custom color picker (per role) ---------------------------------------------
+
+def test_custom_accent_button_exists_alongside_swatches(dialog):
+    assert 'custom' in dialog._accent_buttons
+    assert 'custom' in dialog._cover_buttons
+
+
+def test_choosing_a_custom_accent_color_updates_only_that_role(dialog, monkeypatch):
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: ((59, 89, 152), '#3B5998'))
+    original_cover = dict(dialog._prefs)
+
+    dialog._on_custom_accent()
+
+    assert dialog._prefs['accent_source'] == 'custom'
+    assert dialog._prefs['accent_custom_hex'].startswith('#')
+    assert dialog._changes[-1][0] in ('accent_custom_hex', 'accent_source')
+    # cover role's own settings must be untouched
+    assert dialog._prefs.get('cover_source', 'swatch') == original_cover.get('cover_source', 'swatch')
+    assert dialog._prefs.get('cover') == original_cover.get('cover')
+
+
+def test_choosing_a_custom_cover_color_updates_only_that_role(dialog, monkeypatch):
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: ((140, 39, 39), '#8C2727'))
+    dialog._on_custom_cover()
+    assert dialog._prefs['cover_source'] == 'custom'
+    assert dialog._prefs['cover_custom_hex'].startswith('#')
+    assert dialog._prefs.get('accent_source', 'swatch') == 'swatch'
+
+
+def test_custom_color_is_clamped_for_legibility(dialog, monkeypatch):
+    # Pure white should not survive clamping unchanged -- proves the dialog
+    # actually routes the picked color through songbook._clamp_for_legibility()
+    # rather than using the raw OS-dialog value.
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: ((255, 255, 255), '#FFFFFF'))
+    dialog._on_custom_accent()
+    assert dialog._prefs['accent_custom_hex'] != '#FFFFFF'
+
+
+def test_custom_color_button_shows_the_clamped_hex(dialog, monkeypatch):
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: ((255, 255, 255), '#FFFFFF'))
+    dialog._on_custom_accent()
+    shown = dialog._accent_buttons['custom'].cget('fg_color')
+    assert shown == dialog._prefs['accent_custom_hex']
+
+
+def test_cancelling_the_custom_color_dialog_is_a_noop(dialog, monkeypatch):
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: (None, None))
+    before = dict(dialog._prefs)
+    changes_before = list(dialog._changes)
+
+    dialog._on_custom_accent()
+
+    assert dialog._prefs.get('accent_source', 'swatch') == before.get('accent_source', 'swatch')
+    assert dialog._changes == changes_before
+
+
+def test_clicking_a_swatch_after_custom_reverts_that_role_to_swatch(dialog, monkeypatch):
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: ((59, 89, 152), '#3B5998'))
+    dialog._on_custom_accent()
+    assert dialog._prefs['accent_source'] == 'custom'
+
+    dialog._on_accent_change('red')
+
+    assert dialog._prefs['accent_source'] == 'swatch'
+    assert dialog._prefs['accent'] == 'red'
+
+
+# --- album art row -----------------------------------------------------------------
+
+def _real_art_image(tmp_path, rgb=(200, 30, 30)):
+    from PIL import Image
+    path = tmp_path / 'art.png'
+    Image.new('RGB', (80, 80), rgb).save(path)
+    return str(path)
+
+
+def test_choosing_an_image_sets_both_roles_to_custom(dialog, root, tmp_path, monkeypatch):
+    art_path = _real_art_image(tmp_path)
+    monkeypatch.setattr(gui.filedialog, 'askopenfilename', lambda **k: art_path)
+
+    dialog._on_choose_image()
+    ok = _pump(root, 5.0, until=lambda: dialog._prefs.get('album_art_path') == art_path)
+
+    assert ok, 'album art extraction never finished'
+    assert dialog._prefs['accent_source'] == 'custom'
+    assert dialog._prefs['cover_source'] == 'custom'
+    assert dialog._prefs['accent_custom_hex'].startswith('#')
+    assert dialog._prefs['cover_custom_hex'].startswith('#')
+    assert dialog._clear_art_btn.cget('state') == 'normal'
+    assert dialog._show_on_cover_var.get() is False  # unchecked by default, per spec
+
+
+def test_choosing_an_image_cancel_dialog_is_a_noop(dialog, monkeypatch):
+    monkeypatch.setattr(gui.filedialog, 'askopenfilename', lambda **k: '')
+    before = dict(dialog._prefs)
+
+    dialog._on_choose_image()
+
+    assert dialog._prefs.get('album_art_path', '') == before.get('album_art_path', '')
+    assert dialog._clear_art_btn.cget('state') == 'disabled'
+
+
+def test_choosing_a_bad_image_shows_album_art_error(dialog, root, tmp_path, monkeypatch):
+    bad_path = tmp_path / 'not_an_image.png'
+    bad_path.write_bytes(b'not an image')
+    monkeypatch.setattr(gui.filedialog, 'askopenfilename', lambda **k: str(bad_path))
+
+    dialog._on_choose_image()
+    ok = _pump(root, 5.0, until=lambda: dialog._status_lbl.cget('text') != 'Ready')
+
+    assert ok
+    assert dialog._prefs.get('accent_source', 'swatch') == 'swatch'
+    assert dialog._clear_art_btn.cget('state') == 'disabled'
+
+
+def test_show_on_cover_checkbox_disabled_until_image_loaded(dialog):
+    assert dialog._show_on_cover_checkbox.cget('state') == 'disabled'
+
+
+def test_show_on_cover_checkbox_enabled_after_image_loaded(dialog, root, tmp_path, monkeypatch):
+    art_path = _real_art_image(tmp_path)
+    monkeypatch.setattr(gui.filedialog, 'askopenfilename', lambda **k: art_path)
+    dialog._on_choose_image()
+    _pump(root, 5.0, until=lambda: dialog._prefs.get('album_art_path') == art_path)
+    assert dialog._show_on_cover_checkbox.cget('state') == 'normal'
+
+
+def test_clearing_the_image_disables_checkbox_and_reverts_state(dialog, root, tmp_path, monkeypatch):
+    art_path = _real_art_image(tmp_path)
+    monkeypatch.setattr(gui.filedialog, 'askopenfilename', lambda **k: art_path)
+    dialog._on_choose_image()
+    _pump(root, 5.0, until=lambda: dialog._prefs.get('album_art_path') == art_path)
+
+    dialog._on_clear_image()
+
+    assert dialog._prefs.get('album_art_path', '') == ''
+    assert dialog._clear_art_btn.cget('state') == 'disabled'
+    assert dialog._show_on_cover_checkbox.cget('state') == 'disabled'
+
+
+def test_worker_passes_cover_image_path_only_when_checked_and_loaded(dialog, root, tmp_path, monkeypatch):
+    art_path = _real_art_image(tmp_path)
+    monkeypatch.setattr(gui.filedialog, 'askopenfilename', lambda **k: art_path)
+    dialog._on_choose_image()
+    _pump(root, 5.0, until=lambda: dialog._prefs.get('album_art_path') == art_path)
+
+    seen = {}
+
+    def fake_generate(*a, **k):
+        seen.update(k)
+        return {'pdf_path': None, 'html_path': None, 'page_count': 1,
+                'stats': {'totalArtists': 1, 'totalSongs': 1}}
+    monkeypatch.setattr(gui.songbook, 'generate_songbook', fake_generate)
+
+    # unchecked -> no cover_image_path
+    dialog._generate()
+    _pump(root, 5.0, until=lambda: not dialog._generating)
+    assert seen.get('cover_image_path') is None
+
+    # checked -> cover_image_path passed through
+    dialog._show_on_cover_var.set(True)
+    dialog._generate()
+    _pump(root, 5.0, until=lambda: not dialog._generating)
+    assert seen.get('cover_image_path') == art_path
+
+
+def test_worker_uses_custom_hex_when_source_is_custom(dialog, root, monkeypatch):
+    monkeypatch.setattr(gui.colorchooser, 'askcolor', lambda **k: ((59, 89, 152), '#3B5998'))
+    dialog._on_custom_accent()
+    expected_hex = dialog._prefs['accent_custom_hex']
+
+    seen = {}
+
+    def fake_generate(*a, **k):
+        seen.update(k)
+        return {'pdf_path': None, 'html_path': None, 'page_count': 1,
+                'stats': {'totalArtists': 1, 'totalSongs': 1}}
+    monkeypatch.setattr(gui.songbook, 'generate_songbook', fake_generate)
+
+    dialog._generate()
+    _pump(root, 5.0, until=lambda: not dialog._generating)
+
+    assert seen['accent_color'] == expected_hex

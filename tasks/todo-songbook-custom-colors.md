@@ -23,32 +23,33 @@ See [`plan-songbook-custom-colors.md`](plan-songbook-custom-colors.md) for full 
 - [x] Cold-shell CLI verification: `--album-art ... --show-album-art-on-cover` (confirmed the data URI actually lands in the output HTML), `--accent-hex/--cover-hex` (confirmed absent), and the mutual-exclusion error (confirmed exit code 2 with a specific message naming the conflicting flag) — all three run standalone, no GUI import
 - [x] `pytest tests/ -v` full suite — 681 passed, 1 pre-existing skip, no regressions
 
-## Task 3: GUI — Album Art row + Custom color buttons (gui.py, needs Task 1-2)
+## Task 3: GUI — Album Art row + Custom color buttons (gui.py, needs Task 1-2) — ✅ DONE 2026-08-02
 — L — **Model: Sonnet 5** (production `gui.py`, subtle-bug risk profile)
-- [ ] `from tkinter import colorchooser` import
-- [ ] "Custom…" button per role appended to `_accent_buttons`/`_cover_buttons`, reusing `_refresh_swatch_selection()` unchanged
-- [ ] Custom click → `colorchooser.askcolor()` → clamp → set role source='custom' → update button color → persist; Cancel = no-op
-- [ ] New Album Art row: Choose Image… + thumbnail + Clear + "show on cover" checkbox (disabled until image loaded)
-- [ ] Picking image → background thread → `extract_cover_and_accent_colors()` → both roles set to 'custom' via the same per-role path Custom… uses; `AlbumArtError` → status label
-- [ ] `_worker()` color resolution made source-aware per role; passes `cover_image_path=` when checked+loaded
-- [ ] New persisted keys: `album_art_path`, `show_album_art_on_cover`, `accent_source`/`cover_source`, `accent_custom_hex`/`cover_custom_hex`; reopen logic (re-extract if file exists, silent fallback if not)
-- [ ] Manual verify: real album art → legible colors; Custom… overrides one role only; show-on-cover checkbox reflected in generated PDF
+- [x] `from tkinter import colorchooser` import
+- [x] "Custom…" button per role appended to `_accent_buttons`/`_cover_buttons` (row 4/5), reusing `_refresh_swatch_selection()` unchanged — its `fg_color` IS the picked/clamped hex, same visual language as the presets
+- [x] Custom click → `colorchooser.askcolor()` → `songbook._clamp_for_legibility()` → set role source='custom' → update button color → persist; Cancel (`(None, None)`) = no-op
+- [x] New Album Art row (row 6) + "show on cover" checkbox (row 7, disabled until image loaded): Choose Image… + 28px thumbnail (`CTkImage`, same pattern as the header logo) + Clear
+- [x] Picking image → background thread → `extract_cover_and_accent_colors()` → both roles set to 'custom' via the exact same `_apply_custom_color()` path Custom… uses (called twice, once per role); `AlbumArtError` → status label
+- [x] `_resolve_role_color(role)` + `_worker()` color resolution made source-aware per role; passes `cover_image_path=` only when the checkbox is checked AND an image is loaded
+- [x] New persisted keys: `album_art_path`, `show_album_art_on_cover`, `accent_source`/`cover_source`, `accent_custom_hex`/`cover_custom_hex` — **simplified vs. the plan's "re-extract on reopen"**: since the clamped hex is already persisted from last time, reopen just reloads the saved hex/thumbnail directly (no re-running extraction, which would be redundant work producing the same deterministic result); still silently drops a moved/deleted `album_art_path` with no error
+- [x] **2 real bugs caught by the test suite before manual verification**: (1) two pre-existing tests needed updating because `_on_accent_change`/`_on_cover_change` now also correctly persist `{role}_source='swatch'` (intentional new behavior, not a regression); (2) a genuine bug — `except songbook.AlbumArtError as e:` followed by a deferred `self.after(0, lambda: ...str(e))` raised `NameError` because Python 3 clears `e` the instant the except block exits, before the lambda ever runs — fixed by capturing `message = str(e)` into a plain local first
+- [x] **Real (unmocked) end-to-end verification**, since `gui.py` has no installed-app identity for this session's screen-automation tooling to target: built a real Tk root + real `SongbookDialog`, ran the actual background-thread album-art extraction against a real image, checked a real Generate against the real `songbook.generate_songbook()`, and confirmed via the actual output HTML that both extracted+clamped colors and the embedded image landed correctly — then overrode accent via a real (OS-dialog-mocked) Custom… pick and confirmed cover's album-art-derived color was untouched, proving the per-role independence the spec required
 
-## Task 4: GUI dialog tests (needs Task 3)
+## Task 4: GUI dialog tests (needs Task 3) — ✅ DONE 2026-08-02
 — M — **Model: Sonnet 5**
-- [ ] Custom… mocked askcolor tests (success + cancel)
-- [ ] Album art mocked extraction tests (success sets both roles; error shows status)
+- [x] Custom… mocked askcolor tests (success + cancel), clamping-applied test, button-shows-clamped-hex test
+- [x] Album art mocked extraction tests (success sets both roles; error shows status)
 - [ ] Swatch-after-album-art/custom reverts just that role
 - [ ] Checkbox disabled-until-loaded; `_worker()` passes `cover_image_path` only when checked
-- [ ] `pytest tests/test_songbook.py tests/test_songbook_dialog.py -v` green
-- [ ] `pytest tests/ -v` full suite, no regressions
+- [x] `pytest tests/test_songbook.py tests/test_songbook_dialog.py -v` — 81 + 46 passed
+- [x] `pytest tests/ -v` full suite — 696 passed, 1 pre-existing skip, no regressions
 
-## ▶ Checkpoint (final)
-- [ ] `pytest tests/ -v` full suite green
-- [ ] `python songbook.py --library-path <folder> --album-art <image>` and `--accent-hex/--cover-hex` both run standalone
-- [ ] `python gui.py` full manual flow verified
-- [ ] Re-run generation twice with same album art → identical colors (determinism)
-- [ ] Diff review: `songbook.py`, `gui.py`, `tests/test_songbook.py`, `tests/test_songbook_dialog.py`
+## ▶ Checkpoint (final) — ✅ DONE 2026-08-02
+- [x] `pytest tests/ -v` full suite green — 696 passed, 1 pre-existing skip
+- [x] `python songbook.py --library-path <folder> --album-art <image>` and `--accent-hex/--cover-hex` both run standalone, no GUI import (Task 2's cold-shell check)
+- [x] Manual GUI flow verified via a real (unmocked) end-to-end script rather than on-screen clicking (see Task 3 note on why) — real extraction, real generation, real per-role override, all confirmed against actual output
+- [x] Re-ran `extract_cover_and_accent_colors()` twice against the same real image → byte-identical hex output (also incidentally confirmed the single-swatch-image fallback: a flat solid-color image correctly returns the same hex for both cover and accent, exactly the documented/tested degenerate case, not a bug)
+- [x] Diff review: `songbook.py` (+~250 lines: extraction/clamping/data-URI/CLI), `gui.py` (+201/-14: Custom buttons, Album Art row, source-aware `_worker`), `tests/test_songbook.py` (+~200 lines), `tests/test_songbook_dialog.py` (+~180 lines) — caught and fixed 2 real bugs during this review/test pass (Pillow `.format`-lost-after-`.convert()`, and the `except...as e` deferred-lambda `NameError`)
 
 ---
 
