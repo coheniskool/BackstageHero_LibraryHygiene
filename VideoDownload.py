@@ -784,8 +784,8 @@ def fetch_audio(folder, url):
     max_h = 0
     info = None
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info = _run_ytdlp_with_cookie_fallback(
+            opts, lambda ydl: ydl.extract_info(url, download=True))
         if info:
             heights = [f.get('height') for f in (info.get('formats') or [])
                        if f.get('height')]

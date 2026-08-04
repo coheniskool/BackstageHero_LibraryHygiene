@@ -266,3 +266,36 @@ def test_search_candidates_bot_error_is_not_treated_as_a_cookie_failure(monkeypa
 
     assert vd._COOKIES_BROKEN is False
     assert len(FakeYDL.calls) == 1
+
+
+def test_fetch_audio_recovers_after_dpapi_failure(tmp_path, monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    monkeypatch.setattr(vd, 'cleanup_temp_files', lambda folder: None)
+    (tmp_path / 'video.sync.opus').write_bytes(b'fake audio')
+    good_info = {'formats': [{'height': 480}, {'height': 240}]}
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), good_info])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    path, max_h, info = vd.fetch_audio(str(tmp_path), 'https://youtu.be/x')
+
+    assert path == str(tmp_path / 'video.sync.opus')
+    assert max_h == 480
+    assert info == good_info
+    assert vd._COOKIES_BROKEN is True
+    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
+    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+
+
+def test_fetch_audio_still_swallows_non_cookie_non_bot_errors(tmp_path, monkeypatch):
+    # Unrelated failure (e.g. network unreachable) after cookies are already
+    # disabled -- fetch_audio's existing swallow-and-return contract must
+    # still hold, unchanged by this fix.
+    vd.configure_cookies(False, None)
+    monkeypatch.setattr(vd, 'cleanup_temp_files', lambda folder: None)
+    FakeYDL = _make_fake_ydl_class([Exception('network unreachable')])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    path, max_h, info = vd.fetch_audio(str(tmp_path), 'https://youtu.be/x')
+
+    assert (path, max_h, info) == (None, 0, None)
+    assert vd._COOKIES_BROKEN is False
