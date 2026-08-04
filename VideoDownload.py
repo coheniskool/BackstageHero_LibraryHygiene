@@ -642,6 +642,14 @@ def video_id_of(url):
 # ever read, logged, or persisted by this code.
 USE_BROWSER_COOKIES = False
 COOKIE_BROWSER = None
+# Set once a browser-cookie store proves unusable this process (DPAPI/App-
+# Bound Encryption failure, locked profile, corrupted store, etc.) -- see
+# _run_ytdlp_with_cookie_fallback() below. Deliberately NOT reset by
+# configure_cookies(): once broken this process, it stays broken until the
+# app restarts, even if the user re-toggles the checkbox mid-session. That
+# keeps the fallback entirely in-memory -- it never touches settings.json or
+# gui.py's checkbox state.
+_COOKIES_BROKEN = False
 
 # yt-dlp's own supported --cookies-from-browser browser names. Kept here as a
 # defense-in-depth guard: today's only caller (gui.py's footer dropdown) is
@@ -690,12 +698,47 @@ def _base_opts():
         'noplaylist': 1,
         'sleep_interval_requests': 1,
     }
-    if USE_BROWSER_COOKIES and COOKIE_BROWSER:
+    if USE_BROWSER_COOKIES and COOKIE_BROWSER and not _COOKIES_BROKEN:
         # yt-dlp's Python-API equivalent of --cookies-from-browser: a
         # 1-tuple of (browser_name,). yt-dlp reads that browser's own cookie
         # store directly -- nothing here touches a cookie value.
         opts['cookiesfrombrowser'] = (COOKIE_BROWSER,)
     return opts
+
+
+_COOKIE_ERROR_SIGNS = ('failed to decrypt with dpapi', 'failed to load cookies')
+
+
+def _is_cookie_decrypt_error(exc):
+    msg = str(exc).lower()
+    return any(sign in msg for sign in _COOKIE_ERROR_SIGNS)
+
+
+def _run_ytdlp_with_cookie_fallback(opts, fn):
+    """Run fn(ydl) with opts. If it fails because the browser-cookie store
+    couldn't be read (Windows DPAPI / Chrome App-Bound Encryption -- yt-dlp
+    issue #10927), disable cookies for the rest of this process and retry
+    fn once without them.
+
+    Matches on message text, not exception type: yt-dlp's YoutubeDL.cookiejar
+    property catches the internal CookieLoadError and re-raises it as a plain
+    DownloadError carrying the original message -- by the time it reaches
+    here the type information is already gone, only the text survives."""
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return fn(ydl)
+    except Exception as e:
+        if not (opts.get('cookiesfrombrowser') and _is_cookie_decrypt_error(e)):
+            raise
+        global _COOKIES_BROKEN
+        if not _COOKIES_BROKEN:
+            log.warning('Browser cookie extraction failed (%s); continuing '
+                        'this run without browser cookies.', e)
+        _COOKIES_BROKEN = True
+        retry_opts = dict(opts)
+        retry_opts.pop('cookiesfrombrowser', None)
+        with yt_dlp.YoutubeDL(retry_opts) as ydl:
+            return fn(ydl)
 
 
 def search_candidates(query, n=SEARCH_RESULTS):
