@@ -13,6 +13,7 @@ import sys
 # fail a single test. library_common imports only stdlib and prints nothing.
 import library_common
 library_common.ensure_stdio_not_none()
+library_common.make_console_encoding_safe()
 
 import configparser
 import glob

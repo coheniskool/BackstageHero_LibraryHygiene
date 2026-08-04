@@ -71,6 +71,37 @@ def test_the_replacement_stream_survives_non_cp1252_text(monkeypatch):
         sys.stdout.close()
 
 
+# --- SPEC-cookie-fallback-fix.md Root Cause 2: VideoDownload.py's console --
+#
+# print() call sites (e.g. VideoDownload.py:1079's "Looking on YouTube for:
+# " + query) crashed on a song title/query containing a character outside
+# the console's codepage. library_common.make_console_encoding_safe() already
+# existed and was already wired into five sibling tools -- just not this one.
+
+def test_the_replacement_stream_survives_tonights_crashed_string(monkeypatch):
+    """Regression pin for the exact failure: a title containing a mojibake'd
+    U+FFFD replacement character killed process_download's
+    print('\\nLooking on YouTube for: ' + query) at VideoDownload.py:1079."""
+    monkeypatch.setattr(sys, 'stdout', None)
+    library_common.ensure_stdio_not_none()
+    library_common.make_console_encoding_safe()
+    try:
+        print('\nLooking on YouTube for: Lechuga O Vurd�n')   # must not raise
+    finally:
+        sys.stdout.close()
+
+
+def test_videodownload_makes_console_encoding_safe_before_anything_prints():
+    """VideoDownload.py has ~50 print() call sites, several interpolating
+    externally-sourced text (song titles, search queries, exception
+    messages) that can contain characters outside the console's codepage --
+    see Root Cause 2 of SPEC-cookie-fallback-fix.md. The guard must run at
+    import time, before any of those call sites can execute."""
+    path = Path(library_common.__file__).parent / 'VideoDownload.py'
+    source = path.read_text(encoding='utf-8')
+    assert 'library_common.make_console_encoding_safe()' in source
+
+
 # --- P3-H1: legacy nested review folders ----------------------------------
 
 def test_a_song_in_an_old_nested_review_folder_is_invisible_to_repair_but_live_to_the_app(tmp_path):
