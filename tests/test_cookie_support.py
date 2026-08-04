@@ -239,3 +239,30 @@ def test_cookie_fallback_logs_the_warning_exactly_once(monkeypatch, caplog):
     assert (r1, r2) == ('ok1', 'ok2')
     warnings = [r for r in caplog.records if 'cookie' in r.message.lower()]
     assert len(warnings) == 1
+
+
+def test_search_candidates_retries_without_cookies_after_dpapi_failure(monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    good = {'entries': [{'id': 'abc123', 'title': 'A Song', 'duration': 180}]}
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), good])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    candidates = vd.search_candidates('some query', n=1)
+
+    assert candidates == [('https://www.youtube.com/watch?v=abc123', 'A Song', 180)]
+    assert vd._COOKIES_BROKEN is True
+    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
+    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+
+
+def test_search_candidates_bot_error_is_not_treated_as_a_cookie_failure(monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    bot_error = Exception("Sign in to confirm you're not a bot")
+    FakeYDL = _make_fake_ydl_class([bot_error])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    with pytest.raises(vd.BotDetected):
+        vd.search_candidates('some query', n=1)
+
+    assert vd._COOKIES_BROKEN is False
+    assert len(FakeYDL.calls) == 1

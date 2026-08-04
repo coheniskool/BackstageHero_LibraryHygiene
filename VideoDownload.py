@@ -747,8 +747,8 @@ def search_candidates(query, n=SEARCH_RESULTS):
     opts = _base_opts()
     opts['extract_flat'] = True
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f'ytsearch{n}:{query}', download=False)
+        info = _run_ytdlp_with_cookie_fallback(
+            opts, lambda ydl: ydl.extract_info(f'ytsearch{n}:{query}', download=False))
     except Exception as e:
         if is_bot_error(e):
             raise BotDetected(str(e))
