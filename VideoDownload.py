@@ -840,22 +840,24 @@ def download_video(folder, url, quality, info=None):
         'sleep_interval': 1,
         'max_sleep_interval': 3,
     })
+    def _do(ydl):
+        done = False
+        if info:
+            try:
+                # drop the audio run's selections, keep the format list
+                clean = {k: v for k, v in info.items()
+                         if not k.startswith('requested')}
+                ydl.process_ie_result(clean, download=True)
+                done = True
+            except Exception:
+                log.info('Cached extraction reuse failed; extracting fresh',
+                         exc_info=True)
+                cleanup_temp_files(folder)
+        if not done:
+            ydl.download([url])
+
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            done = False
-            if info:
-                try:
-                    # drop the audio run's selections, keep the format list
-                    clean = {k: v for k, v in info.items()
-                             if not k.startswith('requested')}
-                    ydl.process_ie_result(clean, download=True)
-                    done = True
-                except Exception:
-                    log.info('Cached extraction reuse failed; extracting fresh',
-                             exc_info=True)
-                    cleanup_temp_files(folder)
-            if not done:
-                ydl.download([url])
+        _run_ytdlp_with_cookie_fallback(opts, _do)
     except Exception as e:
         if is_bot_error(e):
             raise BotDetected(str(e))

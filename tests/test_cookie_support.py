@@ -299,3 +299,37 @@ def test_fetch_audio_still_swallows_non_cookie_non_bot_errors(tmp_path, monkeypa
 
     assert (path, max_h, info) == (None, 0, None)
     assert vd._COOKIES_BROKEN is False
+
+
+def test_download_video_retries_without_cookies_after_dpapi_failure(tmp_path, monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    monkeypatch.setattr(vd, 'cleanup_temp_files', lambda folder: None)
+    monkeypatch.setattr(vd, 'ffmpegAvailable', False)  # skip the remux subprocess path
+    folder = tmp_path
+
+    def _make_download_file():
+        (folder / 'video.download.mp4').write_bytes(b'fake video')
+
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), _make_download_file])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    vd.download_video(str(folder), 'https://youtu.be/x', 'height<=720')
+
+    assert (folder / 'video.mp4').exists()
+    assert vd._COOKIES_BROKEN is True
+    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
+    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+
+
+def test_download_video_bot_error_is_not_treated_as_a_cookie_failure(tmp_path, monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    monkeypatch.setattr(vd, 'cleanup_temp_files', lambda folder: None)
+    bot_error = Exception('HTTP Error 429: Too Many Requests')
+    FakeYDL = _make_fake_ydl_class([bot_error])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    with pytest.raises(vd.BotDetected):
+        vd.download_video(str(tmp_path), 'https://youtu.be/x', 'height<=720')
+
+    assert vd._COOKIES_BROKEN is False
+    assert len(FakeYDL.calls) == 1
