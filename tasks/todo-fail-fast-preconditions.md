@@ -64,14 +64,39 @@ Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md)
 - [x] `pytest tests/test_fail_fast.py -v` green
 
 ## Task 6: Full regression + scope/diff review
-- [ ] `pytest tests/ -q` full suite green
-- [ ] `git diff --stat` shows only `VideoDownload.py`, `gui.py`, `tests/test_fail_fast.py` + docs
-- [ ] Re-read the spec's "Never" list against the final diff
+- [x] `pytest tests/ -q` full suite green (733 passed, 1 skipped)
+- [x] `git diff --stat` shows only `VideoDownload.py`, `gui.py`, `tests/test_fail_fast.py` + docs
+- [x] Both source files are purely additive -- zero removed lines
+- [x] Re-read the spec's "Never" list against the final diff: no similarity matching,
+      no `record_throttle_episode(` call added, no `throttle_count +=` added, guard not
+      inside any `try/except`, zero lines touching `_COOKIE_ERROR_SIGNS` /
+      `configure_cookies` / `_COOKIES_BROKEN` / `_run_ytdlp_with_cookie_fallback`
 
 ## ▶ Final Checkpoint
-- [ ] All six spec Success Criteria confirmed by a named test or named manual check
-- [ ] Existing throttle-path tests untouched and passing
-- [ ] Manual smoke: launch via the .bat, normal operation confirmed
+- [x] Success criteria 2-6 each confirmed by a named test (see mapping below)
+- [~] Criterion 1 partially: the raise, the message and the call site are tested; that an
+      uncaught ImportError exits non-zero and the .bat retry then fires is untested --
+      it is launcher behaviour, not app behaviour. Confirm during the manual launch.
+- [x] Existing throttle-path tests untouched and passing (`test_background_mode_*`,
+      `test_throttle_history` all green, none modified)
+- [~] Manual smoke: DEFERRED for the same reason as Checkpoint 1 -- a live app instance
+      (PID 15316) owns `background_state.json` and the shared log. Verified headlessly:
+      `pythonw.exe` imports `gui` cleanly, `CONSECUTIVE_ERROR_LIMIT` resolves to 20, and
+      `_handle_background_error_streak` is present on `App`. **Do the real launch before
+      merging.**
+
+### Success criteria mapping
+1. Broken yt_dlp fails at startup naming the path -> `test_assert_ytdlp_usable_raises_when_youtubedl_missing`,
+   `test_assert_ytdlp_usable_message_names_the_resolved_path`, `test_videodownload_calls_the_guard_right_after_importing_yt_dlp`
+2. 20 consecutive errors in background back off once -> `test_background_trip_backs_off_instead_of_ending_the_run`,
+   `test_counter_resets_after_a_background_backoff`
+3. 19 then a success trips nothing -> `test_one_short_of_the_limit_does_not_trip`,
+   `test_a_success_between_two_near_miss_runs_resets_the_count`, `test_a_skipped_song_between_two_near_miss_runs_resets_the_count`
+4. A trip never reaches the adaptive episode data -> `test_background_trip_does_not_record_a_throttle_episode`,
+   `test_background_trip_leaves_throttle_count_alone`
+5. Foreground and CLI end with their own message -> `test_foreground_trip_does_not_claim_a_rate_limit`,
+   `test_trips_at_exactly_the_limit_and_stops_advancing`, `test_cli_loop_trips_after_limit_consecutive_errors`
+6. Suite green, throttle tests unchanged -> 733 passed, 1 skipped
 
 ---
 
