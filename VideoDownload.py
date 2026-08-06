@@ -706,7 +706,21 @@ def _base_opts():
     return opts
 
 
-_COOKIE_ERROR_SIGNS = ('failed to decrypt with dpapi', 'failed to load cookies')
+# Two distinct ways the browser's cookie store comes back unreadable on
+# Windows, both of which yt-dlp surfaces as a bare DownloadError carrying only
+# this text. DPAPI: Chrome's App-Bound Encryption key can't be unwrapped
+# (yt-dlp #10927). Copy: Chrome is *running* and holds Cookies open, so the
+# PermissionError-to-DownloadError conversion in yt_dlp/cookies.py fires
+# (yt-dlp #7271) -- that one went unmatched at first and killed every song of a
+# 7441-song overnight run. Kept as exact per-issue strings rather than
+# something broader like 'cookie': a genuinely actionable cookie problem (a
+# misspelled browser name, say) must still fail loudly instead of being
+# silently downgraded to a cookie-free run.
+_COOKIE_ERROR_SIGNS = (
+    'failed to decrypt with dpapi',
+    'failed to load cookies',
+    'could not copy chrome cookie database',
+)
 
 
 def _is_cookie_decrypt_error(exc):

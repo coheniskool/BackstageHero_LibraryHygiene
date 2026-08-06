@@ -68,6 +68,17 @@ _DPAPI_ERROR_TEXT = (
     'ERROR: Failed to decrypt with DPAPI. See  '
     'https://github.com/yt-dlp/yt-dlp/issues/10927  for more info')
 
+# The second browser-cookie failure this app actually hits, copied verbatim from
+# a 2026-08-05 overnight run's log. yt_dlp/cookies.py turns a Windows
+# PermissionError (errno 13 -- Chrome is running and holding its Cookies file
+# open) into a bare DownloadError, so nothing but the message text survives to
+# identify it. The doubled 'ERROR: ERROR:' and the double spaces around the URL
+# are real: cookies.py logs the message and YoutubeDL.report_error prefixes it
+# again on the way out.
+_LOCKED_CHROME_DB_ERROR_TEXT = (
+    'ERROR: ERROR: Could not copy Chrome cookie database. See  '
+    'https://github.com/yt-dlp/yt-dlp/issues/7271  for more info')
+
 
 def test_base_opts_has_no_cookie_key_by_default():
     opts = vd._base_opts()
@@ -158,6 +169,14 @@ def test_is_cookie_decrypt_error_matches_dpapi_and_cookie_load_text():
     assert vd._is_cookie_decrypt_error(Exception('Failed To Decrypt With DPAPI'))
 
 
+def test_is_cookie_decrypt_error_matches_locked_chrome_cookie_db():
+    # Same failure class as DPAPI -- the browser's cookie store cannot be read,
+    # so the only useful response is to carry on without it. Different message
+    # though, and the original one killed every song in a 7441-song run.
+    assert vd._is_cookie_decrypt_error(Exception(_LOCKED_CHROME_DB_ERROR_TEXT))
+    assert vd._is_cookie_decrypt_error(Exception('COULD NOT COPY CHROME COOKIE DATABASE'))
+
+
 def test_is_cookie_decrypt_error_does_not_match_bot_or_unrelated_errors():
     assert not vd._is_cookie_decrypt_error(
         Exception("Sign in to confirm you're not a bot"))
@@ -245,6 +264,22 @@ def test_search_candidates_retries_without_cookies_after_dpapi_failure(monkeypat
     vd.configure_cookies(True, 'chrome')
     good = {'entries': [{'id': 'abc123', 'title': 'A Song', 'duration': 180}]}
     FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), good])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    candidates = vd.search_candidates('some query', n=1)
+
+    assert candidates == [('https://www.youtube.com/watch?v=abc123', 'A Song', 180)]
+    assert vd._COOKIES_BROKEN is True
+    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
+    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+
+
+def test_search_candidates_retries_without_cookies_after_locked_chrome_db(monkeypatch):
+    # End-to-end shape of the 2026-08-05 failure: Chrome was open, every song
+    # died on the first construction. The retry has to rescue the same song.
+    vd.configure_cookies(True, 'chrome')
+    good = {'entries': [{'id': 'abc123', 'title': 'A Song', 'duration': 180}]}
+    FakeYDL = _make_fake_ydl_class([Exception(_LOCKED_CHROME_DB_ERROR_TEXT), good])
     monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
 
     candidates = vd.search_candidates('some query', n=1)
