@@ -56,12 +56,12 @@ Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md)
 - [x] Read-check: adaptive-schedule recording path untouched
 
 ## Task 5: CLI loop counts and trips — `VideoDownload.py:1685-1707`
-- [ ] Derive per-song errored from `len(errored)` before vs. after the call
-- [ ] On trip: print a reason naming the repeated error, set `interrupted = True`, `break`
-- [ ] No long backoff in the CLI path (background-mode-only by design)
-- [ ] `test_cli_loop_trips_after_limit_consecutive_errors`
-- [ ] `test_cli_loop_success_resets_the_count`
-- [ ] `pytest tests/test_fail_fast.py -v` green
+- [x] Derive per-song errored from `len(errored)` before vs. after the call
+- [x] On trip: print a reason naming the repeated error, set `interrupted = True`, `break`
+- [x] No long backoff in the CLI path (background-mode-only by design)
+- [x] `test_cli_loop_trips_after_limit_consecutive_errors`
+- [x] `test_cli_loop_success_resets_the_count`
+- [x] `pytest tests/test_fail_fast.py -v` green
 
 ## Task 6: Full regression + scope/diff review
 - [ ] `pytest tests/ -q` full suite green

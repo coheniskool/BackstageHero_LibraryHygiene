@@ -355,3 +355,74 @@ def test_counter_resets_after_a_background_backoff(background, monkeypatch):
 
     kinds = _kinds(_drain(background.app))
     assert kinds.count('background_error_streak') == 1
+
+
+# --- Part B: the same breaker in the source-run CLI loop --------------------
+#
+# main() is the `python VideoDownload.py` path (the frozen build launches the
+# GUI instead). No long backoff here: the escalating wait is background-mode-
+# only by design, and an interactive run should not silently sit for an hour.
+
+def _cli_library(tmp_path, count):
+    songs = tmp_path / 'songs'
+    for n in range(count):
+        folder = songs / ('S%d' % n)
+        folder.mkdir(parents=True)
+        (folder / 'song.ini').write_text('[song]\nname = S%d\n' % n,
+                                         encoding='utf-8')
+    return songs
+
+
+@pytest.fixture
+def cli(tmp_path, monkeypatch):
+    """Drive main() far enough to reach its download loop: real song.ini files
+    on disk, scripted answers to its two input() prompts, no real sleeping."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(vd.updater, 'run_startup_updates', lambda *a, **k: None)
+    monkeypatch.setattr('time.sleep', lambda seconds: None)
+    answers = iter(['1'])          # '1' = default 720p; then Enter-to-exit
+    monkeypatch.setattr('builtins.input', lambda *a, **k: next(answers, ''))
+
+    attempted = []
+
+    def make_runner(script):
+        def fake(folder, song_name, quality, sync_ready, replace, resync,
+                 errored):
+            attempted.append(song_name)
+            entry = script.pop(0) if script else 'ok'
+            if entry == 'error':
+                errored.append('boom')
+                return 'ok'
+            return entry
+        return fake
+
+    class _NS:
+        pass
+    ns = _NS()
+    ns.tmp_path, ns.attempted, ns.make_runner = tmp_path, attempted, make_runner
+    return ns
+
+
+def test_cli_loop_trips_after_limit_consecutive_errors(cli, monkeypatch):
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    _cli_library(cli.tmp_path, limit + 3)
+    monkeypatch.setattr(vd, 'run_song_with_backoff',
+                        cli.make_runner(['error'] * (limit + 3)))
+
+    vd.main()
+
+    # Stopped at the limit instead of working through the remaining three.
+    assert len(cli.attempted) == limit
+
+
+def test_cli_loop_success_resets_the_count(cli, monkeypatch):
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    total = 2 * limit - 1
+    _cli_library(cli.tmp_path, total)
+    script = ['error'] * (limit - 1) + ['ok'] + ['error'] * (limit - 1)
+    monkeypatch.setattr(vd, 'run_song_with_backoff', cli.make_runner(script))
+
+    vd.main()
+
+    # Never limit-in-a-row, so every song got its turn.
+    assert len(cli.attempted) == total

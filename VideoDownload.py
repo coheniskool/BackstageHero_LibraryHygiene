@@ -1725,6 +1725,7 @@ def main():
     errored = []
     interrupted = False
     current_folder = None
+    consecutive_errors = 0
 
     try:
         with tqdm(total=total, unit='songs') as pbar:
@@ -1741,9 +1742,31 @@ def main():
                 elif has_video and not replace:
                     continue
 
+                errors_before = len(errored)
                 ok = run_song_with_backoff(
                     folder, song_name, video_quality, sync_ready, replace, resync, errored)
                 if ok == 'stop':
+                    interrupted = True
+                    break
+
+                # Circuit breaker (SPEC-fail-fast-preconditions.md). Unlike the
+                # GUI loop, `errored` here accumulates across the whole run, so
+                # "did THIS song fail" is whether the list just grew.
+                if len(errored) > errors_before:
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
+                if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
+                    # No long backoff on this path: the escalating wait is
+                    # background-mode-only by design, and someone sitting at an
+                    # interactive run should not be left staring at an hour of
+                    # silence.
+                    log.error('%d songs in a row failed; stopping. Last error: %s',
+                              consecutive_errors, errored[-1])
+                    print('\n' + str(consecutive_errors) + ' songs in a row failed, so this stopped')
+                    print('rather than working through the rest of your library the same way.')
+                    print('Last error: ' + str(errored[-1]))
+                    print('Nothing already downloaded was touched. Fix the cause and re-run.')
                     interrupted = True
                     break
 
