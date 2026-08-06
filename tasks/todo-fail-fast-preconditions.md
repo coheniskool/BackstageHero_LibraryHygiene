@@ -25,17 +25,17 @@ Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md)
 - [x] `pytest tests/test_fail_fast.py -v` green
 
 ## Task 3: GUI loop counts and trips — `gui.py:3036-3105`
-- [ ] Add `consecutive_errors` local alongside `clean_streak`/`pace`
-- [ ] Update it in the three existing outcome branches (`skipped` / `errored` / done)
-- [ ] Confirm the throttle `'stop'` path leaves the counter unchanged
-- [ ] Foreground trip: post new `('error_streak', s, i, total, last_error)` and return
-- [ ] Add the matching `_queue` consumer so the user actually sees it
-- [ ] `test_counter_increments_on_error_and_resets_on_success`
-- [ ] `test_counter_resets_on_skipped_song`
-- [ ] `test_nineteen_errors_then_a_success_does_not_trip`
-- [ ] `test_trips_at_exactly_the_limit_not_before`
-- [ ] `test_foreground_trip_posts_error_streak_not_rate_limited`
-- [ ] `pytest tests/test_fail_fast.py -v` green
+- [x] Add `consecutive_errors` local alongside `clean_streak`/`pace`
+- [x] Update it in the three existing outcome branches (`skipped` / `errored` / done)
+- [x] Confirm the throttle `'stop'` path leaves the counter unchanged
+- [x] Foreground trip: post new `('error_streak', s, i, total, last_error)` and return
+- [x] Add the matching `_queue` consumer so the user actually sees it
+- [x] `test_counter_increments_on_error_and_resets_on_success`
+- [x] `test_counter_resets_on_skipped_song`
+- [x] `test_nineteen_errors_then_a_success_does_not_trip`
+- [x] `test_trips_at_exactly_the_limit_not_before`
+- [x] `test_foreground_trip_posts_error_streak_not_rate_limited`
+- [x] `pytest tests/test_fail_fast.py -v` green
 
 ## Task 4: Background trip handler — `gui.py`, sibling of `_handle_background_throttle`
 - [ ] New handler reusing persist → post → cancellable-wait mechanics

@@ -47,6 +47,7 @@ from VideoDownload import (
     SYNC_MANUAL, dump_video, get_rejected_sources, classify_candidate_title,
     configure_cookies,
     next_resume_at, get_active_schedule, record_throttle_episode,
+    CONSECUTIVE_ERROR_LIMIT,
 )
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import updater
@@ -3029,6 +3030,13 @@ class App(ctk.CTk):
         # time when the episode finally resolves.
         throttle_count = 0
         episode_started_at = None
+        # Circuit breaker (SPEC-fail-fast-preconditions.md). Counts songs that
+        # failed back-to-back; any song that succeeds or is skipped resets it.
+        # A throttle 'stop' deliberately does NOT touch it -- that song has no
+        # verdict yet, the throttle path owns it, and counting it here would
+        # conflate "YouTube is pushing back" with "something is broken".
+        consecutive_errors = 0
+        last_error = None
         # A while loop (not `for i, s in enumerate`) so background mode can retry
         # the SAME song after a long backoff (a bare `continue` without advancing
         # i) rather than skipping past the song that got throttled.
@@ -3092,12 +3100,16 @@ class App(ctk.CTk):
 
             if result == 'skipped':
                 skipped += 1
+                consecutive_errors = 0
                 self._queue.put(('song_skipped', s, i, total))
             elif errored:
                 errors += 1
+                consecutive_errors += 1
+                last_error = errored[-1]
                 self._queue.put(('song_error', s, i, total, errored[-1]))
             else:
                 done += 1
+                consecutive_errors = 0
                 # process_download already probed and stored the resolution in song.ini
                 if not resync:
                     stored = get_stored_resolution(s.folder)
@@ -3113,6 +3125,20 @@ class App(ctk.CTk):
                 episode_started_at, throttle_count = \
                     self._resolve_background_episode(
                         episode_started_at, throttle_count)
+
+            # Nothing has worked for CONSECUTIVE_ERROR_LIMIT songs running, so
+            # stop digging. Checked after the episode bookkeeping above, since
+            # an error is still a non-throttle outcome and must resolve any
+            # throttle episode that was in progress.
+            if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
+                log.error('%d songs in a row failed; last error: %s',
+                          consecutive_errors, last_error)
+                if not background_mode:
+                    # Deliberately NOT 'rate_limited': that message tells the
+                    # user YouTube is throttling them, which is a lie when the
+                    # real cause is a broken cookie store or a dead downloader.
+                    self._queue.put(('error_streak', s, i, total, last_error))
+                    return
 
             i += 1
 
@@ -3437,6 +3463,28 @@ class App(ctk.CTk):
             s.stag   = 'error'
             self._update_row(s)
             self._progress.set((i + 1) / total)
+
+        elif kind == 'error_streak':
+            # Every song has been failing for a while and the cause is not a
+            # rate limit. Name the actual error rather than guessing at it --
+            # the whole point of the breaker is that the user finds out what
+            # went wrong instead of waking up to a run that did nothing.
+            _, s, i, total, last_error = msg
+            s.status = '✗  Stopped'
+            s.stag   = 'error'
+            self._update_row(s)
+            self._running = False
+            self._update_buttons()
+            self._status_lbl.configure(text='Stopped after repeated failures')
+            messagebox.showerror(
+                'Downloads keep failing',
+                '%d songs in a row failed, so the run stopped rather than '
+                'work through the rest of your library the same way.\n\n'
+                'Last error:\n%s\n\n'
+                'Everything already downloaded is safe, and nothing was '
+                'marked as done. Fix the cause and run again.'
+                % (CONSECUTIVE_ERROR_LIMIT, last_error))
+            self._flush_pending_update()
 
         elif kind == 'rate_limited':
             _, s, i, total = msg
