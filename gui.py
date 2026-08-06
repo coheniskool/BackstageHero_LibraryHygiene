@@ -3038,7 +3038,12 @@ class App(ctk.CTk):
         consecutive_errors = 0
         last_error = None
         # Escalation depth for the breaker's own long backoff. Separate from
-        # throttle_count on purpose -- see _handle_background_error_streak.
+        # throttle_count on purpose -- see _handle_background_error_streak --
+        # but reset the same way it is: on any song that reaches a healthy
+        # verdict. Escalation is per-incident, not per-process. Background mode
+        # resumes at startup and a single run can live for days, so a counter
+        # that only ever climbed would reach the 24h step after four unrelated
+        # incidents and stay there however well the run was going in between.
         error_streak_count = 0
         # A while loop (not `for i, s in enumerate`) so background mode can retry
         # the SAME song after a long backoff (a bare `continue` without advancing
@@ -3104,6 +3109,7 @@ class App(ctk.CTk):
             if result == 'skipped':
                 skipped += 1
                 consecutive_errors = 0
+                error_streak_count = 0
                 self._queue.put(('song_skipped', s, i, total))
             elif errored:
                 errors += 1
@@ -3113,6 +3119,7 @@ class App(ctk.CTk):
             else:
                 done += 1
                 consecutive_errors = 0
+                error_streak_count = 0
                 # process_download already probed and stored the resolution in song.ini
                 if not resync:
                     stored = get_stored_resolution(s.folder)
@@ -3152,8 +3159,14 @@ class App(ctk.CTk):
                 # SAME song, so a cause that cleared during the wait (Chrome
                 # got closed) shows up immediately. A cause that did not simply
                 # trips again a full limit later, which is the intended floor
-                # on wasted work. The retried song is counted in `errors` twice
-                # if it fails again -- a cosmetic tally quirk, not a lost song.
+                # on wasted work.
+                #
+                # Un-count this song's failure before retrying it: the retry
+                # will reach its own verdict and count that instead. Without
+                # this, a song that fails, trips the breaker and then succeeds
+                # lands in both tallies, and done + skipped + errors comes out
+                # higher than the number of songs that exist.
+                errors -= 1
                 consecutive_errors = 0
                 continue
 

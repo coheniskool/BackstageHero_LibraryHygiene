@@ -69,7 +69,7 @@ def _module_missing_youtubedl(file_path=r'C:\somewhere\yt_dlp\__init__.py'):
 
 def test_assert_ytdlp_usable_raises_when_youtubedl_missing():
     with pytest.raises(ImportError):
-        vd._assert_ytdlp_usable(_module_missing_youtubedl())
+        library_common.assert_ytdlp_usable(_module_missing_youtubedl())
 
 
 def test_assert_ytdlp_usable_message_names_the_resolved_path():
@@ -77,7 +77,7 @@ def test_assert_ytdlp_usable_message_names_the_resolved_path():
     # the path is the whole diagnostic -- without it the message is unactionable.
     ghost = r'C:\ghost\yt_dlp\__init__.py'
     with pytest.raises(ImportError) as exc:
-        vd._assert_ytdlp_usable(_module_missing_youtubedl(ghost))
+        library_common.assert_ytdlp_usable(_module_missing_youtubedl(ghost))
     assert ghost in str(exc.value)
 
 
@@ -89,13 +89,13 @@ def test_assert_ytdlp_usable_survives_a_module_with_no_file_at_all():
     nameless = types.ModuleType('yt_dlp')
     assert not hasattr(nameless, '__file__')
     with pytest.raises(ImportError):
-        vd._assert_ytdlp_usable(nameless)
+        library_common.assert_ytdlp_usable(nameless)
 
 
 def test_assert_ytdlp_usable_passes_for_the_real_yt_dlp():
     # The module VideoDownload actually imported. If this ever fails, the app
     # genuinely cannot download and the guard is doing its job.
-    assert vd._assert_ytdlp_usable(vd.yt_dlp) is None
+    assert library_common.assert_ytdlp_usable(vd.yt_dlp) is None
 
 
 def test_consecutive_error_limit_is_a_sane_positive_int():
@@ -112,12 +112,14 @@ def test_videodownload_calls_the_guard_right_after_importing_yt_dlp():
     """The predicate is unit-testable; the *call* is import-time code that
     pytest can never reach, so nothing else would fail if it were deleted.
     Mirrors the source-presence check Task 1 of SPEC-cookie-fallback-fix.md
-    used for make_console_encoding_safe()."""
+    used for make_console_encoding_safe(), whose guard this one now sits
+    beside in library_common."""
     source = (Path(library_common.__file__).parent / 'VideoDownload.py').read_text(
         encoding='utf-8')
-    assert '_assert_ytdlp_usable(yt_dlp)' in source
+    assert 'library_common.assert_ytdlp_usable(yt_dlp)' in source
     # Order matters: guarding before the import would be checking the wrong thing.
-    assert source.index('import yt_dlp\n') < source.index('_assert_ytdlp_usable(yt_dlp)')
+    assert (source.index('import yt_dlp\n')
+            < source.index('library_common.assert_ytdlp_usable(yt_dlp)'))
 
 
 # --- Part B: consecutive-failure circuit breaker, default (foreground) run ---
@@ -331,9 +333,20 @@ def test_background_trip_wait_is_cancellable_by_stop(background, monkeypatch):
     limit = vd.CONSECUTIVE_ERROR_LIMIT
     monkeypatch.setattr(gui, 'run_song_with_backoff',
                         _script_runner([('error', 'boom')] * limit))
-    # Cancel on the wait that follows the per-song delays: a Stop pressed during
-    # an hours-long backoff must not sit there until it elapses.
-    background.app._stop_evt = _FakeStopEvent(cancel_on=range(limit - 1, limit + 2))
+
+    class _CancelTheLongWait(_FakeStopEvent):
+        """A Stop pressed during an hours-long backoff must not sit there until
+        it elapses. Identifies the backoff by its duration rather than by
+        counting the per-song delays that precede it, so it keeps testing the
+        right wait if that pacing ever changes."""
+        def wait(self, timeout=None):
+            self.waits.append(timeout)
+            if timeout is not None and timeout >= SCHED[0]:
+                self._set = True
+                return True
+            return False
+
+    background.app._stop_evt = _CancelTheLongWait()
 
     background.app._dl_thread(_songs(limit), 'q', replace=False, resync=False,
                               background_mode=True)
@@ -341,6 +354,46 @@ def test_background_trip_wait_is_cancellable_by_stop(background, monkeypatch):
     kinds = _kinds(_drain(background.app))
     assert 'background_stopped' in kinds
     assert 'background_done' not in kinds
+
+
+def test_a_second_streak_after_recovery_starts_the_backoff_over(background, monkeypatch):
+    """Escalation is per-incident, not per-process. The throttle path resets its
+    escalation whenever an episode resolves; this must match. Without it a
+    background run -- which resumes at startup and can live for days -- would
+    reach the 24h step after four unrelated incidents and stay there, however
+    healthy it had been in between."""
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    script = ([('error', 'boom')] * limit     # first streak -> trips
+              + ['ok']                        # retry succeeds -> run recovered
+              + [('error', 'boom')] * limit)  # a later, unrelated streak
+    monkeypatch.setattr(gui, 'run_song_with_backoff', _script_runner(script))
+
+    background.app._dl_thread(_songs(3 * limit), 'q', replace=False,
+                              resync=False, background_mode=True)
+
+    kinds = _kinds(_drain(background.app))
+    assert kinds.count('background_error_streak') == 2
+    # Both incidents back off at step 0. [0, 1] would mean the second one
+    # inherited the first's escalation.
+    assert background.calls['next_resume_at'] == [0, 0]
+
+
+def test_the_retried_song_is_not_counted_as_an_error_twice(background, monkeypatch):
+    """The song that trips the breaker is retried after the backoff, so its
+    failure must be un-counted first -- otherwise done + errors exceeds the
+    number of songs that actually exist."""
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    script = [('error', 'boom')] * limit + ['ok']
+    monkeypatch.setattr(gui, 'run_song_with_backoff', _script_runner(script))
+
+    background.app._dl_thread(_songs(limit), 'q', replace=False,
+                              resync=False, background_mode=True)
+
+    finished = [m for m in _drain(background.app) if m[0] == 'background_done']
+    _, done, skipped, errors, tools_ok = finished[0]
+    assert done == 1
+    assert errors == limit - 1
+    assert done + skipped + errors == limit
 
 
 def test_counter_resets_after_a_background_backoff(background, monkeypatch):

@@ -107,3 +107,23 @@ Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md)
 - Three spec Open Questions are unresolved and do not block: the choice of 20,
   whether a breaker trip deserves a shorter first backoff step than a throttle,
   and whether the CLI path (Task 5) is dead code in the frozen build.
+
+## Review fixes (/review, 2026-08-05)
+- [x] **Important** `error_streak_count` never reset -> escalation was per-process, not
+      per-incident. A days-long background run reached the 24h step after four unrelated
+      incidents and stayed there. Now reset on any healthy verdict, matching how
+      `_resolve_background_episode` resets `throttle_count`.
+- [x] **Important** No test covered a second trip, which is what hid the above.
+      `test_a_second_streak_after_recovery_starts_the_backoff_over` asserts both incidents
+      back off at step 0.
+- [x] **Suggestion** Import guard moved to `library_common.assert_ytdlp_usable()`, beside
+      `ensure_stdio_not_none` / `make_console_encoding_safe` -- the convention
+      `VideoDownload.py:10-13` already states for import-time guards.
+- [x] **Suggestion** Retried song was counted in `errors` twice, so
+      `done + skipped + errors` could exceed the song count. Un-counted before the retry;
+      `test_the_retried_song_is_not_counted_as_an_error_twice` pins the arithmetic.
+- [x] **Nit** Cancellable-wait test now identifies the backoff by its duration rather than
+      by counting the per-song delays before it.
+- [x] `pytest tests/ -q` 735 passed, 1 skipped
+- [x] Never-list re-checked against source files only: 0 cookie lines, 0
+      `record_throttle_episode(` calls, 0 `throttle_count +=`, 0 removed lines
