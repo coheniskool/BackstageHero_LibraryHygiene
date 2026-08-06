@@ -3037,6 +3037,9 @@ class App(ctk.CTk):
         # conflate "YouTube is pushing back" with "something is broken".
         consecutive_errors = 0
         last_error = None
+        # Escalation depth for the breaker's own long backoff. Separate from
+        # throttle_count on purpose -- see _handle_background_error_streak.
+        error_streak_count = 0
         # A while loop (not `for i, s in enumerate`) so background mode can retry
         # the SAME song after a long backoff (a bare `continue` without advancing
         # i) rather than skipping past the song that got throttled.
@@ -3131,14 +3134,28 @@ class App(ctk.CTk):
             # an error is still a non-throttle outcome and must resolve any
             # throttle episode that was in progress.
             if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
-                log.error('%d songs in a row failed; last error: %s',
-                          consecutive_errors, last_error)
                 if not background_mode:
                     # Deliberately NOT 'rate_limited': that message tells the
                     # user YouTube is throttling them, which is a lie when the
                     # real cause is a broken cookie store or a dead downloader.
+                    log.error('%d songs in a row failed; last error: %s',
+                              consecutive_errors, last_error)
                     self._queue.put(('error_streak', s, i, total, last_error))
                     return
+                error_streak_count, stopped = \
+                    self._handle_background_error_streak(
+                        s, i, total, targets, error_streak_count, last_error,
+                        done, skipped, errors)
+                if stopped:
+                    return
+                # Wait elapsed. Start counting again from zero and retry the
+                # SAME song, so a cause that cleared during the wait (Chrome
+                # got closed) shows up immediately. A cause that did not simply
+                # trips again a full limit later, which is the intended floor
+                # on wasted work. The retried song is counted in `errors` twice
+                # if it fails again -- a cosmetic tally quirk, not a lost song.
+                consecutive_errors = 0
+                continue
 
             i += 1
 
@@ -3151,6 +3168,56 @@ class App(ctk.CTk):
         # `continue`d, a Stop would have returned). Hand off to a single Library
         # Tools pass, then mark the whole run done.
         self._run_background_library_tools(done, skipped, errors)
+
+    def _handle_background_error_streak(self, s, i, total, targets,
+                                        streak_count, last_error,
+                                        done, skipped, errors):
+        """Background-mode-only: called when CONSECUTIVE_ERROR_LIMIT songs have
+        failed back-to-back. Backs off on the long escalating schedule rather
+        than ending the run -- background mode never gives up on its own.
+
+        A near-twin of _handle_background_throttle, and deliberately NOT a
+        shared code path with it, because it differs in exactly the bookkeeping
+        that must not be shared:
+
+          - its own escalation counter, so a streak does not eat the throttle's
+            escalation steps (or vice versa);
+          - no throttle episode recorded. A broken cookie store or a dead
+            downloader says nothing about how long YouTube throttles for, and
+            record_throttle_episode's data is what the adaptive schedule
+            learns from. Feeding this in would corrupt it.
+
+        Returns (streak_count, stopped). The caller must `return` from
+        _dl_thread when stopped is True (background_stopped is already posted),
+        otherwise reset its consecutive-error count and `continue` WITHOUT
+        advancing i, so the same song is retried."""
+        now = time.time()
+        resume_at = next_resume_at(streak_count, now,
+                                   schedule=get_active_schedule())
+        streak_count += 1
+        # Persist BEFORE waiting, same reasoning as the throttle path: a crash
+        # during an hours-long wait must not lose resume_at or which songs are
+        # still to do. throttle_count is deliberately left untouched here.
+        state = _load_background_state()
+        state.update({
+            'phase': 'downloading',
+            'resume_at': resume_at,
+            'remaining_folders': [t.folder for t in targets[i:]],
+        })
+        _save_background_state(state)
+        self._queue.put(('background_error_streak', s, i, total,
+                         resume_at, last_error))
+        log.error('Background mode: %d songs in a row failed (last: %s); '
+                  'backing off until unix %s (escalation step %d) rather than '
+                  'working through the rest of the library the same way',
+                  CONSECUTIVE_ERROR_LIMIT, last_error, resume_at,
+                  streak_count - 1)
+        if self._stop_evt.wait(max(0, resume_at - now)):
+            log.info('Background mode: stopped by user during failure backoff')
+            self._queue.put(('background_stopped', i, total,
+                             done, skipped, errors))
+            return streak_count, True
+        return streak_count, False
 
     def _handle_background_throttle(self, s, i, total, targets, throttle_count,
                                     episode_started_at, done, skipped, errors):
@@ -3533,6 +3600,21 @@ class App(ctk.CTk):
             self._status_lbl.configure(
                 text=f'YouTube throttled. Backing off, resuming at {when} '
                      '(background mode keeps retrying)')
+
+        elif kind == 'background_error_streak':
+            # Same shape as a throttle backoff -- the run is paused, not over,
+            # so _running stays True -- but the cause is not YouTube pushing
+            # back, and saying so is the whole point of the breaker. No modal
+            # dialog: background mode runs unattended overnight, and a box
+            # waiting for OK would stall the run until someone came back.
+            _, s, i, total, resume_at, last_error = msg
+            when = time.strftime('%H:%M', time.localtime(resume_at))
+            s.status = f'⏳  Failing, retrying {when}'
+            s.stag   = 'error'
+            self._update_row(s)
+            self._status_lbl.configure(
+                text=f'{CONSECUTIVE_ERROR_LIMIT} songs in a row failed '
+                     f'({last_error}). Paused until {when}')
 
         elif kind == 'background_library_tools':
             _, n_tools = msg

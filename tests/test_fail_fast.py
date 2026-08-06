@@ -29,10 +29,14 @@ def _script_runner(script):
     ('error', msg) reproduces what the real function does on a generic
     failure (VideoDownload.py:1764-1770): append to `errored` and return
     'ok'. That asymmetry -- an error reported as a successful return -- is
-    exactly why the caller could not tell a dud song from a broken run."""
+    exactly why the caller could not tell a dud song from a broken run.
+
+    An exhausted script keeps returning 'ok' rather than raising, so a test
+    only has to script the part it cares about. Tests that depend on how many
+    songs were attempted assert on the song_start count instead."""
     def fake(folder, label, quality, sync_ready, replace, resync,
              errored, stop_evt, events):
-        entry = script.pop(0)
+        entry = script.pop(0) if script else 'ok'
         if isinstance(entry, tuple) and entry[0] == 'error':
             errored.append(entry[1])
             return 'ok'
@@ -200,3 +204,154 @@ def test_a_skipped_song_between_two_near_miss_runs_resets_the_count(foreground, 
     kinds = _kinds(_drain(foreground))
     assert 'error_streak' not in kinds
     assert 'finished' in kinds
+
+
+# --- Part B: the same breaker in background mode ----------------------------
+#
+# Background mode never gives up on its own, so a trip here backs off on the
+# long escalating schedule and retries rather than ending the run. The two
+# things that must NOT happen are the subject of their own tests below: the
+# streak must not consume throttle escalation steps, and it must not be
+# recorded as a throttle episode. A cookie failure is not evidence about how
+# long YouTube throttles for, and feeding it into that dataset would corrupt
+# the adaptive schedule SPEC-background-mode.md built.
+
+SCHED = [3600, 14400, 43200, 86400]
+
+
+@pytest.fixture
+def background(tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, '_BACKGROUND_STATE_FILE',
+                        str(tmp_path / 'background_state.json'))
+    calls = {'next_resume_at': [], 'episodes': []}
+
+    def fake_next_resume_at(count, now, schedule=None):
+        calls['next_resume_at'].append(count)
+        return now + SCHED[min(count, len(SCHED) - 1)]
+
+    def fake_record_episode(started_at, resolved_at, steps, schedule=None):
+        calls['episodes'].append((started_at, resolved_at, steps))
+
+    monkeypatch.setattr(gui, 'next_resume_at', fake_next_resume_at)
+    monkeypatch.setattr(gui, 'get_active_schedule', lambda: list(SCHED))
+    monkeypatch.setattr(gui, 'record_throttle_episode', fake_record_episode)
+    monkeypatch.setattr(gui, '_run_library_tool', lambda folder, key, dry: {})
+    monkeypatch.setattr(gui, '_format_tool_summary',
+                        lambda key, counts, dry: 'summary')
+    monkeypatch.setattr(gui, 'get_stored_resolution', lambda folder: None)
+
+    app = _bare_app()
+    app._stop_evt = _FakeStopEvent()
+
+    class _NS:
+        pass
+    ns = _NS()
+    ns.app, ns.calls, ns.state_file = app, calls, tmp_path / 'background_state.json'
+    return ns
+
+
+def test_background_trip_backs_off_instead_of_ending_the_run(background, monkeypatch):
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    monkeypatch.setattr(gui, 'run_song_with_backoff',
+                        _script_runner([('error', 'boom')] * limit))
+
+    background.app._dl_thread(_songs(limit), 'q', replace=False, resync=False,
+                              background_mode=True)
+
+    kinds = _kinds(_drain(background.app))
+    assert 'background_error_streak' in kinds
+    # Backed off on step 0 of the schedule, and actually waited.
+    assert 3600 in background.app._stop_evt.waits
+    # The run did not end at the trip -- background mode retries indefinitely.
+    assert 'background_done' in kinds
+
+
+def test_background_trip_persists_state_before_waiting(background, monkeypatch):
+    """A crash during an hours-long wait must not lose where the run got to, so
+    the state has to be on disk *before* the wait starts -- not merely by the
+    end of the run. Snapshotting inside wait() is the only way to tell the
+    difference; checking after _dl_thread returns would pass even if the save
+    happened last, and in fact finds nothing at all, since a completed run
+    clears the state file on its way out."""
+    import json
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    seen = []
+
+    class _SnapshotStopEvent(_FakeStopEvent):
+        def wait(self, timeout=None):
+            if background.state_file.exists():
+                seen.append(json.loads(
+                    background.state_file.read_text(encoding='utf-8')))
+            return super().wait(timeout)
+
+    background.app._stop_evt = _SnapshotStopEvent()
+    monkeypatch.setattr(gui, 'run_song_with_backoff',
+                        _script_runner([('error', 'boom')] * limit))
+
+    background.app._dl_thread(_songs(limit), 'q', replace=False, resync=False,
+                              background_mode=True)
+
+    persisted = [st for st in seen if st.get('resume_at')]
+    assert persisted, 'nothing was on disk when the backoff wait began'
+    assert persisted[-1]['phase'] == 'downloading'
+    # And it recorded what is still to do, not just when to wake up.
+    assert persisted[-1]['remaining_folders']
+
+
+def test_background_trip_does_not_record_a_throttle_episode(background, monkeypatch):
+    """A run that trips the breaker and then hits one real throttle must record
+    exactly one episode -- the throttle's. If the streak recorded one too, the
+    adaptive schedule would be learning from a cookie failure."""
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    script = [('error', 'boom')] * limit + ['stop', 'ok']
+    monkeypatch.setattr(gui, 'run_song_with_backoff', _script_runner(script))
+
+    background.app._dl_thread(_songs(limit), 'q', replace=False, resync=False,
+                              background_mode=True)
+
+    assert len(background.calls['episodes']) == 1
+
+
+def test_background_trip_leaves_throttle_count_alone(background, monkeypatch):
+    """The streak has its own escalation counter. A throttle that happens after
+    a streak backoff must still start at step 0, not inherit the streak's."""
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    script = [('error', 'boom')] * limit + ['stop', 'ok']
+    monkeypatch.setattr(gui, 'run_song_with_backoff', _script_runner(script))
+
+    background.app._dl_thread(_songs(limit), 'q', replace=False, resync=False,
+                              background_mode=True)
+
+    # First call is the streak's own escalation, second is the throttle's --
+    # both at step 0 because they count independently.
+    assert background.calls['next_resume_at'] == [0, 0]
+
+
+def test_background_trip_wait_is_cancellable_by_stop(background, monkeypatch):
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    monkeypatch.setattr(gui, 'run_song_with_backoff',
+                        _script_runner([('error', 'boom')] * limit))
+    # Cancel on the wait that follows the per-song delays: a Stop pressed during
+    # an hours-long backoff must not sit there until it elapses.
+    background.app._stop_evt = _FakeStopEvent(cancel_on=range(limit - 1, limit + 2))
+
+    background.app._dl_thread(_songs(limit), 'q', replace=False, resync=False,
+                              background_mode=True)
+
+    kinds = _kinds(_drain(background.app))
+    assert 'background_stopped' in kinds
+    assert 'background_done' not in kinds
+
+
+def test_counter_resets_after_a_background_backoff(background, monkeypatch):
+    """One trip, then a near-miss run of failures, must not trip again --
+    otherwise every song after the first trip costs another long backoff."""
+    limit = vd.CONSECUTIVE_ERROR_LIMIT
+    script = [('error', 'boom')] * limit + [('error', 'boom')] * (limit - 1)
+    monkeypatch.setattr(gui, 'run_song_with_backoff', _script_runner(script))
+
+    background.app._dl_thread(_songs(3 * limit), 'q', replace=False,
+                              resync=False, background_mode=True)
+
+    kinds = _kinds(_drain(background.app))
+    assert kinds.count('background_error_streak') == 1

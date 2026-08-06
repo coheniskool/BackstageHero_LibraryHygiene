@@ -38,22 +38,22 @@ Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md)
 - [x] `pytest tests/test_fail_fast.py -v` green
 
 ## Task 4: Background trip handler — `gui.py`, sibling of `_handle_background_throttle`
-- [ ] New handler reusing persist → post → cancellable-wait mechanics
-- [ ] **Its own** escalation counter — `throttle_count` must not be incremented
-- [ ] **No** adaptive throttle episode recorded (highest-risk line in this task)
-- [ ] Reset `consecutive_errors` after the wait; retry same song (do not advance `i`)
-- [ ] `test_background_trip_persists_state_before_waiting`
-- [ ] `test_background_trip_does_not_record_a_throttle_episode`
-- [ ] `test_background_trip_leaves_throttle_count_alone`
-- [ ] `test_background_trip_wait_is_cancellable_by_stop`
-- [ ] `test_counter_resets_after_background_backoff`
-- [ ] Tests use a fake clock / stubbed `_stop_evt` — no real sleeping
-- [ ] `pytest tests/test_fail_fast.py -v` green
+- [x] New handler reusing persist → post → cancellable-wait mechanics
+- [x] **Its own** escalation counter — `throttle_count` must not be incremented
+- [x] **No** adaptive throttle episode recorded (highest-risk line in this task)
+- [x] Reset `consecutive_errors` after the wait; retry same song (do not advance `i`)
+- [x] `test_background_trip_persists_state_before_waiting`
+- [x] `test_background_trip_does_not_record_a_throttle_episode`
+- [x] `test_background_trip_leaves_throttle_count_alone`
+- [x] `test_background_trip_wait_is_cancellable_by_stop`
+- [x] `test_counter_resets_after_background_backoff`
+- [x] Tests use a fake clock / stubbed `_stop_evt` — no real sleeping
+- [x] `pytest tests/test_fail_fast.py -v` green
 
 ## ▶ Checkpoint 2
-- [ ] `pytest tests/ -q` full suite green
-- [ ] Read-check: `_handle_background_throttle()` diff empty or additive only
-- [ ] Read-check: adaptive-schedule recording path untouched
+- [x] `pytest tests/ -q` full suite green
+- [x] Read-check: `_handle_background_throttle()` diff empty or additive only
+- [x] Read-check: adaptive-schedule recording path untouched
 
 ## Task 5: CLI loop counts and trips — `VideoDownload.py:1685-1707`
 - [ ] Derive per-song errored from `len(errored)` before vs. after the call
