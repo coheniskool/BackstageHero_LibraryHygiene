@@ -57,7 +57,35 @@ def _setup_logging():
 
 log = _setup_logging()
 
+def _assert_ytdlp_usable(mod):
+    """Raise unless `mod` is a working yt_dlp. Names the resolved path, because
+    the failure this catches is 'imported the wrong thing', not 'did not
+    import' -- without the path the message is unactionable."""
+    if not hasattr(mod, 'YoutubeDL'):
+        raise ImportError(
+            'yt_dlp imported but has no YoutubeDL -- got it from %s. Usually a '
+            'stale or half-written install, or a directory shadowing the real '
+            'package; restarting normally clears it.'
+            % getattr(mod, '__file__', 'an unknown path'))
+
+
 import yt_dlp
+
+# 2026-08-05: a process imported yt_dlp successfully and got a module with no
+# attributes on it -- the signature of a namespace-package import, where the
+# directory resolved but __init__.py did not. Startup succeeded, the GUI opened,
+# background mode reported 7441 songs pending, and then every single one of them
+# died on `AttributeError: module 'yt_dlp' has no attribute 'YoutubeDL'`. It
+# cleared on restart and could not be reproduced from a shell.
+#
+# This does not try to fix that transient -- it makes it announce itself.
+# "Launch BackstageHero.bat" already retries once on a non-zero exit and opens
+# the log on a second consecutive failure, machinery added for a near-identical
+# 2026-07-19 import failure. It never got a chance here, because the import
+# itself did not raise. Deliberately not wrapped in try/except: a caught guard
+# is no guard.
+_assert_ytdlp_usable(yt_dlp)
+
 from tqdm import tqdm
 
 import resolver_client

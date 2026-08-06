@@ -5,18 +5,18 @@ detail, acceptance criteria and verification steps.
 Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md).
 
 ## Task 1: Import guard — `VideoDownload.py:60`
-- [ ] Add `_assert_ytdlp_usable(mod)` predicate defined **above** `import yt_dlp`
-- [ ] Call it immediately after `import yt_dlp`, not wrapped in `try/except`
-- [ ] Comment cites the 2026-08-05 incident and why it raises rather than logs
-- [ ] `tests/test_fail_fast.py` (new): `test_assert_ytdlp_usable_raises_when_youtubedl_missing`
-- [ ] `tests/test_fail_fast.py`: `test_assert_ytdlp_usable_message_names_the_resolved_path`
-- [ ] `tests/test_fail_fast.py`: `test_assert_ytdlp_usable_passes_for_a_real_module`
-- [ ] `pytest tests/test_fail_fast.py -v` green
+- [x] Add `_assert_ytdlp_usable(mod)` predicate defined **above** `import yt_dlp`
+- [x] Call it immediately after `import yt_dlp`, not wrapped in `try/except`
+- [x] Comment cites the 2026-08-05 incident and why it raises rather than logs
+- [x] `tests/test_fail_fast.py` (new): `test_assert_ytdlp_usable_raises_when_youtubedl_missing`
+- [x] `tests/test_fail_fast.py`: `test_assert_ytdlp_usable_message_names_the_resolved_path`
+- [x] `tests/test_fail_fast.py`: `test_assert_ytdlp_usable_passes_for_a_real_module`
+- [x] `pytest tests/test_fail_fast.py -v` green
 
 ## ▶ Checkpoint 1
-- [ ] `pytest tests/ -q` full suite green
-- [ ] Manual: launch via `Launch BackstageHero.bat`, app starts, a song downloads
-- [ ] Read-check: guard is not swallowed by any `try/except`
+- [x] `pytest tests/ -q` full suite green
+- [~] Manual: launch via `Launch BackstageHero.bat` -- DEFERRED, a live app instance (PID 15316) owns background_state.json. Verified headlessly instead: `pythonw.exe` import of VideoDownload succeeds, guard returns None against the real yt_dlp. Do the full launch check before merging.
+- [x] Read-check: guard is not swallowed by any `try/except`
 
 ## Task 2: `CONSECUTIVE_ERROR_LIMIT` constant
 - [ ] Add next to `BOT_BACKOFF_SECONDS`/`LONG_BACKOFF_SECONDS` (`VideoDownload.py:203-218`)
