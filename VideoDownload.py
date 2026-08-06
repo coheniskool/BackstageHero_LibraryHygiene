@@ -244,6 +244,22 @@ BOT_BACKOFF_SECONDS = [60, 180, 420]
 # override for exactly that purpose.
 LONG_BACKOFF_SECONDS = [3600, 14400, 43200, 86400]
 
+# A run goes bad in one of two ways: one song at a time (normal -- a dud video,
+# a private upload, a bad match) or everything at once (the downloader is
+# broken, the network is gone, a precondition failed). Only the second is worth
+# reacting to, and N-failures-in-a-row with no successes between them is the
+# cheapest signal that tells them apart.
+#
+# Deliberately NOT similarity-aware: a single broken precondition can produce
+# differently-worded errors per song, so matching on message text would miss
+# exactly the case this exists for. The count alone is enough to know something
+# systemic is wrong -- see SPEC-fail-fast-preconditions.md, where similarity
+# matching was considered and rejected.
+#
+# On 2026-08-05 two separate broken preconditions each failed every song of a
+# 7441-song overnight run while the app reported itself as running normally.
+CONSECUTIVE_ERROR_LIMIT = 20
+
 
 def next_resume_at(throttle_count, now, schedule=LONG_BACKOFF_SECONDS):
     """Unix timestamp to resume at, given how many consecutive long-backoff

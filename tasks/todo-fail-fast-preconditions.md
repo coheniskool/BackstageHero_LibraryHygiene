@@ -19,10 +19,10 @@ Spec: [`../SPEC-fail-fast-preconditions.md`](../SPEC-fail-fast-preconditions.md)
 - [x] Read-check: guard is not swallowed by any `try/except`
 
 ## Task 2: `CONSECUTIVE_ERROR_LIMIT` constant
-- [ ] Add next to `BOT_BACKOFF_SECONDS`/`LONG_BACKOFF_SECONDS` (`VideoDownload.py:203-218`)
-- [ ] Comment explains the count-only (non-similarity) choice and cites the incident
-- [ ] `tests/test_fail_fast.py`: `test_consecutive_error_limit_is_a_sane_positive_int`
-- [ ] `pytest tests/test_fail_fast.py -v` green
+- [x] Add next to `BOT_BACKOFF_SECONDS`/`LONG_BACKOFF_SECONDS` (`VideoDownload.py:203-218`)
+- [x] Comment explains the count-only (non-similarity) choice and cites the incident
+- [x] `tests/test_fail_fast.py`: `test_consecutive_error_limit_is_a_sane_positive_int`
+- [x] `pytest tests/test_fail_fast.py -v` green
 
 ## Task 3: GUI loop counts and trips — `gui.py:3036-3105`
 - [ ] Add `consecutive_errors` local alongside `clean_streak`/`pace`

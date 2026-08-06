@@ -54,6 +54,16 @@ def test_assert_ytdlp_usable_passes_for_the_real_yt_dlp():
     assert vd._assert_ytdlp_usable(vd.yt_dlp) is None
 
 
+def test_consecutive_error_limit_is_a_sane_positive_int():
+    # Range rather than an exact value: the number is a judgement call
+    # (SPEC-fail-fast-preconditions.md Open Question 1), so pinning it exactly
+    # would make tuning it a test failure. The bounds are what actually matter
+    # -- below ~5 a bad patch of dud videos trips it, above ~100 it stops being
+    # a circuit breaker and becomes a formality.
+    assert isinstance(vd.CONSECUTIVE_ERROR_LIMIT, int)
+    assert 5 <= vd.CONSECUTIVE_ERROR_LIMIT <= 100
+
+
 def test_videodownload_calls_the_guard_right_after_importing_yt_dlp():
     """The predicate is unit-testable; the *call* is import-time code that
     pytest can never reach, so nothing else would fail if it were deleted.
