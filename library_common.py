@@ -163,6 +163,36 @@ def make_console_encoding_safe():
         except (AttributeError, ValueError, OSError):
             pass
 
+
+def assert_ytdlp_usable(mod):
+    """Raise unless `mod` is a working yt_dlp. Call right after importing it.
+
+    On 2026-08-05 a process imported yt_dlp successfully and got a module with
+    no attributes on it -- the signature of a namespace-package import, where
+    the directory resolved but __init__.py did not. Startup succeeded, the GUI
+    opened, background mode reported 7441 songs pending, and then every single
+    one of them died on `AttributeError: module 'yt_dlp' has no attribute
+    'YoutubeDL'`. It cleared on restart and could not be reproduced.
+
+    This does not fix that transient -- it makes it announce itself. "Launch
+    BackstageHero.bat" already retries once on a non-zero exit and opens the
+    log on a second consecutive failure, machinery added for a near-identical
+    2026-07-19 import failure; it never got a chance because the import itself
+    did not raise.
+
+    Names the resolved path, because the failure is "imported the wrong thing"
+    rather than "did not import" -- without the path the message is
+    unactionable. Takes the module as an argument so this stays importable
+    from stdlib alone, like everything else in here.
+    """
+    if not hasattr(mod, 'YoutubeDL'):
+        raise ImportError(
+            'yt_dlp imported but has no YoutubeDL -- got it from %s. Usually a '
+            'stale or half-written install, or a directory shadowing the real '
+            'package; restarting normally clears it.'
+            % getattr(mod, '__file__', 'an unknown path'))
+
+
 # --- File discovery -------------------------------------------------------
 #
 # Clone Hero folders in the wild use inconsistent filenames depending on

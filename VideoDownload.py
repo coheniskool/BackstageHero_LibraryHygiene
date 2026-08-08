@@ -58,6 +58,13 @@ def _setup_logging():
 log = _setup_logging()
 
 import yt_dlp
+
+# Same pattern as the two guards at the top of this file: the check lives in
+# library_common so it can be unit-tested, since inline import-time code here
+# is unreachable under pytest and could be deleted without failing a test.
+# Deliberately not wrapped in try/except -- a caught guard is no guard.
+library_common.assert_ytdlp_usable(yt_dlp)
+
 from tqdm import tqdm
 
 import resolver_client
@@ -215,6 +222,22 @@ BOT_BACKOFF_SECONDS = [60, 180, 420]
 # throttle-and-resume data; next_resume_at() below accepts a schedule
 # override for exactly that purpose.
 LONG_BACKOFF_SECONDS = [3600, 14400, 43200, 86400]
+
+# A run goes bad in one of two ways: one song at a time (normal -- a dud video,
+# a private upload, a bad match) or everything at once (the downloader is
+# broken, the network is gone, a precondition failed). Only the second is worth
+# reacting to, and N-failures-in-a-row with no successes between them is the
+# cheapest signal that tells them apart.
+#
+# Deliberately NOT similarity-aware: a single broken precondition can produce
+# differently-worded errors per song, so matching on message text would miss
+# exactly the case this exists for. The count alone is enough to know something
+# systemic is wrong -- see SPEC-fail-fast-preconditions.md, where similarity
+# matching was considered and rejected.
+#
+# On 2026-08-05 two separate broken preconditions each failed every song of a
+# 7441-song overnight run while the app reported itself as running normally.
+CONSECUTIVE_ERROR_LIMIT = 20
 
 
 def next_resume_at(throttle_count, now, schedule=LONG_BACKOFF_SECONDS):
@@ -706,7 +729,21 @@ def _base_opts():
     return opts
 
 
-_COOKIE_ERROR_SIGNS = ('failed to decrypt with dpapi', 'failed to load cookies')
+# Two distinct ways the browser's cookie store comes back unreadable on
+# Windows, both of which yt-dlp surfaces as a bare DownloadError carrying only
+# this text. DPAPI: Chrome's App-Bound Encryption key can't be unwrapped
+# (yt-dlp #10927). Copy: Chrome is *running* and holds Cookies open, so the
+# PermissionError-to-DownloadError conversion in yt_dlp/cookies.py fires
+# (yt-dlp #7271) -- that one went unmatched at first and killed every song of a
+# 7441-song overnight run. Kept as exact per-issue strings rather than
+# something broader like 'cookie': a genuinely actionable cookie problem (a
+# misspelled browser name, say) must still fail loudly instead of being
+# silently downgraded to a cookie-free run.
+_COOKIE_ERROR_SIGNS = (
+    'failed to decrypt with dpapi',
+    'failed to load cookies',
+    'could not copy chrome cookie database',
+)
 
 
 def _is_cookie_decrypt_error(exc):
@@ -1667,6 +1704,7 @@ def main():
     errored = []
     interrupted = False
     current_folder = None
+    consecutive_errors = 0
 
     try:
         with tqdm(total=total, unit='songs') as pbar:
@@ -1683,9 +1721,31 @@ def main():
                 elif has_video and not replace:
                     continue
 
+                errors_before = len(errored)
                 ok = run_song_with_backoff(
                     folder, song_name, video_quality, sync_ready, replace, resync, errored)
                 if ok == 'stop':
+                    interrupted = True
+                    break
+
+                # Circuit breaker (SPEC-fail-fast-preconditions.md). Unlike the
+                # GUI loop, `errored` here accumulates across the whole run, so
+                # "did THIS song fail" is whether the list just grew.
+                if len(errored) > errors_before:
+                    consecutive_errors += 1
+                else:
+                    consecutive_errors = 0
+                if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
+                    # No long backoff on this path: the escalating wait is
+                    # background-mode-only by design, and someone sitting at an
+                    # interactive run should not be left staring at an hour of
+                    # silence.
+                    log.error('%d songs in a row failed; stopping. Last error: %s',
+                              consecutive_errors, errored[-1])
+                    print('\n' + str(consecutive_errors) + ' songs in a row failed, so this stopped')
+                    print('rather than working through the rest of your library the same way.')
+                    print('Last error: ' + str(errored[-1]))
+                    print('Nothing already downloaded was touched. Fix the cause and re-run.')
                     interrupted = True
                     break
 

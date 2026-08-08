@@ -72,9 +72,39 @@ See [`plan-cookie-fallback-fix.md`](plan-cookie-fallback-fix.md) for full detail
 - [x] Both spec success criteria confirmed by tests: (1) DPAPI cookie failure recovers the same song and only warns once (Task 2/3/4/5 tests); (2) non-cp1252 titles can't crash print() (Task 1 tests)
 - [x] Confirm `configure_cookies()` never resets `_COOKIES_BROKEN` (diff for that function is empty — verified at Checkpoint 2)
 
+## Task 7: `_COOKIE_ERROR_SIGNS` misses the locked-Chrome-DB failure (found in live logs 2026-08-05)
+Observed after the Task 1-6 build shipped: with the DPAPI path fixed, a *second* browser-cookie
+failure surfaced and killed every song the same way the DPAPI one used to.
+
+```
+yt_dlp.utils.DownloadError: ERROR: ERROR: Could not copy Chrome cookie database.
+See  https://github.com/yt-dlp/yt-dlp/issues/7271  for more info
+```
+
+`yt_dlp/cookies.py:361-365` converts a Windows `PermissionError` (errno 13 — Chrome is running and
+holding `Cookies` open) into a **bare `DownloadError`**, the exact shape
+[`SPEC-cookie-fallback-fix.md:53`](../SPEC-cookie-fallback-fix.md) says to match on message text.
+It is the same failure class the spec targets (browser-cookie extraction failed → continue
+cookie-free), so it belongs in `_COOKIE_ERROR_SIGNS`, not in a new mechanism.
+
+- [x] Add `'could not copy chrome cookie database'` to `_COOKIE_ERROR_SIGNS` (`VideoDownload.py:709`)
+- [x] No other change: `_is_cookie_decrypt_error`, `_run_ytdlp_with_cookie_fallback`, `_base_opts()` gate and all three call sites stay as-is
+- [x] `tests/test_cookie_support.py`: `test_is_cookie_decrypt_error_matches_locked_chrome_cookie_db`
+- [x] `tests/test_cookie_support.py`: `test_search_candidates_retries_without_cookies_after_locked_chrome_db`
+- [x] Re-check the spec's "keep detection narrow" rule: this matches one specific yt-dlp message, not a broad cookie-error catch
+- [x] `pytest tests/test_cookie_support.py -v` green (25 passed)
+
+## ▶ Checkpoint 4
+- [x] `pytest tests/ -v` full suite green (714 passed, 1 skipped)
+- [x] `git diff` touches only `VideoDownload.py` + `tests/test_cookie_support.py` (plus this todo)
+
 ---
 
 ### Notes
 - Line numbers verified live against current code at plan time (2026-08-04) — re-verify at `/build` time if this drifts.
+- Task 7 added 2026-08-05 from a live overnight-run log, not from the original plan. Same spec, same
+  failure class, one more message signature. The unrelated `AttributeError: module 'yt_dlp' has no
+  attribute 'YoutubeDL'` seen in the same log was a transient bad import in one process and cleared
+  on restart — not a code defect, deliberately not addressed here.
 - Task 1 is fully independent of Tasks 2-5 — any order, or parallel.
 - Tasks 3, 4, 5 each depend on Task 2 but are independent of each other.
