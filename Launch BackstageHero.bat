@@ -24,7 +24,14 @@ rem find_spec answers the actual question -- "can THIS interpreter, in THIS
 rem environment, locate customtkinter" -- without needing try/except, which
 rem does not fit on a single cmd line. It returns None rather than raising
 rem when the module is missing, so one line covers both outcomes.
-"C:\Python314\pythonw.exe" -c "import sys, site, os, importlib.util as u; f=open('diag_out.txt','w'); f.write('executable=' + sys.executable + chr(10)); f.write('prefix=' + sys.prefix + chr(10)); f.write('cwd=' + os.getcwd() + chr(10)); f.write('ENABLE_USER_SITE=' + str(site.ENABLE_USER_SITE) + chr(10)); f.write('USER_SITE=' + str(site.getusersitepackages()) + chr(10)); f.write('USER_SITE_EXISTS=' + str(os.path.isdir(site.getusersitepackages())) + chr(10)); s=u.find_spec('customtkinter'); f.write('customtkinter=' + (s.origin if s else 'NOT FOUND') + chr(10)); f.write('sys.path=' + chr(10).join(sys.path) + chr(10)); f.close()" >> launch_log.txt 2>&1
+rem
+rem yt_dlp is probed the same way because it, not customtkinter, is what
+rem actually failed on 2026-08-05 and again on 2026-08-08. Its origin is the
+rem line that matters: a real install ends in \__init__.py, while a namespace
+rem package -- the directory resolving without its __init__.py, which is the
+rem fault both incidents showed -- reports None here and leaves yt_dlp with no
+rem YoutubeDL attribute.
+"C:\Python314\pythonw.exe" -c "import sys, site, os, importlib.util as u; f=open('diag_out.txt','w'); f.write('executable=' + sys.executable + chr(10)); f.write('prefix=' + sys.prefix + chr(10)); f.write('cwd=' + os.getcwd() + chr(10)); f.write('ENABLE_USER_SITE=' + str(site.ENABLE_USER_SITE) + chr(10)); f.write('USER_SITE=' + str(site.getusersitepackages()) + chr(10)); f.write('USER_SITE_EXISTS=' + str(os.path.isdir(site.getusersitepackages())) + chr(10)); s=u.find_spec('customtkinter'); f.write('customtkinter=' + (s.origin if s else 'NOT FOUND') + chr(10)); y=u.find_spec('yt_dlp'); f.write('yt_dlp=' + (str(y.origin) if y else 'NOT FOUND') + chr(10)); f.write('sys.path=' + chr(10).join(sys.path) + chr(10)); f.close()" >> launch_log.txt 2>&1
 type diag_out.txt >> launch_log.txt 2>nul
 del diag_out.txt 2>nul
 
@@ -48,6 +55,19 @@ rem and after and could not be reproduced from a shell. A transient -- another
 rem Python process rewriting the bytecode cache, antivirus briefly locking a
 rem .pyc -- should not cost a launch.
 echo --- first attempt failed, retrying once --- >> launch_log.txt
+
+rem Wait before retrying. On 2026-08-08 both attempts failed 0.3s apart with the
+rem same namespace-package import of yt_dlp, so the retry burned its one chance
+rem inside the same instant that caused the fault. Nothing the retry exists to
+rem absorb -- an AV scan holding a .pyc, another process mid-rewrite of the
+rem bytecode cache -- clears that fast, which made the retry decorative.
+rem
+rem timeout is the readable choice but needs a real console; it aborts with
+rem "input redirection is not supported" when stdin is redirected, which is how
+rem this runs from a scheduler or a test harness. ping against loopback is the
+rem portable fallback and waits n-1 seconds.
+timeout /t 5 /nobreak >nul 2>&1 || ping -n 6 127.0.0.1 >nul 2>&1
+
 "C:\Python314\pythonw.exe" gui.py >> launch_log.txt 2>&1
 echo ==== retry exited with code %ERRORLEVEL% at %DATE% %TIME% ==== >> launch_log.txt
 if %ERRORLEVEL% EQU 0 goto :done
@@ -55,7 +75,10 @@ if %ERRORLEVEL% EQU 0 goto :done
 rem Twice is not transient. Stop leaving the user to guess and show the log.
 echo. >> launch_log.txt
 echo BackstageHero could not start twice in a row. >> launch_log.txt
-echo The 'customtkinter=' line above says whether Python could find the GUI library. >> launch_log.txt
+echo Check the 'customtkinter=' and 'yt_dlp=' lines near the top of this log. >> launch_log.txt
+echo NOT FOUND means the library is missing: pip install -r requirements.txt >> launch_log.txt
+echo A yt_dlp of None means the package resolved without its __init__.py -- >> launch_log.txt
+echo reinstall it with: pip install --force-reinstall yt-dlp >> launch_log.txt
 start "" notepad.exe launch_log.txt
 
 :done
