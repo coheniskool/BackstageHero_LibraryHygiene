@@ -1,0 +1,69 @@
+# Runs the pytest suite on every push and on PRs into main.
+#
+# Until now nothing but a developer's own machine had ever run this suite, so
+# "the tests pass" was a single-machine, unwitnessed claim -- flagged when
+# PR #7 went up with no checks on it. This is what makes the claim checkable
+# by someone who isn't the person who wrote the change.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes an in-flight run pointless. Cancel it
+# rather than pay for both. Never cancels on main: that history is the one
+# worth being able to read back.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  pytest:
+    # windows-latest, deliberately, not the cheaper ubuntu runner. This is a
+    # Windows desktop app: gui.py imports tkinter/customtkinter, the
+    # single-instance guard is a named Win32 mutex, and the file-locking
+    # behavior several tests encode (WinError 32 -- see
+    # SPEC-chorus-reliability-fix.md) simply does not exist on Linux. A green
+    # Linux run would be testing something the user never runs.
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # ffmpeg/ffprobe is a real runtime dependency of this app, not a test
+      # nicety, and the runner image does not ship it. Without it five tests
+      # fail rather than skip -- test_probe_audio_duration_ms_real_ffprobe,
+      # three chart_rename stem-duration tests, and the audiosync offset test
+      # ("could not decode audio"). They assume the binary the way the app
+      # does. Installing it is the honest fix; skipping them in CI would make
+      # the suite green by testing less than the developer's machine does.
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y --no-progress
+
+      - uses: actions/setup-python@v6
+        with:
+          # Matches the interpreter this project is developed and shipped
+          # against; requirements.txt is unpinned, so the Python version is
+          # the one thing worth being exact about.
+          python-version: '3.14'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      # Not in requirements.txt on purpose: pytest is a CI/dev tool, and
+      # requirements.txt is what a USER installs to run the app. Adding a
+      # requirements-dev.txt for a single package would be a new convention
+      # to maintain for no gain.
+
+      - name: Run tests
+        # -q matches what the specs quote as the project's baseline
+        # ("827 passed, 1 skipped" and so on), so a CI failure and a local one
+        # read the same way.
+        run: python -m pytest tests/ -q
