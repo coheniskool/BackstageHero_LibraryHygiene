@@ -49,6 +49,43 @@ A readable, signed-in Firefox store existed the whole time. `_COOKIES_BROKEN` is
 a process-wide boolean, so the first failure on Chrome sent the entire 9.5-hour
 run cookie-free with no attempt to look anywhere else.
 
+> **Correction, 2026-08-10 — cookies are not the fix, and this spec's original
+> premise was wrong.**
+>
+> The reasoning above assumed a working cookie store would have rescued the
+> run. Tested directly the next day, on this machine, with the Firefox store
+> that had just been made available:
+>
+> ```
+> no cookies       total=26  video=19  avc=7  mp4+avc=7
+> firefox cookies  FAILED: Requested format is not available
+> ```
+>
+> Four separate video IDs, same result every time: cookie-free returns 6–7
+> usable AVC/mp4 formats, and attaching the signed-in session returns nothing.
+> The failure happens during *extraction*, before any format selector is
+> applied, which is why `quality_format()`'s fallback chain down to bare `best`
+> cannot rescue it — the known interaction where an authenticated session
+> pushes YouTube onto a client path requiring a PO token.
+>
+> The live evidence agrees. The 2026-08-09 run downloaded 160 videos
+> **cookie-free**. The 2026-08-10 run, with Firefox cookies finally working,
+> downloaded **zero** — six songs dead in a row on "Requested format is not
+> available" — and recovered within seconds of the checkbox being unticked.
+>
+> **What survives:** the chain is still correct *graceful degradation*. If a
+> store is unreadable, trying the next one beats going blind, and every
+> constraint in the Never list still holds.
+>
+> **What does not:** the claim that this would have saved the 2026-08-09 run.
+> It would have broken it sooner. On this machine `use_browser_cookies` should
+> stay **off**, which is already the shipped default (`gui.py` reads it with
+> `.get('use_browser_cookies', False)`); only the persisted setting had been
+> turned on.
+>
+> The genuine cause of the 2026-08-09 throttling therefore remains
+> **unidentified**. It is per-IP and it cleared on elapsed time alone.
+
 **Time actually spent working: about 2 hours of 9.5.** The run was throttled
 11:12–16:36 (5.4h, cleared at escalation step 1) and again from 17:33 onward,
 with the next retry not due until 22:44. Throughput while actually running was
