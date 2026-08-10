@@ -132,6 +132,14 @@ def _enrich_one_song(folder, chorus_client, scoredata):
     if artist and title:
         result = chorus_client.search_by_artist_title(artist, title)
         if result:
+            # These six fields must stay in lockstep with
+            # chorus_cache._CACHED_RESULT_FIELDS -- the cache returns a
+            # projection over exactly that allowlist, so a field read here
+            # that isn't cached there is silently always None. It also means
+            # a Chorus response carrying none of the six now trims to {},
+            # which is falsy, so chorus_match is None rather than a record of
+            # six Nones. That's the better outcome, but it is a change.
+            #
             # Match-confidence gating is metadata_enrichment.py's job (it
             # decides whether to WRITE ini fields); this is descriptive data
             # collection only, so no confidence score is claimed here.
@@ -194,26 +202,51 @@ def enrich_library(library_path, ch_data_path=None, dry_run=False, force=False,
     new_data_written = 0
     problems_found = 0
 
-    for folder in library_common.iter_song_folders(library_path):
-        chart_hash, result = _enrich_one_song(folder, client, scoredata)
+    try:
+        for folder in library_common.iter_song_folders(library_path):
+            chart_hash, result = _enrich_one_song(folder, client, scoredata)
 
-        if chart_hash is None:
-            problems_found += 1
+            if chart_hash is None:
+                problems_found += 1
+                if verbose:
+                    log.warning('%s: %s', folder, '; '.join(result))
+                continue
+
+            if not force and chart_hash in sidecar['songs']:
+                songs_skipped += 1
+                continue
+
+            songs_processed += 1
+            new_data_written += 1
+            if result['problems']:
+                problems_found += 1
+            sidecar['songs'][chart_hash] = result
             if verbose:
-                log.warning('%s: %s', folder, '; '.join(result))
-            continue
-
-        if not force and chart_hash in sidecar['songs']:
-            songs_skipped += 1
-            continue
-
-        songs_processed += 1
-        new_data_written += 1
-        if result['problems']:
-            problems_found += 1
-        sidecar['songs'][chart_hash] = result
-        if verbose:
-            log.info('%s: enriched (%d problems)', folder, len(result['problems']))
+                log.info('%s: enriched (%d problems)', folder, len(result['problems']))
+    finally:
+        # The run owns the final flush -- Chorus cache writes are batched now
+        # (SPEC-chorus-cache-write-perf.md), so the thresholds alone would
+        # leave this run's last partial batch unwritten, and those lookups are
+        # the expensive part of the run.
+        #
+        # The `finally` covers a mid-run exception. It does NOT cover app
+        # close: the GUI runs this on a daemon thread, and a daemon thread is
+        # killed at interpreter shutdown without unwinding, so this block
+        # never executes there. What bounds that case is chorus_cache's
+        # FLUSH_EVERY_SECONDS -- at most a minute of lookups is lost. Do not
+        # "strengthen" this into an atexit hook on the strength of that gap;
+        # the loss is bounded and every entry is recomputable.
+        #
+        # Guarded because a raise from inside a `finally` REPLACES the
+        # exception that actually killed the run. gui.py's _run_enrichment
+        # logs whatever propagates, so masking here would put the wrong error
+        # in log.txt and make a real failure undiagnosable. flush() is not
+        # supposed to raise; this is here so that promise can never be the
+        # thing that costs the user their diagnosis.
+        try:
+            client.flush()
+        except Exception as e:
+            log.warning('Could not flush Chorus cache at end of run: %s', e)
 
     sidecar['scanned_at'] = _utcnow_iso()
 
