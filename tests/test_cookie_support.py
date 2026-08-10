@@ -12,17 +12,21 @@ import VideoDownload as vd
 def setup_function(_func):
     # Every test starts from the untouched default, regardless of what an
     # earlier test in this (or another) module left behind. _COOKIES_BROKEN
-    # (SPEC-cookie-fallback-fix.md) is deliberately never reset by
-    # configure_cookies() itself -- it must be reset here instead, or the
-    # first fallback test to run leaks True into every later test in this
-    # file.
+    # (SPEC-cookie-fallback-fix.md) and _BROKEN_COOKIE_BROWSERS
+    # (SPEC-cookie-chain-and-pacing.md) are deliberately never reset by
+    # configure_cookies() itself -- they must be reset here instead, or the
+    # first fallback test to run leaks its state into every later test in
+    # this file. The set is the more dangerous of the two: a leaked 'chrome'
+    # silently changes which browser a later test's chain starts on.
     vd.configure_cookies(False, None)
     vd._COOKIES_BROKEN = False
+    vd._BROKEN_COOKIE_BROWSERS.clear()
 
 
 def teardown_function(_func):
     vd.configure_cookies(False, None)
     vd._COOKIES_BROKEN = False
+    vd._BROKEN_COOKIE_BROWSERS.clear()
 
 
 def _make_fake_ydl_class(behaviors):
@@ -260,7 +264,10 @@ def test_cookie_fallback_logs_the_warning_exactly_once(monkeypatch, caplog):
     assert len(warnings) == 1
 
 
-def test_search_candidates_retries_without_cookies_after_dpapi_failure(monkeypatch):
+def test_search_candidates_advances_to_the_next_browser_after_dpapi_failure(monkeypatch):
+    # Behavior change from SPEC-cookie-chain-and-pacing.md: this used to assert
+    # the retry went cookie-FREE. With a chain configured, a chrome DPAPI
+    # failure now falls through to firefox and the same song keeps its cookies.
     vd.configure_cookies(True, 'chrome')
     good = {'entries': [{'id': 'abc123', 'title': 'A Song', 'duration': 180}]}
     FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), good])
@@ -269,14 +276,16 @@ def test_search_candidates_retries_without_cookies_after_dpapi_failure(monkeypat
     candidates = vd.search_candidates('some query', n=1)
 
     assert candidates == [('https://www.youtube.com/watch?v=abc123', 'A Song', 180)]
-    assert vd._COOKIES_BROKEN is True
-    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
-    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+    # Chain is not exhausted -- firefox worked, so the run still has cookies.
+    assert vd._COOKIES_BROKEN is False
+    assert FakeYDL.calls[0]['cookiesfrombrowser'] == ('chrome',)
+    assert FakeYDL.calls[1]['cookiesfrombrowser'] == ('firefox',)
 
 
-def test_search_candidates_retries_without_cookies_after_locked_chrome_db(monkeypatch):
+def test_search_candidates_advances_to_the_next_browser_after_locked_chrome_db(monkeypatch):
     # End-to-end shape of the 2026-08-05 failure: Chrome was open, every song
-    # died on the first construction. The retry has to rescue the same song.
+    # died on the first construction. The retry has to rescue the same song --
+    # now by moving to the next browser rather than dropping cookies.
     vd.configure_cookies(True, 'chrome')
     good = {'entries': [{'id': 'abc123', 'title': 'A Song', 'duration': 180}]}
     FakeYDL = _make_fake_ydl_class([Exception(_LOCKED_CHROME_DB_ERROR_TEXT), good])
@@ -285,9 +294,26 @@ def test_search_candidates_retries_without_cookies_after_locked_chrome_db(monkey
     candidates = vd.search_candidates('some query', n=1)
 
     assert candidates == [('https://www.youtube.com/watch?v=abc123', 'A Song', 180)]
+    assert vd._COOKIES_BROKEN is False
+    assert FakeYDL.calls[0]['cookiesfrombrowser'] == ('chrome',)
+    assert FakeYDL.calls[1]['cookiesfrombrowser'] == ('firefox',)
+
+
+def test_search_candidates_goes_cookie_free_once_every_browser_fails(monkeypatch):
+    # The 2026-08-09 machine, exactly: chrome and edge both DPAPI-fail. Only
+    # after the whole chain is exhausted does the run drop cookies -- and that
+    # is the one case where the old cookie-free behavior still applies.
+    vd.configure_cookies(True, 'chrome')
+    good = {'entries': [{'id': 'abc123', 'title': 'A Song', 'duration': 180}]}
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT)] * 3 + [good])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    candidates = vd.search_candidates('some query', n=1)
+
+    assert candidates == [('https://www.youtube.com/watch?v=abc123', 'A Song', 180)]
     assert vd._COOKIES_BROKEN is True
-    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
-    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+    assert [c.get('cookiesfrombrowser') for c in FakeYDL.calls] == [
+        ('chrome',), ('firefox',), ('edge',), None]
 
 
 def test_search_candidates_bot_error_is_not_treated_as_a_cookie_failure(monkeypatch):
@@ -316,9 +342,10 @@ def test_fetch_audio_recovers_after_dpapi_failure(tmp_path, monkeypatch):
     assert path == str(tmp_path / 'video.sync.opus')
     assert max_h == 480
     assert info == good_info
-    assert vd._COOKIES_BROKEN is True
-    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
-    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+    # Chain advanced chrome -> firefox rather than dropping cookies.
+    assert vd._COOKIES_BROKEN is False
+    assert FakeYDL.calls[0]['cookiesfrombrowser'] == ('chrome',)
+    assert FakeYDL.calls[1]['cookiesfrombrowser'] == ('firefox',)
 
 
 def test_fetch_audio_still_swallows_non_cookie_non_bot_errors(tmp_path, monkeypatch):
@@ -351,9 +378,10 @@ def test_download_video_retries_without_cookies_after_dpapi_failure(tmp_path, mo
     vd.download_video(str(folder), 'https://youtu.be/x', 'height<=720')
 
     assert (folder / 'video.mp4').exists()
-    assert vd._COOKIES_BROKEN is True
-    assert 'cookiesfrombrowser' in FakeYDL.calls[0]
-    assert 'cookiesfrombrowser' not in FakeYDL.calls[1]
+    # Chain advanced chrome -> firefox rather than dropping cookies.
+    assert vd._COOKIES_BROKEN is False
+    assert FakeYDL.calls[0]['cookiesfrombrowser'] == ('chrome',)
+    assert FakeYDL.calls[1]['cookiesfrombrowser'] == ('firefox',)
 
 
 def test_download_video_bot_error_is_not_treated_as_a_cookie_failure(tmp_path, monkeypatch):
@@ -368,3 +396,181 @@ def test_download_video_bot_error_is_not_treated_as_a_cookie_failure(tmp_path, m
 
     assert vd._COOKIES_BROKEN is False
     assert len(FakeYDL.calls) == 1
+
+
+# --- SPEC-cookie-chain-and-pacing.md Part A: the fallback CHAIN
+#
+# The 2026-08-09 run went 9.5 hours cookie-free because Chrome's App-Bound
+# Encryption made its store unreadable, while a signed-in Firefox store sat
+# on the same machine untouched. _COOKIES_BROKEN was process-wide, so the
+# first failure ended cookies for the whole run. Now only an exhausted chain
+# does that.
+
+def test_chain_puts_the_preferred_browser_first_then_the_defaults():
+    vd.configure_cookies(True, 'chrome')
+    assert vd._cookie_chain() == ['chrome', 'firefox', 'edge']
+
+
+def test_chain_does_not_repeat_the_preferred_browser():
+    # firefox is both the preference and the head of _COOKIE_CHAIN_ORDER --
+    # it must appear exactly once or it would be retried after failing.
+    vd.configure_cookies(True, 'firefox')
+    assert vd._cookie_chain() == ['firefox', 'edge', 'chrome']
+    assert vd._cookie_chain().count('firefox') == 1
+
+
+def test_chain_is_empty_when_cookies_are_off():
+    vd.configure_cookies(False, None)
+    assert vd._cookie_chain() == []
+    assert vd._active_cookie_browser() is None
+
+
+def test_chain_filters_unsupported_browser_names(monkeypatch):
+    # Defense in depth, mirroring configure_cookies' own guard: a bad name in
+    # the fallback order must never reach yt-dlp.
+    monkeypatch.setattr(vd, '_COOKIE_CHAIN_ORDER', ('firefox', 'notabrowser'))
+    vd.configure_cookies(True, 'chrome')
+    assert vd._cookie_chain() == ['chrome', 'firefox']
+
+
+def test_dpapi_failure_advances_to_the_next_browser_and_the_same_call_returns(monkeypatch):
+    """The contract that matters: the song that hits the wall is the song that
+    recovers -- one _run_ytdlp_with_cookie_fallback call, one return value."""
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), 'recovered'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    result = vd._run_ytdlp_with_cookie_fallback(
+        vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    assert result == 'recovered'
+    assert FakeYDL.calls[0]['cookiesfrombrowser'] == ('chrome',)
+    assert FakeYDL.calls[1]['cookiesfrombrowser'] == ('firefox',)
+    assert vd._BROKEN_COOKIE_BROWSERS == {'chrome'}
+    assert vd._COOKIES_BROKEN is False
+
+
+def test_exhausting_every_browser_ends_cookie_free(monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT)] * 3 + ['ok'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    result = vd._run_ytdlp_with_cookie_fallback(
+        vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    assert result == 'ok'
+    assert [c.get('cookiesfrombrowser') for c in FakeYDL.calls] == [
+        ('chrome',), ('firefox',), ('edge',), None]
+    assert vd._BROKEN_COOKIE_BROWSERS == {'chrome', 'firefox', 'edge'}
+    assert vd._COOKIES_BROKEN is True
+    # And every later call skips the dead chain entirely.
+    assert 'cookiesfrombrowser' not in vd._base_opts()
+
+
+@pytest.mark.parametrize('sign_text', [
+    'ERROR: Failed to decrypt with DPAPI. See issues/10927',
+    'ERROR: Failed to load cookies',
+    'ERROR: ERROR: Could not copy Chrome cookie database. See issues/7271',
+])
+def test_each_cookie_error_sign_advances_the_chain(monkeypatch, sign_text):
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception(sign_text), 'recovered'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    result = vd._run_ytdlp_with_cookie_fallback(
+        vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    assert result == 'recovered'
+    assert FakeYDL.calls[1]['cookiesfrombrowser'] == ('firefox',)
+
+
+def test_non_cookie_error_propagates_without_advancing(monkeypatch):
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception('network unreachable')])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    with pytest.raises(Exception, match='network unreachable'):
+        vd._run_ytdlp_with_cookie_fallback(
+            vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    assert len(FakeYDL.calls) == 1
+    assert vd._BROKEN_COOKIE_BROWSERS == set()
+    assert vd._COOKIES_BROKEN is False
+
+
+def test_a_broken_browser_is_not_retried_on_a_later_call(monkeypatch):
+    """Per-process stickiness at finer grain: re-paying a known failure once
+    per song is the cost SPEC-cookie-fallback-fix.md existed to remove."""
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), 'first', 'second'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    vd._run_ytdlp_with_cookie_fallback(vd._base_opts(), lambda ydl: ydl.extract_info())
+    # A fresh _base_opts() (what the next song does) must already start on
+    # firefox -- chrome is never offered again.
+    second = vd._run_ytdlp_with_cookie_fallback(
+        vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    assert second == 'second'
+    assert len(FakeYDL.calls) == 3
+    assert FakeYDL.calls[2]['cookiesfrombrowser'] == ('firefox',)
+
+
+def test_one_warning_per_transition_not_one_per_song(monkeypatch, caplog):
+    """A 7,000-song run must not log a cookie warning per song. Each browser
+    gets exactly one line, no matter how many calls hit the same wall."""
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class(
+        [Exception(_DPAPI_ERROR_TEXT), 'a', 'b', 'c', 'd'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    with caplog.at_level('WARNING'):
+        for _ in range(4):
+            vd._run_ytdlp_with_cookie_fallback(
+                vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    cookie_warnings = [r for r in caplog.records if 'cookie' in r.message.lower()]
+    assert len(cookie_warnings) == 1
+    assert 'trying firefox next' in cookie_warnings[0].message
+
+
+def test_chain_exhausted_warning_is_logged_once(monkeypatch, caplog):
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT)] * 3 + ['ok', 'ok2'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    with caplog.at_level('WARNING'):
+        vd._run_ytdlp_with_cookie_fallback(vd._base_opts(), lambda ydl: ydl.extract_info())
+        vd._run_ytdlp_with_cookie_fallback(vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    exhausted = [r for r in caplog.records
+                 if 'without browser cookies' in r.message]
+    assert len(exhausted) == 1
+
+
+def test_no_cookie_value_reaches_the_logs(monkeypatch, caplog):
+    """Only browser NAMES ever pass through this module -- the property the
+    original cookie feature was built around must survive the chain."""
+    vd.configure_cookies(True, 'chrome')
+    FakeYDL = _make_fake_ydl_class([Exception(_DPAPI_ERROR_TEXT), 'ok'])
+    monkeypatch.setattr(vd.yt_dlp, 'YoutubeDL', FakeYDL)
+
+    with caplog.at_level('WARNING'):
+        vd._run_ytdlp_with_cookie_fallback(
+            vd._base_opts(), lambda ydl: ydl.extract_info())
+
+    for record in caplog.records:
+        assert 'SAPISID' not in record.message
+        assert 'sessionid' not in record.message.lower()
+
+
+def test_base_opts_is_byte_identical_when_cookies_are_off():
+    """The central regression this file exists to prove, restated for the
+    chain: with the feature off, nothing about the chain is observable."""
+    vd.configure_cookies(False, None)
+    assert vd._base_opts() == {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': 1,
+        'sleep_interval_requests': 1,
+    }

@@ -262,7 +262,10 @@ def test_resume_downloading_future_resume_at_waits_then_launches(tmp_path, monke
                         remaining_folders=['C:/Songs/A', 'C:/Songs/B'],
                         replace=True, resync=True)
     calls = []
-    app._launch_background = lambda targets, replace, resync: calls.append(
+    # *rest absorbs pace/clean_streak (SPEC-cookie-chain-and-pacing.md Part B)
+    # without this test having to care about them -- the pacing round-trip has
+    # its own tests below.
+    app._launch_background = lambda targets, replace, resync, *rest: calls.append(
         (targets, replace, resync, app._running))
 
     app._resume_background_downloading(state)
@@ -287,7 +290,7 @@ def test_resume_downloading_past_resume_at_launches_without_waiting(tmp_path, mo
     state = _save_state(phase='downloading', resume_at=resume_at,
                         remaining_folders=['C:/Songs/A'])
     calls = []
-    app._launch_background = lambda targets, replace, resync: calls.append(
+    app._launch_background = lambda targets, replace, resync, *rest: calls.append(
         (targets, replace, resync))
 
     app._resume_background_downloading(state)
@@ -324,7 +327,7 @@ def test_resume_downloading_no_resume_at_launches_without_waiting(tmp_path, monk
     state = _save_state(phase='downloading', resume_at=None,
                         remaining_folders=['C:/Songs/A'])
     calls = []
-    app._launch_background = lambda targets, replace, resync: calls.append(targets)
+    app._launch_background = lambda targets, replace, resync, *rest: calls.append(targets)
 
     app._resume_background_downloading(state)
 
@@ -383,3 +386,53 @@ def test_on_library_scanned_only_fires_resume_check_once(tmp_path, monkeypatch):
     # must NOT re-trigger the resume dispatch.
     app._on_library_scanned([])
     assert calls == [1]
+
+
+# --- pacing survives the resume (SPEC-cookie-chain-and-pacing.md, Part B) ---
+
+def test_resume_restores_the_persisted_pace(tmp_path, monkeypatch):
+    app = _bare_app(tmp_path, monkeypatch)
+    app._songs = [_FakeSong('C:/Songs/A', has_video=False)]
+    state = _save_state(phase='downloading', resume_at=None,
+                        remaining_folders=['C:/Songs/A'],
+                        pace=4.0, clean_streak=3)
+    calls = []
+    app._launch_background = lambda targets, replace, resync, pace=None, clean_streak=None: \
+        calls.append((pace, clean_streak))
+
+    app._resume_background_downloading(state)
+
+    assert calls == [(4.0, 3)]
+
+
+def test_resume_without_pace_keys_starts_at_neutral(tmp_path, monkeypatch):
+    """A state file written before this change must resume cleanly."""
+    app = _bare_app(tmp_path, monkeypatch)
+    app._songs = [_FakeSong('C:/Songs/A', has_video=False)]
+    state = _save_state(phase='downloading', resume_at=None,
+                        remaining_folders=['C:/Songs/A'])
+    assert 'pace' not in state
+    calls = []
+    app._launch_background = lambda targets, replace, resync, pace=None, clean_streak=None: \
+        calls.append((pace, clean_streak))
+
+    app._resume_background_downloading(state)
+
+    assert calls == [(gui._PACE_DEFAULT, 0)]
+
+
+def test_resume_clamps_a_corrupt_persisted_pace(tmp_path, monkeypatch):
+    app = _bare_app(tmp_path, monkeypatch)
+    app._songs = [_FakeSong('C:/Songs/A', has_video=False)]
+    state = _save_state(phase='downloading', resume_at=None,
+                        remaining_folders=['C:/Songs/A'],
+                        pace=0, clean_streak=-5)
+    calls = []
+    app._launch_background = lambda targets, replace, resync, pace=None, clean_streak=None: \
+        calls.append((pace, clean_streak))
+
+    app._resume_background_downloading(state)
+
+    # A pace of 0 would mean a zero inter-song delay -- a busy-loop hammering
+    # YouTube. The clamp is a floor on machine safety, not politeness.
+    assert calls == [(gui._PACE_MIN, 0)]

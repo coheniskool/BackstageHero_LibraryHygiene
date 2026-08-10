@@ -665,14 +665,30 @@ def video_id_of(url):
 # ever read, logged, or persisted by this code.
 USE_BROWSER_COOKIES = False
 COOKIE_BROWSER = None
-# Set once a browser-cookie store proves unusable this process (DPAPI/App-
-# Bound Encryption failure, locked profile, corrupted store, etc.) -- see
-# _run_ytdlp_with_cookie_fallback() below. Deliberately NOT reset by
-# configure_cookies(): once broken this process, it stays broken until the
-# app restarts, even if the user re-toggles the checkbox mid-session. That
-# keeps the fallback entirely in-memory -- it never touches settings.json or
-# gui.py's checkbox state.
+# Set once EVERY browser in the fallback chain has proved unusable this
+# process -- see _run_ytdlp_with_cookie_fallback() below. Deliberately NOT
+# reset by configure_cookies(): once broken this process, it stays broken
+# until the app restarts, even if the user re-toggles the checkbox
+# mid-session. That keeps the fallback entirely in-memory -- it never touches
+# settings.json or gui.py's checkbox state.
 _COOKIES_BROKEN = False
+
+# Ordered fallback, not a single choice: on 2026-08-09 a run went 9.5 hours
+# cookie-free because Chrome's App-Bound Encryption (yt-dlp #10927) made its
+# store unreadable, while a perfectly good signed-in Firefox store sat on the
+# same machine untouched. Firefox leads because it is the only one of the
+# three not subject to Chromium App-Bound Encryption -- direct extraction
+# tests that day: chrome DPAPI-failed, edge DPAPI-failed, firefox returned 49
+# cookies with a live session. The user's dropdown choice still leads over
+# this order; see _cookie_chain().
+_COOKIE_CHAIN_ORDER = ('firefox', 'edge', 'chrome')
+
+# Browsers whose store proved unreadable THIS PROCESS. Same stickiness the
+# _COOKIES_BROKEN boolean had on its own, at finer grain: re-paying a known
+# failure once per song is exactly the cost SPEC-cookie-fallback-fix.md
+# existed to remove, so a browser that fails once is never offered again.
+# Never reset by configure_cookies() -- tests must reset it explicitly.
+_BROKEN_COOKIE_BROWSERS = set()
 
 # yt-dlp's own supported --cookies-from-browser browser names. Kept here as a
 # defense-in-depth guard: today's only caller (gui.py's footer dropdown) is
@@ -707,6 +723,48 @@ def configure_cookies(use_cookies, browser):
     COOKIE_BROWSER = None
 
 
+def _cookie_chain():
+    """Browsers to try, in order: the user's dropdown choice first, then the
+    rest of _COOKIE_CHAIN_ORDER.
+
+    Derived from COOKIE_BROWSER on each call rather than stored at
+    configure_cookies() time on purpose -- COOKIE_BROWSER is the single source
+    of truth, and a stored copy could go stale against direct assignment to
+    the module globals (which is how a fresh-install default and this
+    project's own tests both reach _base_opts())."""
+    if not (USE_BROWSER_COOKIES and COOKIE_BROWSER):
+        return []
+    chain = [COOKIE_BROWSER]
+    chain += [b for b in _COOKIE_CHAIN_ORDER if b != COOKIE_BROWSER]
+    return [b for b in chain if b in _SUPPORTED_COOKIE_BROWSERS]
+
+
+def _active_cookie_browser():
+    """First browser in the chain whose store has not already proved
+    unreadable this process, or None to run cookie-free.
+
+    Evaluated lazily -- on the first yt-dlp call that needs cookies, not at
+    app startup. Cost is not the reason: measured on 2026-08-09, probing all
+    three stores costs firefox 10ms / edge 655ms / chrome 1589ms, and since
+    the chain is sticky that work happens exactly once either way -- eager
+    probing would only move it earlier, not add it.
+
+    The reason is that an eager probe would bake in a TRANSIENT failure. The
+    'could not copy Chrome cookie database' case (yt-dlp #7271) means the
+    browser is merely running and holding its store open; probing at launch,
+    when the user has just clicked a shortcut with their browser open, is the
+    single worst moment to sample it -- and _BROKEN_COOKIE_BROWSERS is sticky
+    for the process, so a browser condemned at startup stays condemned for a
+    multi-day run. Asking at first use gives the condition a chance to have
+    cleared."""
+    if _COOKIES_BROKEN:
+        return None
+    for browser in _cookie_chain():
+        if browser not in _BROKEN_COOKIE_BROWSERS:
+            return browser
+    return None
+
+
 def _base_opts():
     # No player_client override here on purpose: a hardcoded list (previously
     # ['tv_embedded', 'android_vr', 'android']) goes stale the moment yt-dlp's
@@ -721,11 +779,12 @@ def _base_opts():
         'noplaylist': 1,
         'sleep_interval_requests': 1,
     }
-    if USE_BROWSER_COOKIES and COOKIE_BROWSER and not _COOKIES_BROKEN:
+    browser = _active_cookie_browser()
+    if browser:
         # yt-dlp's Python-API equivalent of --cookies-from-browser: a
         # 1-tuple of (browser_name,). yt-dlp reads that browser's own cookie
         # store directly -- nothing here touches a cookie value.
-        opts['cookiesfrombrowser'] = (COOKIE_BROWSER,)
+        opts['cookiesfrombrowser'] = (browser,)
     return opts
 
 
@@ -754,28 +813,52 @@ def _is_cookie_decrypt_error(exc):
 def _run_ytdlp_with_cookie_fallback(opts, fn):
     """Run fn(ydl) with opts. If it fails because the browser-cookie store
     couldn't be read (Windows DPAPI / Chrome App-Bound Encryption -- yt-dlp
-    issue #10927), disable cookies for the rest of this process and retry
-    fn once without them.
+    issue #10927), advance to the next browser in the chain and retry the SAME
+    call; only once every candidate is exhausted does the process fall back to
+    running cookie-free.
+
+    The same-call retry is the contract that matters: the song that first hits
+    the wall is the song that recovers, not the one after it.
 
     Matches on message text, not exception type: yt-dlp's YoutubeDL.cookiejar
     property catches the internal CookieLoadError and re-raises it as a plain
     DownloadError carrying the original message -- by the time it reaches
-    here the type information is already gone, only the text survives."""
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return fn(ydl)
-    except Exception as e:
-        if not (opts.get('cookiesfrombrowser') and _is_cookie_decrypt_error(e)):
-            raise
-        global _COOKIES_BROKEN
-        if not _COOKIES_BROKEN:
-            log.warning('Browser cookie extraction failed (%s); continuing '
-                        'this run without browser cookies.', e)
-        _COOKIES_BROKEN = True
-        retry_opts = dict(opts)
-        retry_opts.pop('cookiesfrombrowser', None)
-        with yt_dlp.YoutubeDL(retry_opts) as ydl:
-            return fn(ydl)
+    here the type information is already gone, only the text survives.
+
+    Terminates because each pass either returns, re-raises, or adds one
+    browser to _BROKEN_COOKIE_BROWSERS -- and once the (finite) chain is
+    exhausted the retry carries no cookiesfrombrowser at all, so a further
+    failure re-raises rather than looping."""
+    global _COOKIES_BROKEN
+    while True:
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return fn(ydl)
+        except Exception as e:
+            configured = opts.get('cookiesfrombrowser')
+            if not (configured and _is_cookie_decrypt_error(e)):
+                raise
+            failed = configured[0]
+            # One warning per browser per process, never one per song: a
+            # browser already in the set has had its say.
+            first_failure = failed not in _BROKEN_COOKIE_BROWSERS
+            _BROKEN_COOKIE_BROWSERS.add(failed)
+
+            nxt = _active_cookie_browser()
+            opts = dict(opts)
+            if nxt:
+                if first_failure:
+                    log.warning('Browser cookie extraction failed for %s (%s); '
+                                'trying %s next.', failed, e, nxt)
+                opts['cookiesfrombrowser'] = (nxt,)
+            else:
+                if not _COOKIES_BROKEN:
+                    log.warning('Browser cookie extraction failed for %s (%s); '
+                                'no readable browser cookie store left, '
+                                'continuing this run without browser cookies.',
+                                failed, e)
+                _COOKIES_BROKEN = True
+                opts.pop('cookiesfrombrowser', None)
 
 
 def search_candidates(query, n=SEARCH_RESULTS):
@@ -1749,7 +1832,16 @@ def main():
                     interrupted = True
                     break
 
-                # small random delay between songs
+                # Small random delay between songs. Deliberately a FLAT delay,
+                # with none of gui.py's adaptive `pace` multiplier -- resolved
+                # in SPEC-cookie-chain-and-pacing.md rather than left open a
+                # third time. This loop only runs via `python VideoDownload.py`
+                # from source: build.py's frozen exe launches the GUI, and the
+                # README documents no CLI entry point for it. Duplicating the
+                # adaptive-pacing policy here would put two implementations of
+                # one rule in the codebase for a path nobody ships, and they
+                # would drift. If this ever becomes a supported entry point,
+                # extract the pacing into a shared helper -- do not copy it.
                 time.sleep(random.uniform(SONG_DELAY_MIN, SONG_DELAY_MAX))
     except KeyboardInterrupt:
         interrupted = True
@@ -1790,7 +1882,7 @@ def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resyn
             return 'ok'
         except KeyboardInterrupt:
             raise
-        except BotDetected:
+        except BotDetected as e:
             cleanup_temp_files(folder)
             if events is not None:
                 events.append('throttled')
@@ -1798,7 +1890,12 @@ def run_song_with_backoff(folder, song_name, quality, sync_ready, replace, resyn
                 print('\nYouTube is still asking to "confirm you\'re not a bot" after several')
                 print('waits. Your IP is being rate-limited. Stopping now - wait a while and')
                 print('re-run; everything already downloaded is skipped automatically.')
-                log.warning('Rate-limited and gave up on %s', song_name)
+                # Which sign fired matters: a "sign in to confirm you're not a
+                # bot" challenge and an HTTP 429 imply different remedies, and
+                # the 2026-08-09 log could not tell them apart because this
+                # line used to drop the text entirely. Truncated so a
+                # pathological yt-dlp message can't flood the rotating log.
+                log.warning('Rate-limited and gave up on %s (%s)', song_name, str(e)[:200])
                 return 'stop'
             wait = BOT_BACKOFF_SECONDS[attempt]
             print('\nYouTube rate-limit hit. Waiting ' + str(wait) + 's before retrying this song...')

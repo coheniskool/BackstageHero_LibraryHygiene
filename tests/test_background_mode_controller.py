@@ -304,6 +304,150 @@ def test_throttle_episode_resolved_logs_escalation_steps(controller, caplog):
         f"Expected throttle resolution log in {[r.message for r in caplog.records]}"
 
 
+# --- throttle log line names the current pace -------------------------------
+
+def test_throttle_log_line_names_the_current_pace(controller, monkeypatch, caplog):
+    """The 2026-08-09 log recorded resume_at and the escalation step for every
+    throttle, but never the pace the run had reached -- so there was no way to
+    tell whether the run was already backed off when YouTube pushed back.
+    _handle_background_throttle's log.info must now include it."""
+    import logging
+    app = controller.app
+    app._stop_evt = _FakeStopEvent()
+
+    # The `controller` fixture's fake_run_song doesn't touch `events`, so
+    # pace would stay at the 1.0 default -- indistinguishable from a bug that
+    # dropped the argument entirely. Push 'throttled' into events on the
+    # 'stop' outcome (what the real run_song_with_backoff does) so pace
+    # escalates to 2.0 by the time the throttle fires, same as gui.py:3072-75.
+    def fake_run_song(folder, label, quality, sync_ready,
+                      replace, resync, errored, stop_evt, events):
+        result = controller.calls['song'].pop(0)
+        if result == 'stop':
+            events.append('throttled')
+        return result
+
+    monkeypatch.setattr(gui, 'run_song_with_backoff', fake_run_song)
+    # The wait doesn't cancel, so the loop retries the SAME song (Task 11's
+    # contract) -- a second scripted outcome is required or the fake's script
+    # runs dry on that retry.
+    controller.calls['song'] = ['stop', 'ok']
+    targets = [_FakeSong('C:/Songs/A', 'Song A')]
+
+    with caplog.at_level(logging.INFO, logger='backstagehero'):
+        app._dl_thread(targets, 'q', replace=False, resync=False, background_mode=True)
+
+    throttle_logs = [r.message for r in caplog.records if 'throttled on' in r.message]
+    assert throttle_logs, f'Expected a throttle log in {[r.message for r in caplog.records]}'
+    assert 'pace 2.00' in throttle_logs[0], \
+        f'Expected the escalated pace (2.00) in: {throttle_logs[0]!r}'
+
+
+# --- pacing is persisted at the backoff points (Part B) ---------------------
+
+def test_throttle_save_includes_the_current_pace(controller, monkeypatch):
+    """pace joins remaining_folders at exactly the points that already
+    persist -- no new save sites, no per-song disk write."""
+    app = controller.app
+    app._stop_evt = _FakeStopEvent()
+
+    def fake_run_song(folder, label, quality, sync_ready,
+                      replace, resync, errored, stop_evt, events):
+        result = controller.calls['song'].pop(0)
+        if result == 'stop':
+            events.append('throttled')
+        return result
+
+    monkeypatch.setattr(gui, 'run_song_with_backoff', fake_run_song)
+
+    # The run completes and clears the state file, so snapshot every write
+    # instead of reading the end state off disk.
+    saves = []
+    real_save = gui._save_background_state
+    monkeypatch.setattr(gui, '_save_background_state',
+                        lambda state: (saves.append(dict(state)), real_save(state))[1])
+
+    controller.calls['song'] = ['stop', 'ok']
+    targets = [_FakeSong('C:/Songs/A', 'Song A')]
+
+    app._dl_thread(targets, 'q', replace=False, resync=False, background_mode=True)
+
+    throttle_saves = [s for s in saves if s.get('resume_at')]
+    assert throttle_saves, f'no throttle save among {saves}'
+    # pace had already doubled to 2.0 by the time the throttle persisted.
+    assert throttle_saves[-1]['pace'] == 2.0
+    assert throttle_saves[-1]['clean_streak'] == 0
+    # ...alongside remaining_folders, at the same existing save point.
+    assert 'remaining_folders' in throttle_saves[-1]
+
+
+def test_foreground_run_does_not_persist_pace(controller, monkeypatch):
+    """Foreground runs have no resume path and must not write state at all."""
+    app = controller.app
+    app._stop_evt = _FakeStopEvent()
+    controller.calls['song'] = ['ok', 'ok']
+    targets = [_FakeSong('C:/Songs/A', 'Song A'), _FakeSong('C:/Songs/B', 'Song B')]
+
+    app._dl_thread(targets, 'q', replace=False, resync=False)   # background off
+
+    assert gui._load_background_state() == {}
+
+
+def test_dl_thread_starts_from_the_pace_it_is_handed(controller, monkeypatch, caplog):
+    """The whole point of Part B: a resumed run continues at the pace it
+    reached, so the first throttle after a restart reports that value rather
+    than a freshly-reset 1.0."""
+    import logging
+    app = controller.app
+    app._stop_evt = _FakeStopEvent()
+
+    def fake_run_song(folder, label, quality, sync_ready,
+                      replace, resync, errored, stop_evt, events):
+        result = controller.calls['song'].pop(0)
+        if result == 'stop':
+            events.append('throttled')
+        return result
+
+    monkeypatch.setattr(gui, 'run_song_with_backoff', fake_run_song)
+    controller.calls['song'] = ['stop', 'ok']
+    targets = [_FakeSong('C:/Songs/A', 'Song A')]
+
+    with caplog.at_level(logging.INFO, logger='backstagehero'):
+        app._dl_thread(targets, 'q', replace=False, resync=False,
+                       background_mode=True, pace=3.0, clean_streak=4)
+
+    throttle_logs = [r.message for r in caplog.records if 'throttled on' in r.message]
+    # Handed 3.0, doubled by the throttle -> 6.00. The point is that it is not
+    # 2.00, which is what a run that reset to the 1.0 default would report.
+    assert 'pace 6.00' in throttle_logs[0]
+
+
+def test_pace_ceiling_is_reachable_by_doubling_and_clamps_there(controller, monkeypatch, caplog):
+    """The 24.0 ceiling must actually bound the doubling -- handed a pace
+    already at the cap, a further throttle must not exceed it."""
+    import logging
+    app = controller.app
+    app._stop_evt = _FakeStopEvent()
+
+    def fake_run_song(folder, label, quality, sync_ready,
+                      replace, resync, errored, stop_evt, events):
+        result = controller.calls['song'].pop(0)
+        if result == 'stop':
+            events.append('throttled')
+        return result
+
+    monkeypatch.setattr(gui, 'run_song_with_backoff', fake_run_song)
+    controller.calls['song'] = ['stop', 'ok']
+    targets = [_FakeSong('C:/Songs/A', 'Song A')]
+
+    with caplog.at_level(logging.INFO, logger='backstagehero'):
+        app._dl_thread(targets, 'q', replace=False, resync=False,
+                       background_mode=True, pace=gui._PACE_MAX)
+
+    throttle_logs = [r.message for r in caplog.records if 'throttled on' in r.message]
+    assert f'pace {gui._PACE_MAX:.2f}' in throttle_logs[0]
+
+
 # --- REGRESSIONS: the default (non-background) path must be unchanged --------
 
 def test_default_path_stop_still_ends_run_with_rate_limited(controller):

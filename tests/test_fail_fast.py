@@ -479,3 +479,53 @@ def test_cli_loop_success_resets_the_count(cli, monkeypatch):
 
     # Never limit-in-a-row, so every song got its turn.
     assert len(cli.attempted) == total
+
+
+# --- give-up warning carries the bot-error text (SPEC-cookie-chain-and-pacing.md) --
+#
+# Not a fail-fast-preconditions concern -- these pin run_song_with_backoff's
+# own give-up log line, which this file already owns coverage of. On
+# 2026-08-09 'Rate-limited and gave up on %s' dropped the triggering
+# exception's text entirely, so the log could not tell a "sign in to confirm
+# you're not a bot" challenge from an HTTP 429 apart -- two failures that
+# imply different remedies.
+
+def test_give_up_warning_carries_the_bot_error_text(monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(
+        vd, 'process_download',
+        lambda *a, **kw: (_ for _ in ()).throw(
+            vd.BotDetected("sign in to confirm you're not a bot")))
+    stop_evt = _FakeStopEvent()   # .wait() never really sleeps
+
+    with caplog.at_level(logging.WARNING, logger='backstagehero'):
+        result = vd.run_song_with_backoff(
+            'C:/Songs/S', 'Test Song', vd.quality_format(720),
+            sync_ready=True, replace=False, resync=False, errored=[],
+            stop_evt=stop_evt)
+
+    assert result == 'stop'
+    give_up = [r.message for r in caplog.records if 'gave up on' in r.message]
+    assert give_up, f'Expected a give-up log in {[r.message for r in caplog.records]}'
+    assert "sign in to confirm you're not a bot" in give_up[0]
+
+
+def test_give_up_warning_truncates_a_pathological_error_message(monkeypatch, caplog):
+    """A pathological yt-dlp message must not flood the rotating log."""
+    import logging
+    huge_message = 'sign in to confirm ' + ('x' * 500)
+    monkeypatch.setattr(
+        vd, 'process_download',
+        lambda *a, **kw: (_ for _ in ()).throw(vd.BotDetected(huge_message)))
+    stop_evt = _FakeStopEvent()
+
+    with caplog.at_level(logging.WARNING, logger='backstagehero'):
+        vd.run_song_with_backoff(
+            'C:/Songs/S', 'Test Song', vd.quality_format(720),
+            sync_ready=True, replace=False, resync=False, errored=[],
+            stop_evt=stop_evt)
+
+    give_up = [r.message for r in caplog.records if 'gave up on' in r.message]
+    assert give_up
+    assert huge_message not in give_up[0]
+    assert huge_message[:200] in give_up[0]
