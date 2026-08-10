@@ -5,28 +5,28 @@ See [`plan-chorus-cache-robustness.md`](plan-chorus-cache-robustness.md) for ful
 Baseline before any of this: **827 passed, 1 skipped** (verified at merge `2043079`). Target: **839 passed, 1 skipped**, with **no existing test modified**.
 
 ## Task 1: Self-heal on the read path — `_load()` restructure + `_reset()`
-- [ ] `_load()` (:121-137) — parse into a local `entries`; assign `self._entries` only after the `isinstance` check passes
-- [ ] `except OSError as e` first — keep the `'Could not read Chorus cache %s: %s'` wording, `self._entries = {}`, **no dirty mark**, with the WinError 32 / concurrent-`os.replace` reasoning in the comment
-- [ ] Wrong-shape branch — message to `'is not an object; starting empty'`, call `self._reset()`
-- [ ] `except Exception as e` backstop — log `type(e).__name__`, call `self._reset()`; comment carries the 2026-08-10 `RecursionError` verification, what the old behavior cost (dead enrichment every run, silent on a GUI daemon thread), and why `Exception` not `BaseException`
-- [ ] In-code note that handler ORDER is load-bearing: `OSError` before the catch-all, or the non-clobbering branch is unreachable
-- [ ] Add private `_reset()` — `self._entries = {}` + `self._dirty += 1`, docstring saying the dirty mark IS the self-heal and why the `OSError` path deliberately skips it
-- [ ] `test_deeply_nested_cache_file_is_survivable` — confirm it fails on `main` before it passes here
-- [ ] `test_unparseable_cache_is_replaced_at_next_flush`
-- [ ] `test_wrong_shape_cache_is_replaced_at_next_flush`
-- [ ] `test_unreadable_cache_is_not_replaced` — byte-compare the file after construct + `flush()`
-- [ ] `test_load_failure_does_not_swallow_keyboardinterrupt`
-- [ ] `test_compact_failure_is_survivable`
-- [ ] `test_lookup_still_works_after_unrecoverable_load_failure`
-- [ ] `test_enrichment_survives_a_corrupt_chorus_cache` (tests/test_library_enrichment.py)
-- [ ] `pytest tests/test_chorus_cache.py tests/test_library_enrichment.py -v` green
+- [x] `_load()` (:121-137) — parse into a local `entries`; assign `self._entries` only after the `isinstance` check passes
+- [x] `except OSError as e` first — keep the `'Could not read Chorus cache %s: %s'` wording, `self._entries = {}`, **no dirty mark**, with the WinError 32 / concurrent-`os.replace` reasoning in the comment
+- [x] Wrong-shape branch — message to `'is not an object; starting empty'`, call `self._reset()`
+- [x] `except Exception as e` backstop — log `type(e).__name__`, call `self._reset()`; comment carries the 2026-08-10 `RecursionError` verification, what the old behavior cost (dead enrichment every run, silent on a GUI daemon thread), and why `Exception` not `BaseException`
+- [x] In-code note that handler ORDER is load-bearing: `OSError` before the catch-all, or the non-clobbering branch is unreachable
+- [x] Add private `_reset()` — `self._entries = {}` + `self._dirty += 1`, docstring saying the dirty mark IS the self-heal and why the `OSError` path deliberately skips it
+- [x] `test_deeply_nested_cache_file_is_survivable` — confirm it fails on `main` before it passes here
+- [x] `test_unparseable_cache_is_replaced_at_next_flush`
+- [x] `test_wrong_shape_cache_is_replaced_at_next_flush`
+- [x] `test_unreadable_cache_is_not_replaced` — byte-compare the file after construct + `flush()`
+- [x] `test_load_failure_does_not_swallow_keyboardinterrupt`
+- [x] `test_compact_failure_is_survivable`
+- [x] `test_unrecoverable_load_failure_costs_one_relookup_not_a_dead_feature` (planned as `test_lookup_still_works_after_...`; renamed to state the promise rather than the absence of a crash)
+- [x] `test_enrichment_survives_a_corrupt_chorus_cache` (tests/test_library_enrichment.py)
+- [x] `pytest tests/test_chorus_cache.py tests/test_library_enrichment.py -v` green
 
 ## ▶ Checkpoint 1
-- [ ] `pytest tests/ -q` full suite green (827 baseline + 8)
-- [ ] Read-check: the `OSError` branch does **not** call `_reset()` — the one line the spec's Never Do list is about
-- [ ] Read-check: flip the catch-all to `BaseException` locally, confirm `test_load_failure_does_not_swallow_keyboardinterrupt` goes red, flip it back
-- [ ] Read-check: `git diff tests/test_chorus_cache.py` shows additions only
-- [ ] Read-check: `_save()` untouched by this task
+- [x] `pytest tests/ -q` full suite green (827 baseline + 8)
+- [x] Read-check: the `OSError` branch does **not** call `_reset()` — the one line the spec's Never Do list is about
+- [x] Read-check: flip the catch-all to `BaseException` locally, confirm `test_load_failure_does_not_swallow_keyboardinterrupt` goes red, flip it back
+- [x] Read-check: `git diff tests/test_chorus_cache.py` shows additions only
+- [x] Read-check: `_save()` untouched by this task
 
 ## Task 2: Self-heal on the write path — `_save()`'s exception handler
 - [ ] `_save()` (:213) — `except (OSError, TypeError, ValueError)` → `except Exception as e`

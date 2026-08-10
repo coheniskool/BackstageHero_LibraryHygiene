@@ -118,23 +118,69 @@ class CachedChorusClient:
         self._retry_not_before = 0.0
         self._load()
 
+    def _reset(self):
+        """Empty the cache AND mark it for replacement on disk.
+
+        The dirty mark is the self-heal. Without it, a file we couldn't make
+        sense of survives every run that happens to have zero cache misses,
+        and we pay the same failed parse forever. Deliberately NOT used for a
+        read failure -- see _load()'s OSError branch.
+        """
+        self._entries = {}
+        self._dirty += 1
+
     def _load(self):
         if not self.cache_path or not self.cache_path.exists():
             return
+        # Handler ORDER is load-bearing: OSError must precede the catch-all,
+        # or the one branch that deliberately does NOT overwrite the file
+        # becomes unreachable.
         try:
+            # Parsed into a local and assigned only once the shape check
+            # passes, so no failure path can leave the instance holding a
+            # half-processed structure.
             with open(self.cache_path, encoding='utf-8') as f:
-                self._entries = json.load(f)
-        except (OSError, ValueError) as e:
+                entries = json.load(f)
+            if not isinstance(entries, dict):
+                # Valid JSON of the wrong shape. Unusable, not unreadable --
+                # reset AND replace, same as unparseable.
+                log.warning('Chorus cache %s is not an object; starting empty',
+                            self.cache_path)
+                self._reset()
+                return
+            self._entries = entries
+            self._compact()
+        except OSError as e:
+            # UNREADABLE, which is not evidence the file is BAD. WinError 32
+            # is transient-but-repeated here (SPEC-chorus-reliability-fix.md),
+            # and a concurrent process caught mid-os.replace looks identical.
+            # Overwriting a file we merely couldn't read THIS ONCE would
+            # replace a good cache with {} -- worse than the failure being
+            # handled. So: empty in memory, untouched on disk.
             log.warning('Could not read Chorus cache %s: %s', self.cache_path, e)
             self._entries = {}
-            return
-        if not isinstance(self._entries, dict):
-            # Valid JSON of the wrong shape. Same outcome as unparseable --
-            # start empty rather than let it fail later at the first lookup.
-            log.warning('Chorus cache %s is not an object; ignoring', self.cache_path)
-            self._entries = {}
-            return
-        self._compact()
+        except Exception as e:
+            # The backstop, and the point is to stop enumerating. Reaching
+            # here means the file could not be turned into a usable cache by
+            # any path we know. The verified case is RecursionError from
+            # deeply nested JSON (2026-08-10, Python 3.14.4: json.load raises
+            # it, and it is NOT a ValueError) -- unreachable from the API,
+            # since chorus_client.py caps responses at 1 MiB and catches bare
+            # Exception, so only a hand-crafted or corrupted disk file gets
+            # here.
+            #
+            # Before this, such a failure escaped __init__ before anything had
+            # been written, so the bad file was never pruned or replaced:
+            # enrichment died the same way every run until the user deleted
+            # the cache by hand. Under the GUI that happens on the daemon
+            # enrichment thread -- the app survives, the feature doesn't.
+            #
+            # Exception, NEVER BaseException: a Ctrl-C during the 0.80s
+            # json.load of a 126 MB file has to abort the run, not be
+            # swallowed at exactly the moment the user is trying to stop.
+            log.warning('Chorus cache %s is unusable (%s: %s); starting empty',
+                        self.cache_path, type(e).__name__, e)
+            self._reset()
 
     def _compact(self):
         """Drop entries the TTL already made unreachable, and trim legacy

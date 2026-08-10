@@ -363,3 +363,29 @@ def test_enrichment_error_is_not_masked_by_a_failing_final_flush(tmp_path, monke
 
     with pytest.raises(RuntimeError, match='Chorus went away mid-run'):
         le.enrich_library(tmp_path)
+
+
+def test_enrichment_survives_a_corrupt_chorus_cache(tmp_path, monkeypatch):
+    """The defect at the level the user actually experiences it.
+
+    A cache file that json.load can't handle used to raise out of
+    CachedChorusClient.__init__ -- before the first song, and before anything
+    had been written, so the bad file was never replaced and every later run
+    died the same way. Under the GUI that happens on a daemon thread: the app
+    keeps running and enrichment is just silently dead.
+
+    ~200,000 nested arrays is the RecursionError case (json.load raises it and
+    it is not a ValueError, so the old handler missed it) -- see
+    SPEC-chorus-cache-robustness.md.
+    """
+    _stub_chorus(monkeypatch, result={'name': 'Kryptonite', 'artist': '3 Doors Down'})
+    _make_song(tmp_path, '3 Doors Down - Kryptonite')
+    cache_path = tmp_path / le.CHORUS_CACHE_FILENAME
+    cache_path.write_text('[' * 200_000 + ']' * 200_000, encoding='utf-8')
+
+    summary = le.enrich_library(tmp_path)
+
+    assert summary['songs_processed'] == 1
+    # and the run healed the file on its way out
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 1
