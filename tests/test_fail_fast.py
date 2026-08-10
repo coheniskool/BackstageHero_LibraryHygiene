@@ -4,6 +4,7 @@
 # the app reported itself as running normally. Nothing here fixes an underlying
 # cause -- these tests pin the app's ability to *notice*.
 
+import sys
 import types
 from pathlib import Path
 
@@ -108,18 +109,94 @@ def test_consecutive_error_limit_is_a_sane_positive_int():
     assert 5 <= vd.CONSECUTIVE_ERROR_LIMIT <= 100
 
 
-def test_videodownload_calls_the_guard_right_after_importing_yt_dlp():
-    """The predicate is unit-testable; the *call* is import-time code that
-    pytest can never reach, so nothing else would fail if it were deleted.
-    Mirrors the source-presence check Task 1 of SPEC-cookie-fallback-fix.md
-    used for make_console_encoding_safe(), whose guard this one now sits
-    beside in library_common."""
+def test_videodownload_imports_yt_dlp_through_the_retrying_helper():
+    """The helper is unit-testable; the *call* is import-time code that pytest
+    can never reach, so nothing else would fail if it were deleted. Mirrors the
+    source-presence check Task 1 of SPEC-cookie-fallback-fix.md used for
+    make_console_encoding_safe(), whose guard this one sits beside.
+
+    Pinned as source text because a bare `import yt_dlp` would still leave a
+    working module bound at test time -- the regression this guards against
+    (reverting to the unretried import) is invisible at runtime on a healthy
+    machine and only shows up on the one launch in a hundred that hits the
+    antivirus hold."""
     source = (Path(library_common.__file__).parent / 'VideoDownload.py').read_text(
         encoding='utf-8')
-    assert 'library_common.assert_ytdlp_usable(yt_dlp)' in source
-    # Order matters: guarding before the import would be checking the wrong thing.
-    assert (source.index('import yt_dlp\n')
-            < source.index('library_common.assert_ytdlp_usable(yt_dlp)'))
+    assert 'yt_dlp = library_common.import_ytdlp()' in source
+    # The bare form is what this replaced; if it comes back the retry is dead
+    # code and the fault is fatal again.
+    assert '\nimport yt_dlp\n' not in source
+
+
+# --- Part A2: surviving the transient, not just announcing it --------------
+#
+# Five launches (2026-07-19, 08-05, 08-08, 08-09, 08-10) died on a yt_dlp that
+# imported as a namespace package. These pin the recovery, using a zero-length
+# backoff so the suite never actually sleeps.
+
+def _flaky_ytdlp(fail_times):
+    """import_module stand-in: returns a broken yt_dlp `fail_times` times, then
+    the real shape. Records how many times it was asked."""
+    calls = []
+
+    def fake_import(name):
+        calls.append(name)
+        if len(calls) <= fail_times:
+            return _module_missing_youtubedl()
+        good = types.ModuleType('yt_dlp')
+        good.YoutubeDL = object
+        return good
+
+    return fake_import, calls
+
+
+def test_import_ytdlp_recovers_when_the_hold_lifts_mid_backoff(monkeypatch):
+    fake_import, calls = _flaky_ytdlp(fail_times=2)
+    monkeypatch.setattr(library_common.importlib, 'import_module', fake_import)
+    mod = library_common.import_ytdlp(backoff=(0, 0, 0), sleep=lambda _s: None)
+    assert hasattr(mod, 'YoutubeDL')
+    assert len(calls) == 3          # two failures, then the one that worked
+
+
+def test_import_ytdlp_still_raises_when_the_hold_never_lifts(monkeypatch):
+    # Retrying makes the fault survivable, not impossible. A hold outlasting
+    # the backoff must still surface as the same actionable ImportError.
+    fake_import, calls = _flaky_ytdlp(fail_times=99)
+    monkeypatch.setattr(library_common.importlib, 'import_module', fake_import)
+    with pytest.raises(ImportError):
+        library_common.import_ytdlp(backoff=(0, 0), sleep=lambda _s: None)
+    assert len(calls) == 3          # the initial attempt plus both retries
+
+
+def test_import_ytdlp_does_not_sleep_on_a_healthy_import(monkeypatch):
+    # The whole backoff is paid only by a launch that already failed. A healthy
+    # machine must not eat a single second of it.
+    fake_import, _ = _flaky_ytdlp(fail_times=0)
+    monkeypatch.setattr(library_common.importlib, 'import_module', fake_import)
+    slept = []
+    library_common.import_ytdlp(backoff=(1, 2, 4), sleep=slept.append)
+    assert slept == []
+
+
+def test_import_ytdlp_clears_the_stale_module_and_the_directory_cache(monkeypatch):
+    """Both are load-bearing and neither is sufficient alone: a failed
+    namespace import leaves its module in sys.modules, and CPython's FileFinder
+    memoises the short directory listing that caused the fault. Skip either and
+    every retry re-serves the same broken result no matter how long the
+    antivirus hold has since lifted."""
+    invalidated = []
+    monkeypatch.setattr(library_common.importlib, 'invalidate_caches',
+                        lambda: invalidated.append(True))
+    fake_import, _ = _flaky_ytdlp(fail_times=1)
+    monkeypatch.setattr(library_common.importlib, 'import_module', fake_import)
+    monkeypatch.setitem(sys.modules, 'yt_dlp', _module_missing_youtubedl())
+    monkeypatch.setitem(sys.modules, 'yt_dlp.utils', types.ModuleType('yt_dlp.utils'))
+
+    library_common.import_ytdlp(backoff=(0,), sleep=lambda _s: None)
+
+    assert invalidated, 'retry reused the cached directory listing'
+    assert 'yt_dlp' not in sys.modules
+    assert 'yt_dlp.utils' not in sys.modules, 'submodules pin the broken parent'
 
 
 # --- Part B: consecutive-failure circuit breaker, default (foreground) run ---

@@ -57,13 +57,14 @@ def _setup_logging():
 
 log = _setup_logging()
 
-import yt_dlp
-
-# Same pattern as the two guards at the top of this file: the check lives in
+# Not a plain `import yt_dlp`: on five launches now that has come back as a
+# namespace package with no YoutubeDL, killing startup. import_ytdlp retries
+# through it and raises the same ImportError if it never clears. Same pattern
+# as the two guards at the top of this file -- the logic lives in
 # library_common so it can be unit-tested, since inline import-time code here
 # is unreachable under pytest and could be deleted without failing a test.
 # Deliberately not wrapped in try/except -- a caught guard is no guard.
-library_common.assert_ytdlp_usable(yt_dlp)
+yt_dlp = library_common.import_ytdlp()
 
 from tqdm import tqdm
 

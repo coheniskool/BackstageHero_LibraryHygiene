@@ -33,7 +33,44 @@ rem fault both incidents showed -- reports None here and leaves yt_dlp with no
 rem YoutubeDL attribute.
 "C:\Python314\pythonw.exe" -c "import sys, site, os, importlib.util as u; f=open('diag_out.txt','w'); f.write('executable=' + sys.executable + chr(10)); f.write('prefix=' + sys.prefix + chr(10)); f.write('cwd=' + os.getcwd() + chr(10)); f.write('ENABLE_USER_SITE=' + str(site.ENABLE_USER_SITE) + chr(10)); f.write('USER_SITE=' + str(site.getusersitepackages()) + chr(10)); f.write('USER_SITE_EXISTS=' + str(os.path.isdir(site.getusersitepackages())) + chr(10)); s=u.find_spec('customtkinter'); f.write('customtkinter=' + (s.origin if s else 'NOT FOUND') + chr(10)); y=u.find_spec('yt_dlp'); f.write('yt_dlp=' + (str(y.origin) if y else 'NOT FOUND') + chr(10)); f.write('sys.path=' + chr(10).join(sys.path) + chr(10)); f.close()" >> launch_log.txt 2>&1
 type diag_out.txt >> launch_log.txt 2>nul
+
+rem ---- say something NOW if the known fault is already visible ----
+rem
+rem The probe above detects the yt_dlp fault before the app ever runs, but
+rem until 2026-08-10 it only wrote that finding to a file nobody was watching.
+rem The 08-10 launch therefore looked, from the desktop, exactly like a
+rem shortcut that does nothing: no window, no error, for 3.5 minutes, and only
+rem then a notepad. Silence is the actual complaint -- the retry ladder below
+rem is worth keeping, but it must not run behind a blank screen.
+rem
+rem Fires only on the fault signature, so a healthy launch is untouched: no
+rem window, no file, nothing. 'yt_dlp=None' is the antivirus-hold shape (the
+rem directory resolved, __init__.py did not); 'NOT FOUND' is a genuinely
+rem missing install, which needs a different fix and so gets its own line.
+set BH_YTDLP_FAULT=
+findstr /c:"yt_dlp=None" diag_out.txt >nul 2>&1 && set BH_YTDLP_FAULT=hold
+findstr /c:"yt_dlp=NOT FOUND" diag_out.txt >nul 2>&1 && set BH_YTDLP_FAULT=missing
 del diag_out.txt 2>nul
+if not defined BH_YTDLP_FAULT goto :launch
+
+echo BackstageHero is starting, but the downloader (yt-dlp) is not importable > startup_notice.txt
+echo right now, so this launch may take a few minutes or fail outright. >> startup_notice.txt
+echo. >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo Cause: the yt_dlp folder is on disk but its __init__.py is not readable. >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo This is almost always antivirus holding the files while it scans them -- >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo yt-dlp is a downloader, so it trips those heuristics routinely. It clears >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo on its own, usually within a few minutes, and the app now retries through it. >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo. >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo To stop it recurring, exclude the folder from your antivirus. In an >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo ADMIN PowerShell: >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="hold" echo   Add-MpPreference -ExclusionPath "%APPDATA%\Python\Python314\site-packages\yt_dlp" >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="missing" echo Cause: yt-dlp is not installed for this interpreter at all. >> startup_notice.txt
+if "%BH_YTDLP_FAULT%"=="missing" echo Fix it with:  pip install -r requirements.txt >> startup_notice.txt
+echo. >> startup_notice.txt
+echo You can close this window; the app is still trying to start behind it. >> startup_notice.txt
+start "" notepad.exe startup_notice.txt
+
+:launch
 
 rem A crash on startup used to be completely silent: pythonw has no console, so
 rem a failed import meant no window, no message, nothing at all -- the only

@@ -5,6 +5,7 @@
 # where several of these existed as near-duplicates across two files -- this
 # module is the single home for them going forward.
 
+import importlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -191,6 +193,63 @@ def assert_ytdlp_usable(mod):
             'stale or half-written install, or a directory shadowing the real '
             'package; restarting normally clears it.'
             % getattr(mod, '__file__', 'an unknown path'))
+
+
+# Waits between import attempts, in seconds. Cumulative ~31s, all of it paid
+# only on a launch that already hit the fault -- a healthy import returns on
+# the first try having slept not at all.
+_YTDLP_IMPORT_BACKOFF = (1, 2, 4, 8, 16)
+
+
+def import_ytdlp(backoff=_YTDLP_IMPORT_BACKOFF, sleep=time.sleep):
+    """Import yt_dlp, retrying through the transient that makes it unimportable.
+
+    Five times now (2026-07-19, 08-05, 08-08, 08-09, 08-10) a launch has died
+    because `import yt_dlp` returned a namespace package: the yt_dlp directory
+    resolved but its __init__.py did not, so the module came back with no
+    YoutubeDL on it. Every occurrence cleared itself within minutes with
+    nothing reinstalled, and the package's own files were never modified --
+    on 08-10 __init__.py had been untouched on disk for three weeks.
+
+    The cause is outside this codebase: an antivirus hold on files inside the
+    package directory. Windows Defender logged a cloud-protection lookup 44
+    seconds before the 08-10 failure, and yt-dlp -- a downloader -- trips those
+    heuristics routinely. While the hold is on, listing the package directory
+    comes back short, and CPython's FileFinder treats a directory whose
+    __init__.py it cannot see as a namespace portion rather than an error.
+    That is why the failure is silent rather than a PermissionError, and why
+    re-probing minutes later from a shell never reproduced it.
+
+    So the import is retried rather than merely announced. invalidate_caches()
+    is the point of the exercise: FileFinder memoises directory listings per
+    path entry, so without it every retry inside this process would re-serve
+    the same short listing that failed the first time, no matter how long the
+    hold had since lifted. sys.modules is cleared alongside it because a failed
+    namespace import still leaves its module object behind, and a plain
+    `import yt_dlp` would hand that same broken object straight back.
+
+    Raises the same ImportError as assert_ytdlp_usable once the backoff is
+    spent -- retrying makes the fault survivable, not impossible, and a hold
+    outlasting ~31s still has to surface. Pass a shorter backoff to test it
+    without the wait.
+    """
+    last = None
+    for attempt, wait in enumerate((0,) + tuple(backoff)):
+        if wait:
+            sleep(wait)
+        # Both are needed and neither is sufficient: dropping the module alone
+        # re-imports through the stale directory cache, invalidating alone
+        # never re-reads because sys.modules short-circuits the import first.
+        if attempt:
+            for name in [n for n in sys.modules if n == 'yt_dlp'
+                         or n.startswith('yt_dlp.')]:
+                del sys.modules[name]
+            importlib.invalidate_caches()
+        last = importlib.import_module('yt_dlp')
+        if hasattr(last, 'YoutubeDL'):
+            return last
+    assert_ytdlp_usable(last)   # always raises; `last` failed the check above
+    return last                 # unreachable, kept so every path returns a module
 
 
 # --- File discovery -------------------------------------------------------
