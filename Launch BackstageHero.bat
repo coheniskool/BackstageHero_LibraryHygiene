@@ -50,31 +50,65 @@ echo --- actual app launch --- >> launch_log.txt
 echo ==== exited with code %ERRORLEVEL% at %DATE% %TIME% ==== >> launch_log.txt
 if %ERRORLEVEL% EQU 0 goto :done
 
-rem One retry, because the 2026-07-19 failure was an import that worked before
+rem Retries, because the 2026-07-19 failure was an import that worked before
 rem and after and could not be reproduced from a shell. A transient -- another
 rem Python process rewriting the bytecode cache, antivirus briefly locking a
 rem .pyc -- should not cost a launch.
-echo --- first attempt failed, retrying once --- >> launch_log.txt
-
-rem Wait before retrying. On 2026-08-08 both attempts failed 0.3s apart with the
-rem same namespace-package import of yt_dlp, so the retry burned its one chance
-rem inside the same instant that caused the fault. Nothing the retry exists to
-rem absorb -- an AV scan holding a .pyc, another process mid-rewrite of the
-rem bytecode cache -- clears that fast, which made the retry decorative.
+rem
+rem On 2026-08-08 both attempts failed 0.3s apart with the same
+rem namespace-package import of yt_dlp, so the single retry burned its one
+rem chance inside the same instant that caused the fault. A 5s wait was added,
+rem and 2026-08-09 then showed 5s too short as well: attempts at 20:02:28 and
+rem 20:02:33 both failed, and the very same pythonw.exe imported yt_dlp
+rem cleanly when re-probed at 20:15 with nothing reinstalled in between.
+rem
+rem That is the fourth occurrence (2026-07-19, 08-05, 08-08, 08-09) and the
+rem second in a restart-shaped context -- it clusters around a previous
+rem instance exiting, which fits __pycache__ rewriting or an AV scan holding
+rem files after process exit.
+rem
+rem ---- why a LADDER rather than one longer wait ----
+rem
+rem Nobody has ever recorded how long this condition actually persists: the
+rem launcher gave up after two attempts, so every occurrence only bounds it
+rem from below. 2026-08-09 is the sole data point with an upper bound too,
+rem and it is uselessly wide: somewhere between 5 seconds and 13 minutes.
+rem
+rem Three spaced retries fix that as a side effect of trying harder. Each
+rem attempt stamps its own time and exit code into launch_log.txt, so
+rem whichever one finally succeeds tells us the recovery window to within one
+rem interval -- the log becomes the instrument, with no separate probe to
+rem maintain and nothing extra to run on a healthy launch. Cumulative waits
+rem are 20s / 60s / 120s (~3.5 min worst case), and every second of it is
+rem paid only on a launch that had already failed twice.
 rem
 rem timeout is the readable choice but needs a real console; it aborts with
 rem "input redirection is not supported" when stdin is redirected, which is how
 rem this runs from a scheduler or a test harness. ping against loopback is the
 rem portable fallback and waits n-1 seconds.
-timeout /t 5 /nobreak >nul 2>&1 || ping -n 6 127.0.0.1 >nul 2>&1
 
+echo --- attempt 1 failed, retrying after 20s --- >> launch_log.txt
+timeout /t 20 /nobreak >nul 2>&1 || ping -n 21 127.0.0.1 >nul 2>&1
 "C:\Python314\pythonw.exe" gui.py >> launch_log.txt 2>&1
-echo ==== retry exited with code %ERRORLEVEL% at %DATE% %TIME% ==== >> launch_log.txt
+echo ==== attempt 2 exited with code %ERRORLEVEL% at %DATE% %TIME% ==== >> launch_log.txt
 if %ERRORLEVEL% EQU 0 goto :done
 
-rem Twice is not transient. Stop leaving the user to guess and show the log.
+echo --- attempt 2 failed, retrying after 40s --- >> launch_log.txt
+timeout /t 40 /nobreak >nul 2>&1 || ping -n 41 127.0.0.1 >nul 2>&1
+"C:\Python314\pythonw.exe" gui.py >> launch_log.txt 2>&1
+echo ==== attempt 3 exited with code %ERRORLEVEL% at %DATE% %TIME% ==== >> launch_log.txt
+if %ERRORLEVEL% EQU 0 goto :done
+
+echo --- attempt 3 failed, retrying after 60s --- >> launch_log.txt
+timeout /t 60 /nobreak >nul 2>&1 || ping -n 61 127.0.0.1 >nul 2>&1
+"C:\Python314\pythonw.exe" gui.py >> launch_log.txt 2>&1
+echo ==== attempt 4 exited with code %ERRORLEVEL% at %DATE% %TIME% ==== >> launch_log.txt
+if %ERRORLEVEL% EQU 0 goto :done
+
+rem Four times over ~3.5 minutes is not transient. Stop leaving the user to
+rem guess and show the log.
 echo. >> launch_log.txt
-echo BackstageHero could not start twice in a row. >> launch_log.txt
+echo BackstageHero could not start after 4 attempts over ~3.5 minutes. >> launch_log.txt
 echo Check the 'customtkinter=' and 'yt_dlp=' lines near the top of this log. >> launch_log.txt
 echo NOT FOUND means the library is missing: pip install -r requirements.txt >> launch_log.txt
 echo A yt_dlp of None means the package resolved without its __init__.py -- >> launch_log.txt

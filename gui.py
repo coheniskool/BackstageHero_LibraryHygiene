@@ -207,6 +207,66 @@ def _clear_background_state():
         pass
 
 
+# Adaptive-pacing bounds (SPEC-cookie-chain-and-pacing.md, Part B). Named here
+# rather than left as literals in _dl_thread because the live logic and the
+# restore-time clamp MUST use the same band -- if they drift, a resumed run
+# starts outside the range the loop can produce, which is the one way this
+# feature could make pacing worse instead of better.
+#
+# The ceiling was 6.0 until it was measured against a real run. pace only
+# scales the 1-3s inter-song gap (~2s mean), and the 2026-08-09 run's median
+# song cycle was 26.1s -- so the old ceiling could cut the request rate by at
+# most 28% (26.1s -> 36.1s per song), which is a weak brake for something that
+# only engages after YouTube has already pushed back twice. At 24.0 the gap
+# averages 48s, the cycle ~72s, and the rate drops ~64% (2.30 -> 0.83
+# songs/min).
+#
+# Not reachable by accident: escalation doubles, so 1.0 -> 24.0 takes five
+# separate throttle events, and the 0.7-per-8-clean-songs decay walks it back
+# to neutral over ~71 clean songs. A run that is going fine never sees it.
+_PACE_MIN = 0.5
+_PACE_MAX = 24.0
+_PACE_DEFAULT = 1.0
+
+
+def _window_title():
+    """The main window's titlebar text.
+
+    One function rather than a literal in two places: App.__init__ sets it and
+    the single-instance guard looks the window up BY it (FindWindowW takes an
+    exact string). When those were two copies of the same f-string, editing
+    the title in one place silently stopped the guard from ever finding the
+    window -- and the failure was invisible, because the guard falls back to a
+    message box and still blocks the second launch. Same source, no drift."""
+    return f'BackstageHero  v{__version__}'
+
+
+def _clamp_pace(value):
+    """A restored pace, forced into the band the live logic can actually
+    produce. Rationale mirrors VideoDownload._MIN_BACKOFF_SECONDS: this is a
+    floor on MACHINE SAFETY, not politeness. A corrupt or hand-edited state
+    file must not be able to yield a pace of 0 (an inter-song delay of zero,
+    i.e. a busy-loop hammering YouTube) or an absurd one (a run that looks
+    hung). Anything unparseable falls back to neutral rather than raising --
+    same defensive contract as _load_background_state itself."""
+    try:
+        pace = float(value)
+    except (TypeError, ValueError):
+        return _PACE_DEFAULT
+    if pace != pace:                      # NaN survives float() but not min/max
+        return _PACE_DEFAULT
+    return max(_PACE_MIN, min(_PACE_MAX, pace))
+
+
+def _clamp_clean_streak(value):
+    """Companion to _clamp_pace: a non-negative int, defaulting to 0."""
+    try:
+        streak = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, streak)
+
+
 def _validate_folder(path):
     """Returns (ok: bool, message: str)."""
     if not path or not os.path.isdir(path):
@@ -1870,7 +1930,7 @@ class App(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title(f'BackstageHero  v{__version__}')
+        self.title(_window_title())
         self.geometry('1020x680')
         # Width floor matches the footer's actual minimum content width (six
         # primary buttons + the progress/status area with its spacer column
@@ -2955,7 +3015,8 @@ class App(ctk.CTk):
             args=(targets, quality, replace, resync),
             daemon=True).start()
 
-    def _launch_background(self, targets, replace, resync):
+    def _launch_background(self, targets, replace, resync,
+                           pace=_PACE_DEFAULT, clean_streak=0):
         """Start an unattended background run: the same per-song download loop
         as _launch, but a YouTube throttle triggers a long, escalating backoff
         and an automatic resume instead of ending the run, and true completion
@@ -3001,25 +3062,34 @@ class App(ctk.CTk):
             'resync': resync,
             'remaining_folders': [s.folder for s in targets],
             'tool_dry_run': self._tool_dry_run_prefs(),
+            'pace': pace,
+            'clean_streak': clean_streak,
         })
-        log.info('Background mode started: %d target(s), replace=%s, resync=%s',
-                 len(targets), replace, resync)
+        log.info('Background mode started: %d target(s), replace=%s, resync=%s, '
+                 'pace=%.2f', len(targets), replace, resync, pace)
 
         threading.Thread(
             target=self._dl_thread,
             args=(targets, quality, replace, resync),
-            kwargs={'background_mode': True},
+            kwargs={'background_mode': True, 'pace': pace,
+                    'clean_streak': clean_streak},
             daemon=True).start()
 
-    def _dl_thread(self, targets, quality, replace, resync, background_mode=False):
+    def _dl_thread(self, targets, quality, replace, resync, background_mode=False,
+                   pace=_PACE_DEFAULT, clean_streak=0):
         total = len(targets)
         done = skipped = errors = 0
         # adaptive pacing: pause between songs that hit YouTube, scaled by how
         # the run is going. clean streaks creep the delay down, getting throttled
         # doubles it. skipped songs make no requests at all so they get no pause,
         # which is what makes re-runs over a mostly-done library fast.
-        pace = 1.0
-        clean_streak = 0
+        #
+        # pace/clean_streak arrive as parameters (rather than always starting
+        # at 1.0/0) so a resumed background run keeps what it learned. A resume
+        # usually FOLLOWS a throttle, so restarting at neutral meant going
+        # straight back to baseline speed at the worst possible moment -- this
+        # was the only adaptive signal in the project that did not survive a
+        # restart. Foreground runs never pass them and are unchanged.
         prev_hit_network = False
         # Background-mode-only long-backoff bookkeeping. Untouched (and never
         # read) on the default non-background path, whose behavior must stay
@@ -3072,13 +3142,13 @@ class App(ctk.CTk):
             prev_hit_network = result != 'skipped'
             if events:
                 # got pushed back this song, slow right down for a while
-                pace = min(pace * 2.0, 6.0)
+                pace = min(pace * 2.0, _PACE_MAX)
                 clean_streak = 0
             elif prev_hit_network:
                 clean_streak += 1
                 if clean_streak >= 8:
                     # going fine, ease off the brake a notch
-                    pace = max(pace * 0.7, 0.5)
+                    pace = max(pace * 0.7, _PACE_MIN)
                     clean_streak = 0
 
             if result == 'stop':
@@ -3093,7 +3163,8 @@ class App(ctk.CTk):
                 throttle_count, episode_started_at, stopped = \
                     self._handle_background_throttle(
                         s, i, total, targets, throttle_count,
-                        episode_started_at, done, skipped, errors)
+                        episode_started_at, done, skipped, errors, pace,
+                        clean_streak)
                 if stopped:
                     # Manual Stop fired mid-wait; background_stopped already
                     # posted. End the run, leaving background_state.json intact.
@@ -3152,7 +3223,7 @@ class App(ctk.CTk):
                 error_streak_count, stopped = \
                     self._handle_background_error_streak(
                         s, i, total, targets, error_streak_count, last_error,
-                        done, skipped, errors)
+                        done, skipped, errors, pace, clean_streak)
                 if stopped:
                     return
                 # Wait elapsed. Start counting again from zero and retry the
@@ -3184,7 +3255,8 @@ class App(ctk.CTk):
 
     def _handle_background_error_streak(self, s, i, total, targets,
                                         streak_count, last_error,
-                                        done, skipped, errors):
+                                        done, skipped, errors,
+                                        pace=_PACE_DEFAULT, clean_streak=0):
         """Background-mode-only: called when CONSECUTIVE_ERROR_LIMIT songs have
         failed back-to-back. Backs off on the long escalating schedule rather
         than ending the run -- background mode never gives up on its own.
@@ -3216,6 +3288,8 @@ class App(ctk.CTk):
             'phase': 'downloading',
             'resume_at': resume_at,
             'remaining_folders': [t.folder for t in targets[i:]],
+            'pace': pace,
+            'clean_streak': clean_streak,
         })
         _save_background_state(state)
         self._queue.put(('background_error_streak', s, i, total,
@@ -3233,7 +3307,8 @@ class App(ctk.CTk):
         return streak_count, False
 
     def _handle_background_throttle(self, s, i, total, targets, throttle_count,
-                                    episode_started_at, done, skipped, errors):
+                                    episode_started_at, done, skipped, errors,
+                                    pace, clean_streak=0):
         """Background-mode-only: called when a song returns 'stop'. Computes the
         long-backoff resume_at, persists state (before waiting -- a crash during
         the wait must not lose resume_at or which songs are still to do), posts
@@ -3259,11 +3334,17 @@ class App(ctk.CTk):
             'resume_at': resume_at,
             'throttle_count': throttle_count,
             'remaining_folders': [t.folder for t in targets[i:]],
+            'pace': pace,
+            'clean_streak': clean_streak,
         })
         _save_background_state(state)
         self._queue.put(('background_throttled', s, i, total, resume_at))
+        # pace is logged (not just resume_at/escalation step) so a future
+        # reader can tell whether the run was already backed off when YouTube
+        # pushed back -- the 2026-08-09 run had no way to answer that.
         log.info('Background mode: throttled on %s; resuming at unix %s '
-                 '(escalation step %d)', s.label, resume_at, throttle_count - 1)
+                 '(escalation step %d, pace %.2f)', s.label, resume_at,
+                 throttle_count - 1, pace)
         # Cancellable wait -- a manual Stop must still work mid-backoff.
         if self._stop_evt.wait(max(0, resume_at - now)):
             # Stopped during the long wait. End the background run cleanly but
@@ -3422,13 +3503,29 @@ class App(ctk.CTk):
         resume_at = state.get('resume_at')
         replace = bool(state.get('replace'))
         resync = bool(state.get('resync'))
+        # Restored verbatim (then clamped), not reset to neutral: a resume
+        # usually follows a throttle, so 1.0 would go straight back to
+        # baseline speed at the worst possible moment. A state file written
+        # before this feature existed has neither key and falls back to
+        # today's defaults -- the forward-compat case a real in-flight run
+        # will actually cross.
+        #
+        # Verbatim rather than verbatim-plus-a-penalty (the obvious
+        # alternative, since a resume follows a block that may not have
+        # lifted): a penalty would be a guess layered on a guess, and the
+        # error self-corrects within one song either way -- if YouTube is
+        # still blocking, the very next song throttles and doubles pace
+        # anyway. Resolved in SPEC-cookie-chain-and-pacing.md.
+        pace = _clamp_pace(state.get('pace', _PACE_DEFAULT))
+        clean_streak = _clamp_clean_streak(state.get('clean_streak', 0))
 
         self._running = True
         self._set_background_mode(True)
         self._stop_evt.clear()
         self._update_buttons()
         self._status_lbl.configure(text='Resuming background run...')
-        log.info('Background mode: resuming at startup, %d song(s) still pending', len(targets))
+        log.info('Background mode: resuming at startup, %d song(s) still '
+                 'pending, pace %.2f', len(targets), pace)
 
         def _worker():
             if resume_at is not None:
@@ -3448,11 +3545,13 @@ class App(ctk.CTk):
             # song will produce a new 'stop' and re-escalate normally through
             # the existing Task 11 logic -- a reasonable, simple tradeoff, not
             # a bug to fix.
-            self.after(0, lambda: self._finish_resume_and_launch(targets, replace, resync))
+            self.after(0, lambda: self._finish_resume_and_launch(
+                targets, replace, resync, pace, clean_streak))
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _finish_resume_and_launch(self, targets, replace, resync):
+    def _finish_resume_and_launch(self, targets, replace, resync,
+                                  pace=_PACE_DEFAULT, clean_streak=0):
         """Bounced onto the main thread via self.after(0, ...) so there's no
         cross-thread race with _launch_background's own state (Tkinter
         callbacks are single-threaded).
@@ -3465,9 +3564,11 @@ class App(ctk.CTk):
         cleanly. _launch_background then re-sets self._running = True itself
         and saves a fresh background_state.json snapshot (new
         remaining_folders, throttle_count reset to 0, resume_at reset to None)
-        exactly as it does for a fresh Start-click."""
+        exactly as it does for a fresh Start-click -- but carrying the restored
+        pace/clean_streak through, so the one thing a resume must NOT reset
+        survives that fresh snapshot."""
         self._running = False
-        self._launch_background(targets, replace, resync)
+        self._launch_background(targets, replace, resync, pace, clean_streak)
 
     def _on_resume_wait_stopped(self):
         """A manual Stop pressed during the pre-resume wait. background_state.json
@@ -3693,6 +3794,105 @@ class App(ctk.CTk):
         super().destroy()
 
 
+# --- single-instance guard (SPEC-launch-reliability.md) ---------------------
+#
+# Nothing used to stop a second instance, and App.__init__ schedules
+# _maybe_resume_background -- so a stray double-click during a multi-day
+# background run put two processes on the same background_state.json, each
+# overwriting the other's remaining_folders. _save_background_state is atomic
+# per write, which does not help at all when the two writers disagree about
+# what is left to do: the last one wins and the other's progress is lost.
+#
+# A named mutex, deliberately NOT a PID lock file: Windows releases a mutex
+# when the process dies by ANY means -- crash, kill, power loss. A lock file
+# has to encode staleness detection and gets it wrong in exactly the case
+# that matters, leaving a hard-killed app with a lock nobody can clear. A
+# guard that can stop the app starting is worse than no guard at all.
+_SINGLE_INSTANCE_MUTEX = None
+# Unprefixed == per-user (the Local\ namespace), NOT Global\. Global\ would
+# also block a second instance running as a DIFFERENT Windows user, which is
+# the wrong policy: two users on one machine have separate settings.json,
+# separate background_state.json and separate libraries, so they are not the
+# collision this guard exists to prevent. Global\ can also require
+# SeCreateGlobalPrivilege, which would make the guard fail (and fall back to
+# starting normally) in exactly the hardened environments where it is least
+# expected.
+_SINGLE_INSTANCE_MUTEX_NAME = 'BackstageHero.SingleInstance'
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _win32():
+    """The Win32 surface the single-instance guard needs, behind one seam.
+
+    Fetched through a function rather than called inline so tests can
+    substitute a fake: acquiring a REAL named mutex inside pytest would make
+    the test process itself hold it for its whole life, poisoning every later
+    test and any concurrent run of the suite."""
+    import ctypes
+    return ctypes.windll
+
+
+def _focus_existing_instance(win32):
+    """Bring the already-running instance's window to the front. Returns True
+    if a window was found and raised.
+
+    Looks the window up by exact title via _window_title(), the same function
+    App.__init__ sets it with -- so the two cannot drift. The embedded
+    __version__ is not a hazard in practice: both instances are the same code
+    at the same version, and a mismatch could only happen if two different
+    builds were launched side by side."""
+    hwnd = win32.user32.FindWindowW(None, _window_title())
+    if not hwnd:
+        return False
+    win32.user32.ShowWindow(hwnd, 9)          # SW_RESTORE (un-minimize)
+    win32.user32.SetForegroundWindow(hwnd)
+    return True
+
+
+def _acquire_single_instance_lock():
+    """True if this process may start, False if another instance already owns
+    the lock (in which case that instance has been focused or the user has
+    been told, and this process should exit 0).
+
+    Any failure of the Win32 calls themselves starts the app normally."""
+    global _SINGLE_INSTANCE_MUTEX
+    try:
+        win32 = _win32()
+        handle = win32.kernel32.CreateMutexW(None, False,
+                                             _SINGLE_INSTANCE_MUTEX_NAME)
+        already_running = bool(handle) and (
+            win32.kernel32.GetLastError() == _ERROR_ALREADY_EXISTS)
+    except Exception as e:
+        log.warning('Single-instance check unavailable (%s); starting normally.', e)
+        return True
+
+    if not already_running:
+        # Module-level, never a local: a garbage-collected handle releases the
+        # mutex and the guard silently stops working partway through the run.
+        _SINGLE_INSTANCE_MUTEX = handle
+        return True
+
+    log.info('Another BackstageHero instance is already running; '
+             'focusing it instead of starting a second one.')
+    try:
+        focused = _focus_existing_instance(win32)
+    except Exception:
+        focused = False
+    if not focused:
+        # Never exit silently -- a double-click that appears to do nothing is
+        # the exact failure mode the launcher's whole diagnostic apparatus
+        # exists to avoid.
+        try:
+            win32.user32.MessageBoxW(
+                None,
+                'BackstageHero is already running.\n\n'
+                'Check the taskbar for the existing window.',
+                'BackstageHero', 0x40)          # MB_ICONINFORMATION
+        except Exception:
+            pass
+    return False
+
+
 def run():
     """Called from VideoDownload.__main__ when running as the frozen exe."""
     # Tell Windows to group this process under its own taskbar identity,
@@ -3702,6 +3902,17 @@ def run():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('BackstageHero.App')
     except Exception:
         pass
+
+    # Before App() on purpose: App.__init__ schedules _maybe_resume_background,
+    # and a second instance must never reach the code that auto-resumes a
+    # background run.
+    if not _acquire_single_instance_lock():
+        # Exit 0, NOT non-zero. "Launch BackstageHero.bat" retries on a
+        # non-zero %ERRORLEVEL% and then opens launch_log.txt in notepad -- a
+        # blocked second instance exiting non-zero would be retried, blocked
+        # again, and would tell the user their app "could not start twice in a
+        # row", turning this guard into a false alarm.
+        sys.exit(0)
 
     updater._cleanup_old_exe()   # fast, no network, fine to call at startup
 

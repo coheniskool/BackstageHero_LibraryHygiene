@@ -138,3 +138,64 @@ def test_clear_when_no_file_exists_is_a_silent_no_op(state_file):
     gui._clear_background_state()  # must not raise
 
     assert gui._load_background_state() == {}
+
+
+# --- adaptive pacing survives a restart (SPEC-cookie-chain-and-pacing.md, B)
+#
+# pace/clean_streak used to be locals in _dl_thread, so every resume restarted
+# at 1.0/0 -- and a resume usually FOLLOWS a throttle, so that meant going
+# straight back to baseline speed at the worst possible moment. It was the
+# only adaptive signal in the project that did not survive a restart.
+
+def test_pace_and_clean_streak_round_trip(state_file):
+    state = dict(SAMPLE_STATE, pace=2.8, clean_streak=5)
+    gui._save_background_state(state)
+
+    loaded = gui._load_background_state()
+
+    assert loaded['pace'] == 2.8
+    assert loaded['clean_streak'] == 5
+
+
+def test_missing_pace_keys_load_at_todays_defaults(state_file):
+    """Forward compatibility, and the case a real user will actually hit: a
+    state file written by the previous version has neither key, and an
+    in-flight run must cross this change without erroring."""
+    gui._save_background_state(SAMPLE_STATE)          # no pace/clean_streak
+
+    loaded = gui._load_background_state()
+
+    assert 'pace' not in loaded
+    assert gui._clamp_pace(loaded.get('pace', gui._PACE_DEFAULT)) == gui._PACE_DEFAULT
+    assert gui._clamp_clean_streak(loaded.get('clean_streak', 0)) == 0
+
+
+@pytest.mark.parametrize('bad, expected', [
+    (0, gui._PACE_MIN),          # a zero pace means a zero delay: a busy-loop
+    (-1, gui._PACE_MIN),
+    (999, gui._PACE_MAX),        # a run that would look hung
+    (float('inf'), gui._PACE_MAX),
+    ('fast', gui._PACE_DEFAULT),  # unparseable -> neutral, never raises
+    (None, gui._PACE_DEFAULT),
+    (float('nan'), gui._PACE_DEFAULT),
+])
+def test_out_of_band_pace_is_clamped(bad, expected):
+    assert gui._clamp_pace(bad) == expected
+
+
+@pytest.mark.parametrize('bad, expected', [
+    (-1, 0), (-99, 0), ('nope', 0), (None, 0), (7, 7), (2.9, 2),
+])
+def test_out_of_band_clean_streak_is_clamped(bad, expected):
+    assert gui._clamp_clean_streak(bad) == expected
+
+
+def test_clamp_band_matches_the_band_the_live_logic_produces():
+    """The clamp and _dl_thread's own min()/max() must use the SAME bounds --
+    if they drift, a resumed run starts outside the range the loop can reach,
+    which is the one way this feature could make pacing worse."""
+    import inspect
+    source = inspect.getsource(gui.App._dl_thread)
+    assert '_PACE_MAX' in source
+    assert '_PACE_MIN' in source
+    assert gui._PACE_MIN < gui._PACE_DEFAULT < gui._PACE_MAX
