@@ -31,9 +31,19 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      # ffmpeg/ffprobe is a real runtime dependency of this app, not a test
+      # nicety, and the runner image does not ship it. Without it five tests
+      # fail rather than skip -- test_probe_audio_duration_ms_real_ffprobe,
+      # three chart_rename stem-duration tests, and the audiosync offset test
+      # ("could not decode audio"). They assume the binary the way the app
+      # does. Installing it is the honest fix; skipping them in CI would make
+      # the suite green by testing less than the developer's machine does.
+      - name: Install ffmpeg
+        run: choco install ffmpeg -y --no-progress
+
+      - uses: actions/setup-python@v6
         with:
           # Matches the interpreter this project is developed and shipped
           # against; requirements.txt is unpinned, so the Python version is
