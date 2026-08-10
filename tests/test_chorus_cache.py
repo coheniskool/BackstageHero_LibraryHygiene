@@ -113,6 +113,7 @@ def test_disk_cache_persists_across_instances(tmp_path, monkeypatch):
 
     first_client = cc.CachedChorusClient(cache_path=cache_path)
     first_client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    first_client.flush()  # writes are batched now -- see SPEC-chorus-cache-write-perf.md
     assert cache_path.exists()
 
     second_client = cc.CachedChorusClient(cache_path=cache_path)
@@ -135,18 +136,28 @@ def test_corrupt_disk_cache_is_ignored_not_raised(tmp_path, monkeypatch):
 
 def test_disk_write_failure_does_not_raise(tmp_path, monkeypatch):
     """A convenience cache must never cost the user the ability to run
-    enrichment -- matches _export_library_csv's own philosophy."""
+    enrichment -- matches _export_library_csv's own philosophy.
+
+    The explicit flush() is load-bearing, not decoration: writes are batched
+    now, so a single lookup writes nothing and this test would pass without
+    ever entering the failing-open path -- green, and asserting nothing.
+    """
     calls = []
     _stub(monkeypatch, calls, result=_RESULT_A)
     cache_path = tmp_path / 'chorus_cache.json'
 
+    attempts = []
+
     def _denied(*a, **k):
+        attempts.append(1)
         raise OSError(13, 'Permission denied')
     monkeypatch.setattr('builtins.open', _denied)
 
     client = cc.CachedChorusClient(cache_path=cache_path)
     result = client.search_by_artist_title('3 Doors Down', 'Kryptonite')  # must not raise
+    client.flush()  # must not raise either
     assert result == _RESULT_A
+    assert attempts, 'the failing-open path was never exercised'
 
 
 def test_disk_cache_written_as_valid_json(tmp_path, monkeypatch):
@@ -155,6 +166,159 @@ def test_disk_cache_written_as_valid_json(tmp_path, monkeypatch):
     cache_path = tmp_path / 'chorus_cache.json'
     client = cc.CachedChorusClient(cache_path=cache_path)
     client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    client.flush()  # writes are batched now -- see SPEC-chorus-cache-write-perf.md
     with open(cache_path, encoding='utf-8') as f:
         data = json.load(f)
     assert isinstance(data, dict)
+
+
+# --- Batched-write behavior (SPEC-chorus-cache-write-perf.md) ----------------
+# Before this, search_by_artist_title() called _save() after every miss, and
+# _save() re-serializes the WHOLE dict: measured 2026-08-10 against the live
+# cache, that was a 126.42 MB rewrite and 0.75s of json.dumps per song, over a
+# ~7,800-song library. These tests pin the batching that replaced it.
+
+
+def _count_saves(monkeypatch):
+    """Record every completed atomic write by wrapping os.replace -- _save()'s
+    last step. Counting the write itself rather than calls to _save() keeps
+    these assertions about observable disk behavior, not internal structure."""
+    saves = []
+    real_replace = cc.os.replace
+
+    def counting_replace(src, dst):
+        saves.append(dst)
+        return real_replace(src, dst)
+    monkeypatch.setattr(cc.os, 'replace', counting_replace)
+    return saves
+
+
+def test_writes_are_batched_not_per_lookup(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 100)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    for i in range(10):
+        client.search_by_artist_title(f'Artist {i}', 'Title')
+
+    assert saves == [], 'ten lookups under the batch threshold must not write'
+
+    client.flush()
+    assert len(saves) == 1
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 10  # one write, all ten entries
+
+
+def test_flush_happens_after_n_inserts(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 3)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    client.search_by_artist_title('Artist 1', 'Title')
+    client.search_by_artist_title('Artist 2', 'Title')
+    assert saves == []
+
+    client.search_by_artist_title('Artist 3', 'Title')  # crosses the threshold
+    assert len(saves) == 1
+
+
+def test_flush_happens_after_time_threshold(tmp_path, monkeypatch):
+    """A slow, rate-limited run trickles in one lookup at a time and would
+    never reach the insert threshold -- the time bound is what caps how much
+    such a run can lose to a kill."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 100)
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(cc.time, 'time', lambda: fake_now[0])
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    client.search_by_artist_title('Artist 1', 'Title')
+    assert saves == []
+
+    fake_now[0] += cc.FLUSH_EVERY_SECONDS + 1
+    client.search_by_artist_title('Artist 2', 'Title')
+    assert len(saves) == 1
+
+
+def test_flush_with_nothing_pending_is_a_noop(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    client.flush()
+    client.flush()
+
+    assert saves == []
+    assert not cache_path.exists()
+
+
+def test_failed_save_keeps_dirty_window_for_retry(tmp_path, monkeypatch):
+    """A failed write must not clear the pending window -- otherwise a
+    transient error silently discards up to FLUSH_EVERY_N_INSERTS entries
+    that were never written anywhere."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 100)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+
+    real_open = open
+    fail = [True]
+
+    def flaky_open(*a, **k):
+        if fail[0]:
+            raise OSError(13, 'Permission denied')
+        return real_open(*a, **k)
+    monkeypatch.setattr('builtins.open', flaky_open)
+
+    client.flush()  # fails, must not raise
+    assert not cache_path.exists()
+
+    fail[0] = False
+    client.flush()  # the entry must still be pending, and land this time
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 1
+
+
+def test_failed_save_does_not_retry_on_every_lookup(tmp_path, monkeypatch):
+    """The known real write failure here is WinError 32 (see
+    SPEC-chorus-reliability-fix.md) -- transient, but repeated. Keeping the
+    dirty window means _dirty stays over the threshold, so without pacing
+    every subsequent lookup would re-attempt a failing write."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 1)
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(cc.time, 'time', lambda: fake_now[0])
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    attempts = []
+
+    def _denied(*a, **k):
+        attempts.append(1)
+        raise OSError(13, 'Permission denied')
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    monkeypatch.setattr('builtins.open', _denied)
+
+    for i in range(5):
+        client.search_by_artist_title(f'Artist {i}', 'Title')
+    assert len(attempts) == 1, 'only the first failure should have been attempted'
+
+    fake_now[0] += cc.FLUSH_EVERY_SECONDS + 1
+    client.search_by_artist_title('Artist 9', 'Title')
+    assert len(attempts) == 2, 'the retry should resume at the time threshold'

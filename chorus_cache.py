@@ -22,6 +22,21 @@ log = logging.getLogger('backstagehero')
 DEFAULT_TTL_DAYS = 7
 _SECONDS_PER_DAY = 86400
 
+# Batched-write thresholds (SPEC-chorus-cache-write-perf.md). Measured against
+# the live cache on 2026-08-10: 126.42 MB across 7,743 entries, 0.75s just to
+# json.dumps it -- and _save() rewrote all of it after every single lookup, so
+# a full pass over the ~7,800-song library meant hours of serialization and
+# close to a terabyte of writes to persist a few hundred KB of metadata.
+#
+# These numbers bound WORST-CASE ENTRY LOSS ON A KILL, not throughput. Once
+# the file is small a flush costs single-digit milliseconds, so the only
+# question they answer is "how much re-lookup does an abrupt exit cost?" --
+# 25 entries is a few seconds of re-work on the next run. The time bound is
+# what covers a slow, rate-limited run that trickles in roughly one lookup a
+# minute and would otherwise never reach the insert threshold at all.
+FLUSH_EVERY_N_INSERTS = 25
+FLUSH_EVERY_SECONDS = 60
+
 
 def _cache_key(artist, title):
     return (library_common.normalize_lookup_value(artist)
@@ -40,7 +55,15 @@ class CachedChorusClient:
         self.cache_path = Path(cache_path) if cache_path else None
         self.ttl_seconds = ttl_days * _SECONDS_PER_DAY
         self._entries = {}
+        # Counts unpersisted changes. MUST be initialized before _load(),
+        # which sets it when it drops or rewrites what it read -- that mark is
+        # how a shrunken cache reaches disk. Moving this below _load() would
+        # silently discard it and the file would never actually shrink.
+        self._dirty = 0
         self._load()
+        self._last_flush = time.time()
+        # Set after a failed write to pace the retry -- see _save().
+        self._retry_not_before = 0.0
 
     def _load(self):
         if not self.cache_path or not self.cache_path.exists():
@@ -53,8 +76,17 @@ class CachedChorusClient:
             self._entries = {}
 
     def _save(self):
+        """Atomic write (temp file + os.replace), returning True if the cache
+        reached disk.
+
+        Batching changed WHEN we write, never HOW. An enrichment pass can span
+        days, so a crash or forced-close mid-write must leave the previous
+        valid cache intact, never a half-written one the next run would parse
+        and trust -- the same reasoning gui.py's _save_background_state spells
+        out for background_state.json.
+        """
         if not self.cache_path:
-            return
+            return False
         tmp_path = self.cache_path.with_name(self.cache_path.name + '.tmp')
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -62,6 +94,39 @@ class CachedChorusClient:
             os.replace(tmp_path, self.cache_path)
         except OSError as e:
             log.warning('Could not write Chorus cache %s: %s', self.cache_path, e)
+            # _dirty deliberately survives: the pending window is retried, not
+            # discarded. But that leaves _dirty over the threshold, so without
+            # pacing every later lookup would re-attempt a failing write --
+            # and the known real failure here (WinError 32, see
+            # SPEC-chorus-reliability-fix.md) is transient but repeated.
+            self._retry_not_before = time.time() + FLUSH_EVERY_SECONDS
+            return False
+        self._dirty = 0
+        self._last_flush = time.time()
+        return True
+
+    def _maybe_flush(self):
+        """Persist only once the pending batch is big enough or old enough."""
+        if not self.cache_path or not self._dirty:
+            return
+        if time.time() < self._retry_not_before:
+            return
+        if (self._dirty >= FLUSH_EVERY_N_INSERTS
+                or (time.time() - self._last_flush) >= FLUSH_EVERY_SECONDS):
+            self._save()
+
+    def flush(self):
+        """Persist pending entries now. A caller doing a run of lookups must
+        call this when the run ends -- the batch thresholds alone would leave
+        the run's final partial batch unwritten.
+
+        Cheap and safe to call repeatedly; a no-op when nothing is pending.
+        Unlike _maybe_flush() this ignores the post-failure retry pacing: a
+        paced retry must not cause a run's last chance to write to be skipped.
+        """
+        if not self.cache_path or not self._dirty:
+            return
+        self._save()
 
     def search_by_artist_title(self, artist, title, force=False):
         key = _cache_key(artist, title)
@@ -72,5 +137,6 @@ class CachedChorusClient:
 
         result = chorus_client.search_by_artist_title(artist, title)
         self._entries[key] = {'result': result, 'cached_at': time.time()}
-        self._save()
+        self._dirty += 1
+        self._maybe_flush()
         return result

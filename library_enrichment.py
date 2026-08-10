@@ -194,26 +194,35 @@ def enrich_library(library_path, ch_data_path=None, dry_run=False, force=False,
     new_data_written = 0
     problems_found = 0
 
-    for folder in library_common.iter_song_folders(library_path):
-        chart_hash, result = _enrich_one_song(folder, client, scoredata)
+    try:
+        for folder in library_common.iter_song_folders(library_path):
+            chart_hash, result = _enrich_one_song(folder, client, scoredata)
 
-        if chart_hash is None:
-            problems_found += 1
+            if chart_hash is None:
+                problems_found += 1
+                if verbose:
+                    log.warning('%s: %s', folder, '; '.join(result))
+                continue
+
+            if not force and chart_hash in sidecar['songs']:
+                songs_skipped += 1
+                continue
+
+            songs_processed += 1
+            new_data_written += 1
+            if result['problems']:
+                problems_found += 1
+            sidecar['songs'][chart_hash] = result
             if verbose:
-                log.warning('%s: %s', folder, '; '.join(result))
-            continue
-
-        if not force and chart_hash in sidecar['songs']:
-            songs_skipped += 1
-            continue
-
-        songs_processed += 1
-        new_data_written += 1
-        if result['problems']:
-            problems_found += 1
-        sidecar['songs'][chart_hash] = result
-        if verbose:
-            log.info('%s: enriched (%d problems)', folder, len(result['problems']))
+                log.info('%s: enriched (%d problems)', folder, len(result['problems']))
+    finally:
+        # The run owns the final flush -- Chorus cache writes are batched now
+        # (SPEC-chorus-cache-write-perf.md), so the thresholds alone would
+        # leave this run's last partial batch unwritten. In a `finally`
+        # because the GUI calls this on a daemon thread: app close, and any
+        # mid-run exception, must not throw away lookups already paid for.
+        # They are the expensive part of the run.
+        client.flush()
 
     sidecar['scanned_at'] = _utcnow_iso()
 

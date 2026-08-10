@@ -4,6 +4,8 @@
 
 import json
 
+import pytest
+
 import library_enrichment as le
 import resolver_client
 
@@ -281,3 +283,61 @@ def test_enrich_library_high_score_is_max_across_scored_instruments(tmp_path, mo
     assert entry['score_detail']['instruments']['lead']['score'] == 500000
     assert entry['score_detail']['instruments']['bass']['score'] == 200000
     assert 'high_score_streak' not in entry  # removed -- no such field exists in the real format
+
+
+# --- Chorus cache flush at end of run (SPEC-chorus-cache-write-perf.md) ------
+# Writes are batched now, so enrich_library() owns the final flush. Without it
+# a run's last partial batch is lost -- and the GUI's enrichment thread is a
+# daemon thread, so app close is a real path where the loop never finishes.
+
+
+def _no_batch_flush(monkeypatch):
+    """Push both flush thresholds out of reach so only an explicit flush()
+    can have written the cache file -- otherwise these tests would pass on a
+    mid-run threshold crossing and prove nothing about the final flush."""
+    monkeypatch.setattr(le.chorus_cache, 'FLUSH_EVERY_N_INSERTS', 10_000)
+    monkeypatch.setattr(le.chorus_cache, 'FLUSH_EVERY_SECONDS', 10_000)
+
+
+def test_enrichment_flushes_cache_at_end_of_run(tmp_path, monkeypatch):
+    _no_batch_flush(monkeypatch)
+    _stub_chorus(monkeypatch, result={'name': 'Kryptonite', 'artist': '3 Doors Down'})
+    _make_song(tmp_path, '3 Doors Down - Kryptonite')
+
+    le.enrich_library(tmp_path)
+
+    cache_path = tmp_path / le.CHORUS_CACHE_FILENAME
+    assert cache_path.exists()
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 1
+
+
+def test_enrichment_flushes_cache_even_on_error(tmp_path, monkeypatch):
+    """A multi-day unattended run that dies partway must not throw away the
+    Chorus lookups it already paid for -- they are the expensive part."""
+    _no_batch_flush(monkeypatch)
+    # Distinct name/artist per song: the cache is keyed on those, so two songs
+    # sharing the default INI_TEXT would collide on one key and the second
+    # lookup would be served from cache instead of reaching the stub.
+    _make_song(tmp_path, 'A Band - First Song',
+                ini_text='[song]\nname = First Song\nartist = A Band\n')
+    _make_song(tmp_path, 'B Band - Second Song',
+                ini_text='[song]\nname = Second Song\nartist = B Band\n')
+
+    lookups = []
+
+    def exploding_search(artist, title):
+        lookups.append((artist, title))
+        if len(lookups) > 1:
+            raise RuntimeError('Chorus went away mid-run')
+        return {'name': 'First Song', 'artist': 'A Band'}
+    monkeypatch.setattr(le.chorus_cache.chorus_client, 'search_by_artist_title',
+                         exploding_search)
+
+    with pytest.raises(RuntimeError):
+        le.enrich_library(tmp_path)
+
+    cache_path = tmp_path / le.CHORUS_CACHE_FILENAME
+    assert cache_path.exists()
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 1  # the first song's lookup survived
