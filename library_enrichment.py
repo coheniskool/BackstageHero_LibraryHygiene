@@ -218,10 +218,16 @@ def enrich_library(library_path, ch_data_path=None, dry_run=False, force=False,
     finally:
         # The run owns the final flush -- Chorus cache writes are batched now
         # (SPEC-chorus-cache-write-perf.md), so the thresholds alone would
-        # leave this run's last partial batch unwritten. In a `finally`
-        # because the GUI calls this on a daemon thread: app close, and any
-        # mid-run exception, must not throw away lookups already paid for.
-        # They are the expensive part of the run.
+        # leave this run's last partial batch unwritten, and those lookups are
+        # the expensive part of the run.
+        #
+        # The `finally` covers a mid-run exception. It does NOT cover app
+        # close: the GUI runs this on a daemon thread, and a daemon thread is
+        # killed at interpreter shutdown without unwinding, so this block
+        # never executes there. What bounds that case is chorus_cache's
+        # FLUSH_EVERY_SECONDS -- at most a minute of lookups is lost. Do not
+        # "strengthen" this into an atexit hook on the strength of that gap;
+        # the loss is bounded and every entry is recomputable.
         client.flush()
 
     sidecar['scanned_at'] = _utcnow_iso()

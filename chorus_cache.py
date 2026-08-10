@@ -84,6 +84,14 @@ class CachedChorusClient:
 
     Writes are batched, so a caller doing a run of lookups must flush() when
     the run ends.
+
+    ttl_days is DESTRUCTIVE, not advisory: _compact() drops expired entries at
+    load and the shrunken form is written back, so constructing this against a
+    shared cache_path with a shorter ttl_days than another caller uses will
+    permanently delete entries that caller would still have served. Harmless
+    today -- library_enrichment.enrich_library() is the only construction site
+    and takes the default -- but pass a custom ttl_days against a shared file
+    only if you mean to prune it for everyone.
     """
 
     def __init__(self, cache_path=None, ttl_days=DEFAULT_TTL_DAYS):
@@ -161,17 +169,20 @@ class CachedChorusClient:
             self._dirty += 1
 
     def _save(self):
-        """Atomic write (temp file + os.replace), returning True if the cache
-        reached disk.
+        """Atomic write (temp file + os.replace).
 
         Batching changed WHEN we write, never HOW. An enrichment pass can span
         days, so a crash or forced-close mid-write must leave the previous
         valid cache intact, never a half-written one the next run would parse
         and trust -- the same reasoning gui.py's _save_background_state spells
         out for background_state.json.
+
+        Deliberately returns nothing: a write failure is already logged, and
+        no caller has anything useful to do about it -- this is a convenience
+        cache, and a run must never fail because it couldn't persist one.
         """
         if not self.cache_path:
-            return False
+            return
         tmp_path = self.cache_path.with_name(self.cache_path.name + '.tmp')
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -185,10 +196,9 @@ class CachedChorusClient:
             # and the known real failure here (WinError 32, see
             # SPEC-chorus-reliability-fix.md) is transient but repeated.
             self._retry_not_before = time.time() + FLUSH_EVERY_SECONDS
-            return False
+            return
         self._dirty = 0
         self._last_flush = time.time()
-        return True
 
     def _maybe_flush(self):
         """Persist only once the pending batch is big enough or old enough."""

@@ -209,6 +209,12 @@ Explicitly **not** in scope as a test: a live run against the real 126 MB cache.
 2. **Should `flush()` also be called periodically by the GUI's enrichment thread**, independent of `enrich_library()`'s `finally`? The 60-second time threshold already covers this, so probably not — flagged only because a daemon thread killed at app close is the one path where "the finally never ran" is real, and the time bound is what caps the damage there.
 3. **Should a prune-only-no-writes run still shrink the file?** As specced, yes: a load that prunes marks the cache dirty, so even a run with zero cache misses rewrites the shrunken file once. Alternative is to only shrink lazily when something else is already dirty. Chose eager because the whole point is bounding the file, and one 34 MB write once is a rounding error against what this spec removes.
 
+4. **Cross-process concurrency, revisited** (raised at code review, 2026-08-10). SPEC-chorus-reliability-fix.md left GUI + CLI `library_enricher.py` racing on the same library as its own Open Question 1, and this spec does not close it either. Batching does move the needle slightly in the wrong direction: each process now holds up to `FLUSH_EVERY_N_INSERTS` entries in memory rather than on disk, so a concurrent whole-file `os.replace` discards those too.
+
+   Recorded rather than fixed, because the honest magnitude is small: the dominant loss in that race has always been the whole-file clobber itself — the losing process's entire dict is replaced regardless — and 25 additional entries is a rounding error on top of a total loss. It is not a new failure mode, only marginally more of an existing one. If cross-process protection is ever built, it belongs in one place covering both specs, not bolted onto this one.
+
+5. **`ttl_days` is destructive** (raised at code review, 2026-08-10). Because `_compact()` prunes at load and the result is written back, constructing a client with a shorter `ttl_days` against a shared cache file permanently deletes entries a default-TTL caller would still have served. Latent today — `enrich_library()` is the only construction site and takes the default — and now stated in the class docstring. Flagged here because it is a data-loss-shaped consequence of prune-on-load that the original spec did not anticipate.
+
 ---
 
 **Next phase**: `/plan` → `tasks/plan-chorus-cache-write-perf.md` (chorus_cache batching + prune + trim, then the library_enrichment flush, then the three test updates), then `/build`.
