@@ -938,6 +938,44 @@ def test_compact_failure_is_survivable(tmp_path, monkeypatch):
     assert client.search_by_artist_title('3 Doors Down', 'Kryptonite') == _RESULT_A
 
 
+def test_save_does_not_raise_on_recursionerror(tmp_path, monkeypatch):
+    """The write-path half of the same hole. Verified 2026-08-10 on Python
+    3.14.4: json.dump raises RecursionError too, which _save()'s
+    (OSError, TypeError, ValueError) equally missed.
+
+    Blast radius is arguably worse here than at load: flush() is called from
+    a `finally` in enrich_library(), where a raise would REPLACE the
+    exception that actually killed the run. And a failed write must still
+    keep its pending window -- a survived failure does the same thing to the
+    counters whatever raised it.
+    """
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 1000)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+
+    real_dump = cc.json.dump
+    fail = [True]
+
+    def recursive_dump(*a, **k):
+        if fail[0]:
+            raise RecursionError('maximum recursion depth exceeded')
+        return real_dump(*a, **k)
+    monkeypatch.setattr(cc.json, 'dump', recursive_dump)
+
+    client.flush()  # must not raise
+    assert not cache_path.exists()
+
+    fail[0] = False
+    client.flush()  # the entry must still be pending, and land this time
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 1
+
+
 def test_entry_at_exactly_ttl_is_pruned(tmp_path, monkeypatch):
     """The read path uses `< ttl`, so `>= ttl` in _compact is the consistent
     choice. Pinned so the two cannot silently diverge."""

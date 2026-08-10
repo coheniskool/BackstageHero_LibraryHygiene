@@ -256,14 +256,26 @@ class CachedChorusClient:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self._entries, f)
             os.replace(tmp_path, self.cache_path)
-        except (OSError, TypeError, ValueError) as e:
+        except Exception as e:
             # OSError is the expected case. TypeError/ValueError cover
             # json.dump choking on a value the API sent that isn't
             # JSON-native: flush() is called from a `finally` in
             # enrich_library(), where any raise would replace the run's real
             # exception with this one. A convenience cache must not be able to
             # rewrite what killed a run.
-            log.warning('Could not write Chorus cache %s: %s', self.cache_path, e)
+            #
+            # Caught as Exception rather than that tuple because the tuple was
+            # exactly as complete as _load()'s used to be: json.dump raises
+            # RecursionError on deeply nested input too (verified 2026-08-10,
+            # Python 3.14.4), and it is neither a TypeError nor a ValueError.
+            # Accepted cost, stated rather than discovered later: a catch-all
+            # can mask a bug a future refactor introduces as a logged warning
+            # instead of a red test. That is the price of the never-raise
+            # contract this docstring promises, and the same price already
+            # being paid for OSError -- type(e).__name__ in the log line is
+            # what keeps an unanticipated cause identifiable in log.txt.
+            log.warning('Could not write Chorus cache %s (%s): %s',
+                        self.cache_path, type(e).__name__, e)
             # _dirty deliberately survives: the pending window is retried, not
             # discarded. But that leaves _dirty over the threshold, so without
             # pacing every later lookup would re-attempt a failing write --

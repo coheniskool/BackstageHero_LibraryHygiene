@@ -29,12 +29,12 @@ Baseline before any of this: **827 passed, 1 skipped** (verified at merge `20430
 - [x] Read-check: `_save()` untouched by this task
 
 ## Task 2: Self-heal on the write path — `_save()`'s exception handler
-- [ ] `_save()` (:213) — `except (OSError, TypeError, ValueError)` → `except Exception as e`
-- [ ] Extend the existing comment (:214-219), don't replace it: keep the OSError/TypeError/ValueError reasoning, add `RecursionError` + the 2026-08-10 `json.dump` finding, and state the accepted cost of a catch-all masking a later refactor's bug
-- [ ] Add `type(e).__name__` to the `log.warning`
-- [ ] Confirm nothing below the handler moved — `_dirty` survives, `_retry_not_before` still set one `FLUSH_EVERY_SECONDS` out, success path still resets all three
-- [ ] `test_save_does_not_raise_on_recursionerror` — and the pending entry lands on the next good flush
-- [ ] `pytest tests/test_chorus_cache.py -v` green
+- [x] `_save()` (:213) — `except (OSError, TypeError, ValueError)` → `except Exception as e`
+- [x] Extend the existing comment (:214-219), don't replace it: keep the OSError/TypeError/ValueError reasoning, add `RecursionError` + the 2026-08-10 `json.dump` finding, and state the accepted cost of a catch-all masking a later refactor's bug
+- [x] Add `type(e).__name__` to the `log.warning`
+- [x] Confirm nothing below the handler moved — `_dirty` survives, `_retry_not_before` still set one `FLUSH_EVERY_SECONDS` out, success path still resets all three
+- [x] `test_save_does_not_raise_on_recursionerror` — and the pending entry lands on the next good flush
+- [x] `pytest tests/test_chorus_cache.py -v` green
 
 ## Task 3: Prune floor — `ttl_days` stops being destructive
 - [ ] `__init__` (:98-119) — `self._prune_seconds = max(self.ttl_seconds, DEFAULT_TTL_DAYS * _SECONDS_PER_DAY)`, **before** `_load()`
