@@ -334,10 +334,32 @@ def test_enrichment_flushes_cache_even_on_error(tmp_path, monkeypatch):
     monkeypatch.setattr(le.chorus_cache.chorus_client, 'search_by_artist_title',
                          exploding_search)
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match='Chorus went away mid-run'):
         le.enrich_library(tmp_path)
 
     cache_path = tmp_path / le.CHORUS_CACHE_FILENAME
     assert cache_path.exists()
     with open(cache_path, encoding='utf-8') as f:
         assert len(json.load(f)) == 1  # the first song's lookup survived
+
+
+def test_enrichment_error_is_not_masked_by_a_failing_final_flush(tmp_path, monkeypatch):
+    """A raise from inside the `finally` would REPLACE the exception that
+    actually killed the run. gui.py's _run_enrichment logs whatever
+    propagates, so masking would put the wrong error in log.txt and make a
+    real failure undiagnosable."""
+    _no_batch_flush(monkeypatch)
+    _make_song(tmp_path, 'A Band - First Song',
+                ini_text='[song]\nname = First Song\nartist = A Band\n')
+
+    def exploding_search(artist, title):
+        raise RuntimeError('Chorus went away mid-run')
+    monkeypatch.setattr(le.chorus_cache.chorus_client, 'search_by_artist_title',
+                         exploding_search)
+
+    def denied_flush(self):
+        raise PermissionError(13, 'denied')
+    monkeypatch.setattr(le.chorus_cache.CachedChorusClient, 'flush', denied_flush)
+
+    with pytest.raises(RuntimeError, match='Chorus went away mid-run'):
+        le.enrich_library(tmp_path)

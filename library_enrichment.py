@@ -228,7 +228,17 @@ def enrich_library(library_path, ch_data_path=None, dry_run=False, force=False,
         # FLUSH_EVERY_SECONDS -- at most a minute of lookups is lost. Do not
         # "strengthen" this into an atexit hook on the strength of that gap;
         # the loss is bounded and every entry is recomputable.
-        client.flush()
+        #
+        # Guarded because a raise from inside a `finally` REPLACES the
+        # exception that actually killed the run. gui.py's _run_enrichment
+        # logs whatever propagates, so masking here would put the wrong error
+        # in log.txt and make a real failure undiagnosable. flush() is not
+        # supposed to raise; this is here so that promise can never be the
+        # thing that costs the user their diagnosis.
+        try:
+            client.flush()
+        except Exception as e:
+            log.warning('Could not flush Chorus cache at end of run: %s', e)
 
     sidecar['scanned_at'] = _utcnow_iso()
 

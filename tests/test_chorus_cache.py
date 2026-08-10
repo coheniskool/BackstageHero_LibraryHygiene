@@ -235,8 +235,10 @@ def test_flush_happens_after_time_threshold(tmp_path, monkeypatch):
     calls = []
     _stub(monkeypatch, calls, result=_RESULT_A)
     monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 100)
+    # monotonic, not time: flush cadence deliberately doesn't use the wall
+    # clock, so a backward step can't stall persistence.
     fake_now = [1_000_000.0]
-    monkeypatch.setattr(cc.time, 'time', lambda: fake_now[0])
+    monkeypatch.setattr(cc.time, 'monotonic', lambda: fake_now[0])
     cache_path = tmp_path / 'chorus_cache.json'
 
     client = cc.CachedChorusClient(cache_path=cache_path)
@@ -303,7 +305,7 @@ def test_failed_save_does_not_retry_on_every_lookup(tmp_path, monkeypatch):
     _stub(monkeypatch, calls, result=_RESULT_A)
     monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 1)
     fake_now = [1_000_000.0]
-    monkeypatch.setattr(cc.time, 'time', lambda: fake_now[0])
+    monkeypatch.setattr(cc.time, 'monotonic', lambda: fake_now[0])
     cache_path = tmp_path / 'chorus_cache.json'
 
     attempts = []
@@ -519,3 +521,276 @@ def test_legacy_full_payload_entry_is_trimmed_on_load(tmp_path, monkeypatch):
     # and the surviving entry still serves a lookup without going to network
     assert client.search_by_artist_title('3 Doors Down', 'Kryptonite') == _TRIMMED_FAT_RESULT
     assert calls == []
+
+
+# --- The defect's own regression tests --------------------------------------
+# Found by mutation testing at /ship review: deleting EITHER counter reset in
+# _save() left all 813 tests green while silently restoring a whole-file write
+# per lookup -- the exact O(n)-per-insert defect this module was changed to
+# fix. No test observed a run crossing a flush threshold more than once, so
+# nothing pinned what a save does to the counters afterwards.
+
+
+def test_long_run_writes_scale_with_batches_not_lookups(tmp_path, monkeypatch):
+    """The regression test for the original defect. 100 lookups must cost a
+    handful of writes, not 100 -- and crucially this crosses the threshold
+    repeatedly, so a save that fails to reset its counters shows up here."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 25)
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(cc.time, 'monotonic', lambda: fake_now[0])
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    for i in range(100):
+        fake_now[0] += 1  # well inside FLUSH_EVERY_SECONDS
+        client.search_by_artist_title(f'Artist {i}', 'Title')
+
+    assert 3 <= len(saves) <= 5, f'expected ~4 batched writes, got {len(saves)}'
+
+
+def test_successful_save_resets_the_insert_counter(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 3)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    for i in range(3):
+        client.search_by_artist_title(f'Artist {i}', 'Title')
+    assert len(saves) == 1
+
+    client.search_by_artist_title('Artist 4', 'Title')
+    client.search_by_artist_title('Artist 5', 'Title')
+    assert len(saves) == 1, 'the counter did not reset; every lookup now writes'
+
+
+def test_successful_save_resets_the_time_clock(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 1000)
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(cc.time, 'monotonic', lambda: fake_now[0])
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    client.search_by_artist_title('Artist 1', 'Title')
+    fake_now[0] += cc.FLUSH_EVERY_SECONDS + 1
+    client.search_by_artist_title('Artist 2', 'Title')
+    assert len(saves) == 1
+
+    fake_now[0] += 1
+    client.search_by_artist_title('Artist 3', 'Title')
+    fake_now[0] += 1
+    client.search_by_artist_title('Artist 4', 'Title')
+    assert len(saves) == 1, 'the clock did not reset; every later lookup writes'
+
+
+def test_entries_added_after_a_failed_save_are_included_in_the_retry(tmp_path, monkeypatch):
+    """The retry must persist current state, not the snapshot that failed."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 1000)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('Artist 1', 'Title')
+
+    real_open = open
+    fail = [True]
+
+    def flaky_open(*a, **k):
+        if fail[0]:
+            raise OSError(13, 'Permission denied')
+        return real_open(*a, **k)
+    monkeypatch.setattr('builtins.open', flaky_open)
+    client.flush()  # fails
+
+    client.search_by_artist_title('Artist 2', 'Title')
+    client.search_by_artist_title('Artist 3', 'Title')
+    fail[0] = False
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 3
+
+
+def test_retry_pacing_is_cleared_after_a_successful_save(tmp_path, monkeypatch):
+    """A recovered write must not stay locked out for the rest of the window
+    the failure opened -- otherwise entries sit un-checkpointed for up to a
+    minute after writes are demonstrably working again."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 2)
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(cc.time, 'monotonic', lambda: fake_now[0])
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    real_open = open
+    fail = [True]
+
+    def flaky_open(*a, **k):
+        if fail[0]:
+            raise OSError(13, 'Permission denied')
+        return real_open(*a, **k)
+    monkeypatch.setattr('builtins.open', flaky_open)
+
+    client.search_by_artist_title('Artist 1', 'Title')
+    client.search_by_artist_title('Artist 2', 'Title')  # crosses threshold, fails
+    fail[0] = False
+    client.flush()  # explicit flush bypasses pacing and succeeds
+
+    saves = _count_saves(monkeypatch)
+    client.search_by_artist_title('Artist 3', 'Title')
+    client.search_by_artist_title('Artist 4', 'Title')  # crosses threshold again
+    assert len(saves) == 1, 'still gated by a pacing window a good write made moot'
+
+
+# --- Malformed-cache hardening (found at /ship review) -----------------------
+
+
+def test_wrong_shape_cache_file_is_ignored_not_raised(tmp_path, monkeypatch):
+    """Valid JSON of the wrong shape. Untested until /ship review, and the
+    only thing standing between a corrupted file and an AttributeError out of
+    __init__ that would abort enrichment before the first song."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    cache_path.write_text('[1, 2, 3]', encoding='utf-8')
+
+    client = cc.CachedChorusClient(cache_path=cache_path)  # must not raise
+    assert client.search_by_artist_title('3 Doors Down', 'Kryptonite') == _RESULT_A
+
+
+def test_oversized_cached_at_is_treated_as_expired(tmp_path, monkeypatch):
+    """A JSON integer too large for a float raises OverflowError on the
+    subtraction. Unhandled, that fires inside __init__ before anything is
+    written, so the bad file never gets pruned and enrichment stays dead
+    until the user deletes the cache by hand."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    huge = '1' + '0' * 400
+    cache_path.write_text(
+        '{"k": {"result": null, "cached_at": ' + huge + '}}', encoding='utf-8')
+
+    client = cc.CachedChorusClient(cache_path=cache_path)  # must not raise
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert json.load(f) == {}
+
+
+def test_infinite_cached_at_is_treated_as_expired(tmp_path, monkeypatch):
+    """json accepts the non-standard Infinity literal. An infinite cached_at
+    reads as never-expiring: served forever, refreshed never."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    cache_path.write_text('{"k": {"result": null, "cached_at": Infinity}}',
+                           encoding='utf-8')
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert json.load(f) == {}
+
+
+# --- Interaction and contract coverage (found at /ship review) --------------
+
+
+def test_prune_and_trim_persist_together_for_the_next_instance(tmp_path, monkeypatch):
+    """Prune and trim were only ever tested in isolation on a one-entry file.
+    This is the shape the live 126 MB cache actually has."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    fresh_key = cc._cache_key('3 Doors Down', 'Kryptonite')
+    _write_cache(cache_path, {
+        fresh_key: {'result': _FAT_RESULT, 'cached_at': now - 86400},
+        'stale': {'result': _FAT_RESULT, 'cached_at': now - 30 * 86400},
+    })
+
+    cc.CachedChorusClient(cache_path=cache_path).flush()
+
+    second = cc.CachedChorusClient(cache_path=cache_path)
+    with open(cache_path, encoding='utf-8') as f:
+        data = json.load(f)
+    assert list(data) == [fresh_key]
+    assert data[fresh_key]['result'] == _TRIMMED_FAT_RESULT
+    assert second.search_by_artist_title('3 Doors Down', 'Kryptonite') == _TRIMMED_FAT_RESULT
+    assert calls == []
+
+
+def test_cached_no_match_stays_none_not_empty_dict(monkeypatch):
+    """_trim promises None passes straight through. An empty dict is falsy so
+    today's consumer is accidentally safe either way -- pin the contract, not
+    the accident."""
+    calls = []
+    _stub(monkeypatch, calls, result=None)
+    client = cc.CachedChorusClient()
+
+    assert client.search_by_artist_title('Nobody', 'Nothing') is None
+    assert client.search_by_artist_title('Nobody', 'Nothing') is None
+    assert len(calls) == 1
+
+
+def test_forced_refresh_reaches_disk(tmp_path, monkeypatch):
+    """A force=True refresh that never persists would be re-forced every run.
+    Asserting entry COUNT would not catch it -- the key already exists."""
+    calls = []
+    _stub(monkeypatch, calls, result_by_call=[
+        {'name': 'Kryptonite', 'artist': '3 Doors Down', 'genre': 'Rock'},
+        {'name': 'Kryptonite', 'artist': '3 Doors Down', 'genre': 'Metal'},
+    ])
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite', force=True)
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        entry = next(iter(json.load(f).values()))
+    assert entry['result']['genre'] == 'Metal'
+
+
+def test_save_leaves_no_tmp_file_behind(tmp_path, monkeypatch):
+    """The atomic write's own contract, which until now was only enforced
+    incidentally through the batching tests' os.replace seam."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    client.flush()
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['chorus_cache.json']
+
+
+def test_entry_at_exactly_ttl_is_pruned(tmp_path, monkeypatch):
+    """The read path uses `< ttl`, so `>= ttl` in _compact is the consistent
+    choice. Pinned so the two cannot silently diverge."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        'exactly-ttl': {'result': _RESULT_A,
+                        'cached_at': now - cc.DEFAULT_TTL_DAYS * 86400},
+    })
+
+    cc.CachedChorusClient(cache_path=cache_path).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert json.load(f) == {}

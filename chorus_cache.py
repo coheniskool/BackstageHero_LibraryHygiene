@@ -10,6 +10,7 @@
 
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -98,15 +99,24 @@ class CachedChorusClient:
         self.cache_path = Path(cache_path) if cache_path else None
         self.ttl_seconds = ttl_days * _SECONDS_PER_DAY
         self._entries = {}
-        # Counts unpersisted changes. MUST be initialized before _load(),
-        # which sets it when it drops or rewrites what it read -- that mark is
-        # how a shrunken cache reaches disk. Moving this below _load() would
-        # silently discard it and the file would never actually shrink.
+        # All three MUST be initialized before _load(): it sets _dirty when it
+        # drops or rewrites what it read, and that mark is how a shrunken
+        # cache reaches disk. Initializing any of them after _load() would
+        # silently discard that -- and if _load() ever grows a flush of its
+        # own, _maybe_flush() would hit an AttributeError on the other two.
+        #
+        # Flush cadence runs on the MONOTONIC clock, not time.time(). These
+        # measure elapsed time, and a backward wall-clock step (NTP
+        # correction, resume from sleep, a manual clock fix) would otherwise
+        # park _retry_not_before in the future and stall persistence for the
+        # size of the step -- on a multi-day unattended run, exactly when the
+        # bounded-loss promise matters. cached_at/ttl_seconds stay on
+        # time.time(): those are persisted and compared across runs.
         self._dirty = 0
-        self._load()
-        self._last_flush = time.time()
+        self._last_flush = time.monotonic()
         # Set after a failed write to pace the retry -- see _save().
         self._retry_not_before = 0.0
+        self._load()
 
     def _load(self):
         if not self.cache_path or not self.cache_path.exists():
@@ -152,12 +162,20 @@ class CachedChorusClient:
             try:
                 age = now - entry['cached_at']
                 result = entry['result']
-            except (KeyError, TypeError):
+            except (KeyError, TypeError, OverflowError):
                 # Malformed entry: unreadable is indistinguishable from
                 # expired, and the read path would have raised on it.
+                # OverflowError is a JSON integer too large for a float --
+                # without it this loop would raise inside __init__ and, since
+                # nothing has been written yet, the bad file would never get
+                # pruned. Enrichment would stay dead until the user deleted
+                # the cache by hand.
                 changed = True
                 continue
-            if age >= self.ttl_seconds:
+            if not math.isfinite(age) or age >= self.ttl_seconds:
+                # json accepts the non-standard Infinity/NaN literals, and an
+                # infinite cached_at would otherwise read as never-expiring --
+                # served forever, refreshed never.
                 changed = True
                 continue
             compacted = {'result': _trim(result), 'cached_at': entry['cached_at']}
@@ -188,26 +206,35 @@ class CachedChorusClient:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self._entries, f)
             os.replace(tmp_path, self.cache_path)
-        except OSError as e:
+        except (OSError, TypeError, ValueError) as e:
+            # OSError is the expected case. TypeError/ValueError cover
+            # json.dump choking on a value the API sent that isn't
+            # JSON-native: flush() is called from a `finally` in
+            # enrich_library(), where any raise would replace the run's real
+            # exception with this one. A convenience cache must not be able to
+            # rewrite what killed a run.
             log.warning('Could not write Chorus cache %s: %s', self.cache_path, e)
             # _dirty deliberately survives: the pending window is retried, not
             # discarded. But that leaves _dirty over the threshold, so without
             # pacing every later lookup would re-attempt a failing write --
             # and the known real failure here (WinError 32, see
             # SPEC-chorus-reliability-fix.md) is transient but repeated.
-            self._retry_not_before = time.time() + FLUSH_EVERY_SECONDS
+            self._retry_not_before = time.monotonic() + FLUSH_EVERY_SECONDS
             return
         self._dirty = 0
-        self._last_flush = time.time()
+        self._last_flush = time.monotonic()
+        # Recovered: drop the pacing gate rather than stay locked out for the
+        # rest of a window that a working write has already made moot.
+        self._retry_not_before = 0.0
 
     def _maybe_flush(self):
         """Persist only once the pending batch is big enough or old enough."""
         if not self.cache_path or not self._dirty:
             return
-        if time.time() < self._retry_not_before:
+        if time.monotonic() < self._retry_not_before:
             return
         if (self._dirty >= FLUSH_EVERY_N_INSERTS
-                or (time.time() - self._last_flush) >= FLUSH_EVERY_SECONDS):
+                or (time.monotonic() - self._last_flush) >= FLUSH_EVERY_SECONDS):
             self._save()
 
     def flush(self):
