@@ -43,28 +43,29 @@ See [`plan-chorus-cache-write-perf.md`](plan-chorus-cache-write-perf.md) for ful
 - [x] `pytest tests/test_chorus_cache.py -v` green
 
 ## Task 3: Payload trim — `chorus_cache.py`
-- [ ] Add `_CACHED_RESULT_FIELDS = ('name', 'artist', 'album', 'genre', 'year', 'charter')` — comment that it is an allowlist by deliberate choice, not a `notesData` denylist, and that widening it is Ask First (same rule as `metadata_enrichment.CHORUS_FILLABLE_KEYS`, metadata_enrichment.py:50-52)
-- [ ] Add `_trim(result)` — `None` passes through; non-dict passes through; else six-field projection
-- [ ] Apply at insert (`search_by_artist_title`:74)
-- [ ] Apply to legacy entries in `_load()`, `self._dirty += 1` if any were trimmed
-- [ ] Update `CachedChorusClient` docstring (:32-37) — narrowed contract, NOT a drop-in for `chorus_client.search_by_artist_title()`; cite the 2026-08-10 approval and the 112.8-of-126.4 MB number
-- [ ] Verify `_RESULT_A`/`_RESULT_B` (:9-10) contain only allowlisted fields before relying on the existing tests surviving unmodified
-- [ ] `test_only_consumed_fields_are_cached`
-- [ ] `test_legacy_full_payload_entry_is_trimmed_on_load`
-- [ ] Regression: `test_none_result_is_cached_too` (:98) passes unmodified
-- [ ] `pytest tests/test_chorus_cache.py tests/test_library_enrichment.py tests/test_metadata_enrichment.py tests/test_dedupe.py -v` green
+- [x] Add `_CACHED_RESULT_FIELDS = ('name', 'artist', 'album', 'genre', 'year', 'charter')` — comment that it is an allowlist by deliberate choice, not a `notesData` denylist, and that widening it is Ask First (same rule as `metadata_enrichment.CHORUS_FILLABLE_KEYS`, metadata_enrichment.py:50-52)
+- [x] Add `_trim(result)` — non-dict (incl. `None`) passes through; else six-field projection, absent keys omitted **not** None-filled (plan bullet corrected during build)
+- [x] Apply `_trim` to the RETURNED value too, so a miss and a hit hand back the same shape (added during build)
+- [x] Apply at insert (`search_by_artist_title`:74)
+- [x] Apply to legacy entries in `_load()`, `self._dirty += 1` if any were trimmed
+- [x] Update `CachedChorusClient` docstring (:32-37) — narrowed contract, NOT a drop-in for `chorus_client.search_by_artist_title()`; cite the 2026-08-10 approval and the 112.8-of-126.4 MB number
+- [x] Verify `_RESULT_A`/`_RESULT_B` (:9-10) contain only allowlisted fields before relying on the existing tests surviving unmodified
+- [x] `test_only_consumed_fields_are_cached`
+- [x] `test_legacy_full_payload_entry_is_trimmed_on_load`
+- [x] Regression: `test_none_result_is_cached_too` (:98) passes unmodified
+- [x] `pytest tests/test_chorus_cache.py tests/test_library_enrichment.py tests/test_metadata_enrichment.py tests/test_dedupe.py -v` green
 
 ## ▶ Checkpoint 2
-- [ ] `pytest tests/ -q` full suite green (~812 passed / 1 skipped)
-- [ ] Read-check: `_CACHED_RESULT_FIELDS` is an allowlist; class docstring states the narrowed contract
-- [ ] Read-check: `_load()` prunes then trims in one pass, increments `_dirty` for either, atomic-write path untouched
+- [x] `pytest tests/ -q` full suite green (~812 passed / 1 skipped)
+- [x] Read-check: `_CACHED_RESULT_FIELDS` is an allowlist; class docstring states the narrowed contract
+- [x] Read-check: `_load()` prunes then trims in one pass, increments `_dirty` for either, atomic-write path untouched
 
 ## ▶ Checkpoint 3 — real-data migration rehearsal (non-destructive)
-- [ ] Copy `M:/_Organized/Songs/backstagehero_chorus_cache.json` to the scratchpad — **never open the live path for writing**
-- [ ] Construct a `CachedChorusClient` against the copy, `flush()`, measure
-- [ ] Assert < 5 MB (predicted ~0.52 MB) and entry count ≤ 2,352 (TTL drift since 2026-08-10 means more will have expired)
-- [ ] Spot-check surviving entries: six fields present, `notesData` absent, `cached_at` preserved
-- [ ] Confirm the copy reloads cleanly into a second client with no further pruning
+- [x] Copy `M:/_Organized/Songs/backstagehero_chorus_cache.json` to the scratchpad — **never open the live path for writing**
+- [x] Construct a `CachedChorusClient` against the copy, `flush()`, measure
+- [x] Assert < 5 MB (predicted ~0.52 MB) and entry count ≤ 2,352 (TTL drift since 2026-08-10 means more will have expired)
+- [x] Spot-check surviving entries: six fields present, `notesData` absent, `cached_at` preserved
+- [x] Confirm the copy reloads cleanly into a second client with no further pruning
 
 ## ▶ Checkpoint (final)
 - [ ] `pytest tests/ -q` full suite green

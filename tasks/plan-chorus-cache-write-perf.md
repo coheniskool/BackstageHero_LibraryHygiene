@@ -145,7 +145,10 @@ Tasks 2 and 3 are logically independent of each other but both edit `_load()`, s
 
 **Exact change** (`chorus_cache.py`):
 - Add `_CACHED_RESULT_FIELDS = ('name', 'artist', 'album', 'genre', 'year', 'charter')` as a module constant, with a comment stating this is an **allowlist by deliberate choice, not a `notesData` denylist** — a future fat field Chorus adds must not silently reintroduce the problem — and that widening it is an Ask First decision, the same rule `metadata_enrichment.CHORUS_FILLABLE_KEYS` (metadata_enrichment.py:50-52) already carries.
-- Add `_trim(result)`: returns `None` unchanged for a `None` result; otherwise returns `{k: result.get(k) for k in _CACHED_RESULT_FIELDS}`. Tolerate a non-dict result by returning it unchanged rather than raising.
+- Add `_trim(result)`: returns `{k: result[k] for k in _CACHED_RESULT_FIELDS if k in result}`; any non-dict (including `None`, a cached no-match) passes straight through rather than raising.
+
+  **Corrected during build.** This bullet originally specified a `result.get(k)` projection filling absent fields with `None`, which contradicts this task's own "existing tests pass unmodified" claim two sections down — a `None`-filled six-key dict is not equal to the three-key `_RESULT_A`. Verified before implementing: the intersection form leaves the fixtures identical, the `None`-fill form does not. Intersection is also the better design on its own merits — the cache shouldn't invent keys the API never sent, and every consumer reads through `.get()` anyway.
+- Apply `_trim` to the **returned** value as well as the stored one. A miss returning the raw response while a hit returns the projection would make a lookup's shape depend on cache state — a bug that only surfaces in production. Not in the original plan; added during build and covered by `test_trimmed_result_is_returned_on_both_miss_and_hit`.
 - Apply in `search_by_artist_title()` at insert (:74) and in `_load()` for legacy entries; if any legacy entry was trimmed, `self._dirty += 1`.
 - Update the `CachedChorusClient` class docstring (:32-37) to state the narrowed contract explicitly: this returns a six-field projection, **not** a drop-in for `chorus_client.search_by_artist_title()`. Cite the 2026-08-10 spec-review approval and the 112.8-of-126.4 MB number.
 
@@ -153,7 +156,8 @@ Tasks 2 and 3 are logically independent of each other but both edit `_load()`, s
 - A stubbed Chorus result containing `notesData` is stored without it, and with all six consumed fields intact.
 - A legacy on-disk entry carrying a full payload comes back trimmed after load, six fields intact — the migration path for the live 126 MB file.
 - A `None` result is still cached as `None` (existing `test_none_result_is_cached_too`:98 must pass unmodified).
-- A result missing some of the six fields stores them as `None` rather than raising or omitting the key.
+- A result missing some of the six fields omits those keys rather than filling them with `None` (see the correction above).
+- A cache miss and a subsequent cache hit for the same lookup return the same shape.
 - `metadata_enrichment` and `dedupe_report` are untouched — they call the raw `chorus_client` and never see the cache.
 
 **Verification:**

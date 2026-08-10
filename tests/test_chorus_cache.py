@@ -433,3 +433,89 @@ def test_load_with_nothing_to_prune_does_not_mark_dirty(tmp_path, monkeypatch):
     client.flush()
 
     assert saves == []
+
+
+# --- Payload trim (SPEC-chorus-cache-write-perf.md) -------------------------
+# The cache stored the ENTIRE Chorus response. Measured 2026-08-10, its
+# notesData field alone was 112.8 MB of the 126.4 MB file -- read by nobody.
+# library_enrichment._enrich_one_song is the only consumer of a cached result
+# and reads exactly _CACHED_RESULT_FIELDS.
+
+_FAT_RESULT = {
+    'name': 'Kryptonite', 'artist': '3 Doors Down', 'album': 'The Better Life',
+    'genre': 'Rock', 'year': '2000', 'charter': 'Somebody',
+    'notesData': {'noteCounts': list(range(50))},  # the 112.8 MB field
+    'md5': 'abc123', 'chartHash': 'def456', 'loading_phrase': 'go',
+}
+_TRIMMED_FAT_RESULT = {
+    'name': 'Kryptonite', 'artist': '3 Doors Down', 'album': 'The Better Life',
+    'genre': 'Rock', 'year': '2000', 'charter': 'Somebody',
+}
+
+
+def test_only_consumed_fields_are_cached(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_FAT_RESULT)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        entry = next(iter(json.load(f).values()))
+    assert entry['result'] == _TRIMMED_FAT_RESULT
+    assert 'notesData' not in entry['result']
+
+
+def test_trimmed_result_is_returned_on_both_miss_and_hit(monkeypatch):
+    """A miss must not hand back the raw response while a hit hands back the
+    projection -- callers would see the same lookup change shape depending on
+    cache state, which is the kind of bug that only shows up in production."""
+    calls = []
+    _stub(monkeypatch, calls, result=_FAT_RESULT)
+    client = cc.CachedChorusClient()
+
+    on_miss = client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    on_hit = client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+
+    assert len(calls) == 1
+    assert on_miss == _TRIMMED_FAT_RESULT
+    assert on_hit == _TRIMMED_FAT_RESULT
+
+
+def test_absent_fields_stay_absent_rather_than_filled_with_none(monkeypatch):
+    """The cache projects the response down; it doesn't invent keys the API
+    never sent. Every consumer reads through .get() anyway."""
+    calls = []
+    _stub(monkeypatch, calls, result={'name': 'Kryptonite', 'artist': '3 Doors Down'})
+    client = cc.CachedChorusClient()
+
+    result = client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+
+    assert result == {'name': 'Kryptonite', 'artist': '3 Doors Down'}
+
+
+def test_legacy_full_payload_entry_is_trimmed_on_load(tmp_path, monkeypatch):
+    """The migration path for the live 126 MB cache: it must shrink in place,
+    not be discarded -- rebuilding it means ~7,800 lookups against an API
+    already known to rate-limit (SPEC-chorus-reliability-fix.md)."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    key = cc._cache_key('3 Doors Down', 'Kryptonite')
+    _write_cache(cache_path, {key: {'result': _FAT_RESULT, 'cached_at': now - 86400}})
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        entry = json.load(f)[key]
+    assert entry['result'] == _TRIMMED_FAT_RESULT
+    assert entry['cached_at'] == now - 86400  # TTL position preserved
+
+    # and the surviving entry still serves a lookup without going to network
+    assert client.search_by_artist_title('3 Doors Down', 'Kryptonite') == _TRIMMED_FAT_RESULT
+    assert calls == []

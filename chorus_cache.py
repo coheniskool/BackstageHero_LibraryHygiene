@@ -38,9 +38,33 @@ FLUSH_EVERY_N_INSERTS = 25
 FLUSH_EVERY_SECONDS = 60
 
 
+# The only consumer of a cached result is library_enrichment._enrich_one_song,
+# which reads exactly these six fields. The full Chorus response carries far
+# more: measured on the live cache 2026-08-10, its notesData field alone was
+# 112.8 MB of the 126.4 MB file, read by nobody.
+#
+# An ALLOWLIST by deliberate choice, not a notesData denylist -- a future fat
+# field Chorus adds must not silently reintroduce the problem. Widening it is
+# an Ask First decision (approved at spec review 2026-08-10 as these six), the
+# same rule metadata_enrichment.CHORUS_FILLABLE_KEYS carries for its own list.
+_CACHED_RESULT_FIELDS = ('name', 'artist', 'album', 'genre', 'year', 'charter')
+
+
 def _cache_key(artist, title):
     return (library_common.normalize_lookup_value(artist)
             + '\x1f' + library_common.normalize_lookup_value(title))
+
+
+def _trim(result):
+    """Project a Chorus response down to the fields anything actually reads.
+
+    Absent fields stay absent rather than being filled with None -- the cache
+    shouldn't invent keys the API never sent, and every consumer reads through
+    .get() anyway. `None` (a cached no-match) passes straight through.
+    """
+    if not isinstance(result, dict):
+        return result
+    return {k: result[k] for k in _CACHED_RESULT_FIELDS if k in result}
 
 
 class CachedChorusClient:
@@ -49,6 +73,17 @@ class CachedChorusClient:
     repeating a lookup Chorus doesn't have shouldn't re-hit the network on
     every scan. Optional on-disk persistence (cache_path) survives across
     runs; without it, the cache is in-memory only for this instance's life.
+
+    NOT a drop-in for chorus_client.search_by_artist_title(): this returns a
+    projection over _CACHED_RESULT_FIELDS, not the raw Chorus response. The
+    raw response's notesData field alone was 112.8 MB of the 126.4 MB live
+    cache on 2026-08-10 and no consumer reads it; narrowing the contract was
+    approved at spec review the same day (SPEC-chorus-cache-write-perf.md).
+    Callers needing the full response should call chorus_client directly --
+    metadata_enrichment.py and dedupe_report.py already do.
+
+    Writes are batched, so a caller doing a run of lookups must flush() when
+    the run ends.
     """
 
     def __init__(self, cache_path=None, ttl_days=DEFAULT_TTL_DAYS):
@@ -81,34 +116,47 @@ class CachedChorusClient:
             log.warning('Chorus cache %s is not an object; ignoring', self.cache_path)
             self._entries = {}
             return
-        self._prune_expired()
+        self._compact()
 
-    def _prune_expired(self):
-        """Drop entries the TTL has already made unreachable.
+    def _compact(self):
+        """Drop entries the TTL already made unreachable, and trim legacy
+        full-payload results down to _CACHED_RESULT_FIELDS.
 
-        search_by_artist_title() has always checked the TTL on read, so an
-        expired entry can never be returned to a caller -- but nothing ever
-        removed one, so it was re-serialized by every save forever. On the
-        live cache on 2026-08-10 that was 5,379 of 7,743 entries (69%) riding
-        along in every 126 MB rewrite. Dropping them is pure win: no caller
-        can observe a difference.
+        Pruning: search_by_artist_title() has always checked the TTL on read,
+        so an expired entry can never be returned to a caller -- but nothing
+        ever removed one, so it was re-serialized by every save forever. On
+        the live cache on 2026-08-10 that was 5,379 of 7,743 entries (69%)
+        riding along in every 126 MB rewrite.
 
-        Marks the cache dirty so the shrunken form actually reaches disk --
-        without that, a run with zero cache misses would drop them in memory
-        and leave the file exactly as big as it was.
+        Trimming: entries written before the payload trim carry the whole
+        Chorus response. This is their migration path -- the file shrinks in
+        place. Rebuilding it instead would mean ~7,800 fresh lookups against
+        an API already known to rate-limit (SPEC-chorus-reliability-fix.md).
+
+        Either change marks the cache dirty, so the shrunken form actually
+        reaches disk. Without that, a run with zero cache misses would compact
+        in memory and leave the file exactly as big as it was.
         """
         now = time.time()
         kept = {}
+        changed = False
         for key, entry in self._entries.items():
             try:
                 age = now - entry['cached_at']
+                result = entry['result']
             except (KeyError, TypeError):
                 # Malformed entry: unreadable is indistinguishable from
                 # expired, and the read path would have raised on it.
+                changed = True
                 continue
-            if age < self.ttl_seconds:
-                kept[key] = entry
-        if len(kept) != len(self._entries):
+            if age >= self.ttl_seconds:
+                changed = True
+                continue
+            compacted = {'result': _trim(result), 'cached_at': entry['cached_at']}
+            if compacted != entry:
+                changed = True
+            kept[key] = compacted
+        if changed:
             self._entries = kept
             self._dirty += 1
 
@@ -172,7 +220,10 @@ class CachedChorusClient:
             if entry is not None and (time.time() - entry['cached_at']) < self.ttl_seconds:
                 return entry['result']
 
-        result = chorus_client.search_by_artist_title(artist, title)
+        # Trimmed before storing AND returned trimmed, so a miss and a hit
+        # hand back the same shape -- otherwise a lookup's result would depend
+        # on cache state, which only shows up as a bug in production.
+        result = _trim(chorus_client.search_by_artist_title(artist, title))
         self._entries[key] = {'result': result, 'cached_at': time.time()}
         self._dirty += 1
         self._maybe_flush()
