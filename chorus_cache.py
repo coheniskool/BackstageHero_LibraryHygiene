@@ -86,24 +86,35 @@ class CachedChorusClient:
     Writes are batched, so a caller doing a run of lookups must flush() when
     the run ends.
 
-    ttl_days is DESTRUCTIVE, not advisory: _compact() drops expired entries at
-    load and the shrunken form is written back, so constructing this against a
-    shared cache_path with a shorter ttl_days than another caller uses will
-    permanently delete entries that caller would still have served. Harmless
-    today -- library_enrichment.enrich_library() is the only construction site
-    and takes the default -- but pass a custom ttl_days against a shared file
-    only if you mean to prune it for everyone.
+    ttl_days controls what THIS instance will serve, and nothing more. Because
+    _compact() prunes at load and the shrunken form is written back, a short
+    ttl_days used to permanently delete entries a default-TTL caller would
+    still have been served -- a data-loss-shaped consequence of prune-on-load
+    that SPEC-chorus-cache-write-perf.md did not anticipate. Deletion is now
+    floored at DEFAULT_TTL_DAYS (see _prune_seconds), so a shorter ttl_days
+    narrows what you get served without narrowing what anyone else keeps. A
+    longer one prunes at its own horizon, which takes nothing from anybody.
     """
 
     def __init__(self, cache_path=None, ttl_days=DEFAULT_TTL_DAYS):
         self.cache_path = Path(cache_path) if cache_path else None
         self.ttl_seconds = ttl_days * _SECONDS_PER_DAY
+        # Reading and pruning are different questions, so they get different
+        # horizons. ttl_seconds answers "will I serve this entry?", which is
+        # rightly per-instance. This answers "may I DELETE this entry, for
+        # everyone?" -- floored at the default so no instance can drop an
+        # entry a default-TTL caller would still have been served. Not
+        # redundant when ttl_days is the default; it is what keeps a shorter
+        # one from being destructive.
+        self._prune_seconds = max(self.ttl_seconds, DEFAULT_TTL_DAYS * _SECONDS_PER_DAY)
         self._entries = {}
-        # All three MUST be initialized before _load(): it sets _dirty when it
-        # drops or rewrites what it read, and that mark is how a shrunken
-        # cache reaches disk. Initializing any of them after _load() would
-        # silently discard that -- and if _load() ever grows a flush of its
-        # own, _maybe_flush() would hit an AttributeError on the other two.
+        # All of these MUST be initialized before _load(). It READS
+        # _prune_seconds to decide what to drop, and it SETS _dirty when it
+        # drops or rewrites what it read (or resets an unusable file), and
+        # that mark is how a shrunken or healed cache reaches disk.
+        # Initializing any of them after _load() would silently discard that
+        # -- and if _load() ever grows a flush of its own, _maybe_flush()
+        # would hit an AttributeError on the other two.
         #
         # Flush cadence runs on the MONOTONIC clock, not time.time(). These
         # measure elapsed time, and a backward wall-clock step (NTP
@@ -192,6 +203,11 @@ class CachedChorusClient:
         the live cache on 2026-08-10 that was 5,379 of 7,743 entries (69%)
         riding along in every 126 MB rewrite.
 
+        Pruning uses _prune_seconds, NOT ttl_seconds, and the difference is
+        the point: refusing to serve an entry costs one re-lookup and affects
+        only this instance, while deleting it is permanent and affects every
+        caller of this file. Only the second one needs a floor.
+
         Trimming: entries written before the payload trim carry the whole
         Chorus response. This is their migration path -- the file shrinks in
         place. Rebuilding it instead would mean ~7,800 fresh lookups against
@@ -218,7 +234,7 @@ class CachedChorusClient:
                 # the cache by hand.
                 changed = True
                 continue
-            if not math.isfinite(age) or age >= self.ttl_seconds:
+            if not math.isfinite(age) or age >= self._prune_seconds:
                 # json accepts the non-standard Infinity/NaN literals, and an
                 # infinite cached_at would otherwise read as never-expiring --
                 # served forever, refreshed never.

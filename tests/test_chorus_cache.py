@@ -993,3 +993,74 @@ def test_entry_at_exactly_ttl_is_pruned(tmp_path, monkeypatch):
 
     with open(cache_path, encoding='utf-8') as f:
         assert json.load(f) == {}
+
+
+# --- Prune horizon vs read horizon (SPEC-chorus-cache-robustness.md) --------
+# _compact() pruned against self.ttl_seconds and the shrunken result was
+# written back, so a client constructed with a SHORTER ttl_days against a
+# shared cache file permanently deleted entries a default-TTL caller would
+# still have served. Reading and pruning are different questions -- "will I
+# serve this?" is per-instance, "may I delete this for everyone?" is not --
+# so only the second one is floored at the default.
+
+
+def test_shorter_ttl_does_not_delete_what_a_default_caller_would_serve(tmp_path, monkeypatch):
+    """The data-loss shape. A 5-day-old entry is stale to a 1-day client but
+    perfectly good to the 7-day default, and one must not delete it out from
+    under the other."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    key = cc._cache_key('Styx', 'Mr. Roboto')
+    _write_cache(cache_path, {key: {'result': _RESULT_B, 'cached_at': now - 5 * 86400}})
+
+    cc.CachedChorusClient(cache_path=cache_path, ttl_days=1).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert list(json.load(f)) == [key]
+    # and the default-TTL caller can still be served by it
+    assert cc.CachedChorusClient(cache_path=cache_path).search_by_artist_title(
+        'Styx', 'Mr. Roboto') == _RESULT_B
+    assert calls == []
+
+
+def test_shorter_ttl_still_refuses_to_serve_a_stale_entry(tmp_path, monkeypatch):
+    """The other half. Keeping the entry on disk must not turn into serving
+    it: a 1-day client still considers a 5-day-old entry stale and goes back
+    to the network."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        cc._cache_key('Styx', 'Mr. Roboto'): {'result': _RESULT_B, 'cached_at': now - 5 * 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path, ttl_days=1)
+
+    assert client.search_by_artist_title('Styx', 'Mr. Roboto') == _RESULT_A
+    assert calls == [('Styx', 'Mr. Roboto')]
+
+
+def test_longer_ttl_prunes_at_its_own_horizon(tmp_path, monkeypatch):
+    """The floor must not become a ceiling. A 30-day client prunes at 30
+    days, not 7 -- otherwise the file stops being bounded, which is the
+    growth problem SPEC-chorus-cache-write-perf.md closed."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    kept_key = cc._cache_key('Styx', 'Mr. Roboto')
+    _write_cache(cache_path, {
+        kept_key: {'result': _RESULT_B, 'cached_at': now - 10 * 86400},
+        'past-thirty-days': {'result': _RESULT_A, 'cached_at': now - 40 * 86400},
+    })
+
+    cc.CachedChorusClient(cache_path=cache_path, ttl_days=30).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert list(json.load(f)) == [kept_key]

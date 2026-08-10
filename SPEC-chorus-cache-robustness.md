@@ -266,7 +266,7 @@ Explicitly **not** tested: a live run against the real cache file. Decisions 2 a
 5. `KeyboardInterrupt` during load propagates.
 6. `C:\Python314\python.exe -m pytest tests/ -q` ≥ **839 passed, 1 skipped** (827 + 12), with no existing test modified.
 7. `git diff` shows zero changed lines inside `_save()`'s temp-file + `os.replace` block.
-8. Decisions 1-3 are recorded in this document with their reopening conditions, and the parent spec's Open Questions 4-6 are marked resolved against it.
+8. Decisions 1-3 are recorded in this document with their reopening conditions. The parent spec's Open Questions **5 and 6** are marked resolved against it; **4 (cross-process concurrency) stays open** and is restated as Open Question 3 below — this spec chooses not to make that race worse, which is not the same as fixing it.
 
 ## Open Questions
 

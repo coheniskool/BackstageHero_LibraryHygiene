@@ -37,23 +37,23 @@ Baseline before any of this: **827 passed, 1 skipped** (verified at merge `20430
 - [x] `pytest tests/test_chorus_cache.py -v` green
 
 ## Task 3: Prune floor — `ttl_days` stops being destructive
-- [ ] `__init__` (:98-119) — `self._prune_seconds = max(self.ttl_seconds, DEFAULT_TTL_DAYS * _SECONDS_PER_DAY)`, **before** `_load()`
-- [ ] Existing initialization-order comment (:102-114) gains one clause naming `_prune_seconds` — not a rewrite
-- [ ] `_compact()` (:175) — `age >= self._prune_seconds`; the only line of logic that moves
-- [ ] `_compact()` docstring — paragraph on why reading and pruning use different horizons (only pruning is destructive)
-- [ ] Class docstring (:89-95) — rewrite the `ttl_days` paragraph from warning to guarantee, keeping the reason so the `max()` isn't later "simplified" away
-- [ ] `test_shorter_ttl_does_not_delete_what_a_default_caller_would_serve` — confirm it fails on `main` first
-- [ ] `test_shorter_ttl_still_refuses_to_serve_a_stale_entry`
-- [ ] `test_longer_ttl_prunes_at_its_own_horizon`
-- [ ] Regression: `test_entry_expires_after_ttl` (:78) and `test_entry_at_exactly_ttl_is_pruned` (:780) pass unmodified
-- [ ] `pytest tests/test_chorus_cache.py -v` green
+- [x] `__init__` (:98-119) — `self._prune_seconds = max(self.ttl_seconds, DEFAULT_TTL_DAYS * _SECONDS_PER_DAY)`, **before** `_load()`
+- [x] Existing initialization-order comment (:102-114) gains one clause naming `_prune_seconds` — not a rewrite
+- [x] `_compact()` (:175) — `age >= self._prune_seconds`; the only line of logic that moves
+- [x] `_compact()` docstring — paragraph on why reading and pruning use different horizons (only pruning is destructive)
+- [x] Class docstring (:89-95) — rewrite the `ttl_days` paragraph from warning to guarantee, keeping the reason so the `max()` isn't later "simplified" away
+- [x] `test_shorter_ttl_does_not_delete_what_a_default_caller_would_serve` — confirm it fails on `main` first
+- [x] `test_shorter_ttl_still_refuses_to_serve_a_stale_entry`
+- [x] `test_longer_ttl_prunes_at_its_own_horizon`
+- [x] Regression: `test_entry_expires_after_ttl` (:78) and `test_entry_at_exactly_ttl_is_pruned` (:780) pass unmodified
+- [x] `pytest tests/test_chorus_cache.py -v` green
 
 ## ▶ Checkpoint 2 (final)
-- [ ] `pytest tests/ -q` → **839 passed, 1 skipped**
-- [ ] `git diff --stat` — `chorus_cache.py` only; `library_enrichment.py` unchanged; `tests/` additions only
-- [ ] Read-check: **zero** changed lines inside `_save()`'s temp-file + `os.replace` block (Success Criterion 7)
-- [ ] Read-check: every new comment carries its date and its why; no comment restates its code
-- [ ] Mark SPEC-chorus-cache-write-perf.md's Open Questions 4-6 resolved against this spec (Success Criterion 8)
+- [x] `pytest tests/ -q` → **839 passed, 1 skipped**
+- [x] `git diff --stat` — `chorus_cache.py` only; `library_enrichment.py` unchanged; `tests/` additions only
+- [x] Read-check: **zero** changed lines inside `_save()`'s temp-file + `os.replace` block (Success Criterion 7)
+- [x] Read-check: every new comment carries its date and its why; no comment restates its code
+- [x] Mark SPEC-chorus-cache-write-perf.md's Open Questions **5 and 6** resolved against this spec; **4 stays open** (cross-process concurrency — this change declines to make it worse, which is not a fix). Success Criterion 8 corrected to match
 
 ## Not in scope — decided, not deferred again
 - [x] **`RecursionError` handler** — subsumed by Task 1's backstop; gets a regression test, not a handler (Spec Decision 1)
