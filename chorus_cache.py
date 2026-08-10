@@ -74,6 +74,43 @@ class CachedChorusClient:
         except (OSError, ValueError) as e:
             log.warning('Could not read Chorus cache %s: %s', self.cache_path, e)
             self._entries = {}
+            return
+        if not isinstance(self._entries, dict):
+            # Valid JSON of the wrong shape. Same outcome as unparseable --
+            # start empty rather than let it fail later at the first lookup.
+            log.warning('Chorus cache %s is not an object; ignoring', self.cache_path)
+            self._entries = {}
+            return
+        self._prune_expired()
+
+    def _prune_expired(self):
+        """Drop entries the TTL has already made unreachable.
+
+        search_by_artist_title() has always checked the TTL on read, so an
+        expired entry can never be returned to a caller -- but nothing ever
+        removed one, so it was re-serialized by every save forever. On the
+        live cache on 2026-08-10 that was 5,379 of 7,743 entries (69%) riding
+        along in every 126 MB rewrite. Dropping them is pure win: no caller
+        can observe a difference.
+
+        Marks the cache dirty so the shrunken form actually reaches disk --
+        without that, a run with zero cache misses would drop them in memory
+        and leave the file exactly as big as it was.
+        """
+        now = time.time()
+        kept = {}
+        for key, entry in self._entries.items():
+            try:
+                age = now - entry['cached_at']
+            except (KeyError, TypeError):
+                # Malformed entry: unreadable is indistinguishable from
+                # expired, and the read path would have raised on it.
+                continue
+            if age < self.ttl_seconds:
+                kept[key] = entry
+        if len(kept) != len(self._entries):
+            self._entries = kept
+            self._dirty += 1
 
     def _save(self):
         """Atomic write (temp file + os.replace), returning True if the cache

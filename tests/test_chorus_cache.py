@@ -322,3 +322,114 @@ def test_failed_save_does_not_retry_on_every_lookup(tmp_path, monkeypatch):
     fake_now[0] += cc.FLUSH_EVERY_SECONDS + 1
     client.search_by_artist_title('Artist 9', 'Title')
     assert len(attempts) == 2, 'the retry should resume at the time threshold'
+
+
+# --- TTL prune on load (SPEC-chorus-cache-write-perf.md) --------------------
+# The TTL was only ever checked on READ, so an expired entry was unreachable
+# but never removed -- it rode along in every save forever. Measured on the
+# live cache 2026-08-10: 5,379 of 7,743 entries (69%) were already expired.
+
+
+def _write_cache(cache_path, entries):
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(entries, f)
+
+
+def test_expired_entries_pruned_on_load(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    fresh_key = cc._cache_key('Styx', 'Mr. Roboto')
+    stale_key = cc._cache_key('3 Doors Down', 'Kryptonite')
+    _write_cache(cache_path, {
+        fresh_key: {'result': _RESULT_B, 'cached_at': now - 86400},
+        stale_key: {'result': _RESULT_A, 'cached_at': now - 30 * 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert list(json.load(f)) == [fresh_key]
+
+
+def test_prune_on_load_does_not_lose_fresh_entries(tmp_path, monkeypatch):
+    """The guard against an over-eager prune: a within-TTL entry must still
+    serve a lookup from cache rather than going back to the network."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        cc._cache_key('Styx', 'Mr. Roboto'): {'result': _RESULT_B, 'cached_at': now - 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+
+    assert client.search_by_artist_title('Styx', 'Mr. Roboto') == _RESULT_B
+    assert calls == []  # served from the surviving entry, no network
+
+
+def test_malformed_cached_at_treated_as_expired(tmp_path, monkeypatch):
+    """Before the prune, the read path would have raised on these. Unreadable
+    is indistinguishable from expired, and a cache must never be the reason a
+    run can't start."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    good_key = cc._cache_key('Styx', 'Mr. Roboto')
+    _write_cache(cache_path, {
+        'missing-timestamp': {'result': _RESULT_A},
+        'non-numeric-timestamp': {'result': _RESULT_A, 'cached_at': 'yesterday'},
+        good_key: {'result': _RESULT_B, 'cached_at': now - 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path)  # must not raise
+    client.flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert list(json.load(f)) == [good_key]
+
+
+def test_prune_on_load_persists_at_next_flush(tmp_path, monkeypatch):
+    """A run with zero cache misses must still shrink the file -- otherwise
+    the expired entries are only dropped in memory and the 126 MB measured on
+    2026-08-10 is never actually reclaimed on disk."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        'stale': {'result': _RESULT_A, 'cached_at': now - 30 * 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    client.flush()  # no lookups happened at all
+
+    assert len(saves) == 1
+
+
+def test_load_with_nothing_to_prune_does_not_mark_dirty(tmp_path, monkeypatch):
+    """The other side of the eager-shrink rule: a cache that needed no
+    pruning must not be rewritten for nothing on every run."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        cc._cache_key('Styx', 'Mr. Roboto'): {'result': _RESULT_B, 'cached_at': now - 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    saves = _count_saves(monkeypatch)
+    client.flush()
+
+    assert saves == []
