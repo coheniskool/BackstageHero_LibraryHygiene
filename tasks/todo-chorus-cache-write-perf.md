@@ -68,11 +68,11 @@ See [`plan-chorus-cache-write-perf.md`](plan-chorus-cache-write-perf.md) for ful
 - [x] Confirm the copy reloads cleanly into a second client with no further pruning
 
 ## ▶ Checkpoint (final)
-- [ ] `pytest tests/ -q` full suite green
-- [ ] Diff review: only `chorus_cache.py`, `library_enrichment.py`, `tests/test_chorus_cache.py`, `tests/test_library_enrichment.py` touched — no new dependency, no `atexit`/`signal` hook, no background flush thread, no cross-process lock, no JSONL, no changes to `chorus_client.py`/`metadata_enrichment.py`/`dedupe_report.py`/`gui.py`
-- [ ] Confirm the three spec success criteria in the plan file's Final Checkpoint section
-- [ ] Read-check (not just green tests): atomic temp + `os.replace` intact; `search_by_artist_title()` still never raises on cache trouble
-- [ ] **Leave the 2026-08-10 stall investigation open** — this fix is not evidence about it
+- [x] `pytest tests/ -q` full suite green
+- [x] Diff review: only `chorus_cache.py`, `library_enrichment.py`, `tests/test_chorus_cache.py`, `tests/test_library_enrichment.py` touched — no new dependency, no `atexit`/`signal` hook, no background flush thread, no cross-process lock, no JSONL, no changes to `chorus_client.py`/`metadata_enrichment.py`/`dedupe_report.py`/`gui.py`
+- [x] Confirm the three spec success criteria in the plan file's Final Checkpoint section
+- [x] Read-check (not just green tests): atomic temp + `os.replace` intact; `search_by_artist_title()` still never raises on cache trouble
+- [x] **Leave the 2026-08-10 stall investigation open** — this fix is not evidence about it
 
 ---
 
