@@ -127,7 +127,9 @@ Recorded here so a future reader knows it was weighed rather than missed.
 
 - If the process is killed between flushes, at most `FLUSH_EVERY_N_INSERTS` (25) entries — or one `FLUSH_EVERY_SECONDS` (60 s) window's worth, whichever came first — are lost.
 - The cost of that loss is bounded and non-destructive: the next run re-issues those Chorus lookups. No library file, no sidecar, and no user data is affected. The cache holds nothing that cannot be recomputed from the network.
-- What is **not** acceptable, and does not change here, is a *corrupt* cache. The temp + `os.replace` discipline stays exactly as it is: any crash — mid-write, mid-run, machine power loss — must leave either the previous complete file or the new complete file, never a hybrid. A multi-day unattended background run is precisely the crash-mid-write scenario that discipline exists for.
+- What is **not** acceptable, and does not change here, is a *corrupt* cache. The temp + `os.replace` discipline stays exactly as it is: a crash or forced-close mid-write leaves either the previous complete file or the new complete file, never a hybrid. A multi-day unattended background run is precisely the crash-mid-write scenario that discipline exists for.
+
+  **Precision, added at ship review:** that guarantee covers process-level crashes, not *machine* power loss. `os.replace` without a preceding `f.flush()` + `os.fsync()` does not order the data write against the rename, so a power cut can in principle leave the renamed file with unwritten contents. Adding `fsync` is deliberately **not** in scope here — this spec's whole discipline is "batching changes *when* we write, never *how*" — but the durability claim should not be stated more strongly than the code delivers. For a recomputable cache the distinction costs a re-lookup, which is the same price this spec already accepts for a kill between flushes.
 
 The trade being made is explicit: **up to 25 recomputable lookups** in exchange for **removing ~1 TB of writes and ~2 hours of CPU from a full pass.**
 
@@ -213,7 +215,13 @@ Explicitly **not** in scope as a test: a live run against the real 126 MB cache.
 
    Recorded rather than fixed, because the honest magnitude is small: the dominant loss in that race has always been the whole-file clobber itself — the losing process's entire dict is replaced regardless — and 25 additional entries is a rounding error on top of a total loss. It is not a new failure mode, only marginally more of an existing one. If cross-process protection is ever built, it belongs in one place covering both specs, not bolted onto this one.
 
-5. **`ttl_days` is destructive** (raised at code review, 2026-08-10). Because `_compact()` prunes at load and the result is written back, constructing a client with a shorter `ttl_days` against a shared cache file permanently deletes entries a default-TTL caller would still have served. Latent today — `enrich_library()` is the only construction site and takes the default — and now stated in the class docstring. Flagged here because it is a data-loss-shaped consequence of prune-on-load that the original spec did not anticipate.
+5. **Deferred hardening from the ship review** (2026-08-10). Three findings were judged real but out of scope for this change, recorded so they read as decided rather than missed:
+
+   - **`RecursionError` at load.** `json.load` raises it (not `ValueError`) on deeply nested input, so it escapes `_load()`'s handler and kills construction with no self-heal. Verified **pre-existing** — identical on `main` — and unreachable from the API, since `chorus_client.py` caps responses at 1 MiB and swallows its own parse errors. Only a hand-crafted disk file gets there.
+   - **The better fix for both this and the `OverflowError` case is a self-heal path**: on any unrecoverable read/compact failure, log and reset to `{}` rather than propagate. A convenience cache should cost a re-lookup when corrupt, never a permanently dead feature. That subsumes the individual exception-tuple patches and deserves its own small change rather than being bolted on here.
+   - **Predictable `.tmp` sibling name.** `_save()` uses a fixed `<cache>.tmp` rather than `mkstemp`, and `open()` follows symlinks. A non-issue while the library folder is local and single-user — anyone who can plant a symlink there can already write the cache directly — but it becomes a real write-redirect primitive if that folder is ever on a network share or multi-user volume. Note batching makes the existing TOCTOU window *rarer*, not worse.
+
+6. **`ttl_days` is destructive** (raised at code review, 2026-08-10). Because `_compact()` prunes at load and the result is written back, constructing a client with a shorter `ttl_days` against a shared cache file permanently deletes entries a default-TTL caller would still have served. Latent today — `enrich_library()` is the only construction site and takes the default — and now stated in the class docstring. Flagged here because it is a data-loss-shaped consequence of prune-on-load that the original spec did not anticipate.
 
 ---
 

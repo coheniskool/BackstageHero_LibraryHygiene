@@ -201,8 +201,12 @@ class CachedChorusClient:
         """
         if not self.cache_path:
             return
-        tmp_path = self.cache_path.with_name(self.cache_path.name + '.tmp')
         try:
+            # Inside the try: with_name() raises ValueError on a degenerate
+            # path (a bare drive root, '.'), which --chorus-cache lets a user
+            # supply. Outside, that escaped search_by_artist_title() and broke
+            # its never-raises contract over a typo.
+            tmp_path = self.cache_path.with_name(self.cache_path.name + '.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self._entries, f)
             os.replace(tmp_path, self.cache_path)

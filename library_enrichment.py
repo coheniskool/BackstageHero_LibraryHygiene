@@ -132,6 +132,14 @@ def _enrich_one_song(folder, chorus_client, scoredata):
     if artist and title:
         result = chorus_client.search_by_artist_title(artist, title)
         if result:
+            # These six fields must stay in lockstep with
+            # chorus_cache._CACHED_RESULT_FIELDS -- the cache returns a
+            # projection over exactly that allowlist, so a field read here
+            # that isn't cached there is silently always None. It also means
+            # a Chorus response carrying none of the six now trims to {},
+            # which is falsy, so chorus_match is None rather than a record of
+            # six Nones. That's the better outcome, but it is a change.
+            #
             # Match-confidence gating is metadata_enrichment.py's job (it
             # decides whether to WRITE ini fields); this is descriptive data
             # collection only, so no confidence score is claimed here.

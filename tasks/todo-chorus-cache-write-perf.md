@@ -5,7 +5,7 @@ See [`plan-chorus-cache-write-perf.md`](plan-chorus-cache-write-perf.md) for ful
 ## Task 1: Batched flush — `chorus_cache.py` write machinery + `enrich_library()` final flush
 - [x] Add constants `FLUSH_EVERY_N_INSERTS = 25`, `FLUSH_EVERY_SECONDS = 60` with a why-comment citing the 2026-08-10 measurement (126.42 MB / 7,743 entries / 0.75 s per `json.dumps`)
 - [x] `__init__` (:39-43) — `self._dirty = 0` **before** `self._load()`; `self._last_flush = time.time()` and `self._retry_not_before = 0.0` after it, with an in-code note on why the ordering matters
-- [x] `_save()` (:55-64) — return `True`/`False`; on success reset `_dirty = 0` and `_last_flush`; on `OSError` leave `_dirty` intact and set `_retry_not_before = time.time() + FLUSH_EVERY_SECONDS`
+- [x] `_save()` (:55-64) — on success reset `_dirty = 0`, `_last_flush` and `_retry_not_before`; on a failed write leave `_dirty` intact and set `_retry_not_before` one `FLUSH_EVERY_SECONDS` out (**deviation:** the plan said return `True`/`False`; dropped at code review because neither call site consumed it — see the `_save()` docstring)
 - [x] Add `_maybe_flush()` — no-op if `not _dirty` or still inside `_retry_not_before`; else save when `_dirty >= FLUSH_EVERY_N_INSERTS` or `FLUSH_EVERY_SECONDS` elapsed
 - [x] Add public `flush()` — unconditional last-chance persist, ignores `_retry_not_before`, cheap no-op when clean, docstring explains why callers need it
 - [x] `search_by_artist_title()` (:73-76) — replace `self._save()` with `self._dirty += 1` + `self._maybe_flush()`
