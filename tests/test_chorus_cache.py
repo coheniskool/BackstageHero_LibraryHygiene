@@ -4,6 +4,8 @@
 
 import json
 
+import pytest
+
 import chorus_cache as cc
 
 _RESULT_A = {'name': 'Kryptonite', 'artist': '3 Doors Down', 'genre': 'Rock'}
@@ -777,6 +779,203 @@ def test_save_leaves_no_tmp_file_behind(tmp_path, monkeypatch):
     assert sorted(p.name for p in tmp_path.iterdir()) == ['chorus_cache.json']
 
 
+# --- Self-heal on an unrecoverable load (SPEC-chorus-cache-robustness.md) ---
+# _load() caught (OSError, ValueError) and _compact() caught (KeyError,
+# TypeError, OverflowError) per entry. Anything else propagated out of
+# __init__ -- and since NOTHING has been written at that point, the bad file
+# was never pruned or replaced. Every later run read the same file and died
+# the same way. Under the GUI that killed the daemon enrichment thread
+# silently: the app survived, the feature did not, until the user found and
+# deleted a JSON file by hand.
+#
+# A convenience cache should cost a re-lookup when it is corrupt, never a
+# permanently dead feature.
+
+# ~200,000 nested arrays. Verified 2026-08-10 on Python 3.14.4: json.load
+# raises RecursionError on this, and RecursionError is NOT a ValueError, so it
+# went straight through _load()'s handler. Unreachable from the API --
+# chorus_client.py caps responses at 1 MiB and catches bare Exception -- so
+# only a hand-crafted or corrupted disk file gets here.
+_DEEPLY_NESTED_JSON = '[' * 200_000 + ']' * 200_000
+
+
+def test_deeply_nested_cache_file_is_survivable(tmp_path, monkeypatch):
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    cache_path.write_text(_DEEPLY_NESTED_JSON, encoding='utf-8')
+
+    client = cc.CachedChorusClient(cache_path=cache_path)  # must not raise
+
+    assert client.search_by_artist_title('3 Doors Down', 'Kryptonite') == _RESULT_A
+
+
+def test_unrecoverable_load_failure_costs_one_relookup_not_a_dead_feature(tmp_path, monkeypatch):
+    """The whole promise, asserted as behavior rather than internal state: a
+    file we cannot make sense of costs the run its cached lookups ONCE. The
+    next run reads a healed file and pays nothing."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    cache_path.write_text(_DEEPLY_NESTED_JSON, encoding='utf-8')
+
+    first = cc.CachedChorusClient(cache_path=cache_path)
+    first.search_by_artist_title('3 Doors Down', 'Kryptonite')
+    first.flush()
+
+    second = cc.CachedChorusClient(cache_path=cache_path)
+    assert second.search_by_artist_title('3 Doors Down', 'Kryptonite') == _RESULT_A
+    assert len(calls) == 1, 'the healed cache should have served the second run'
+
+
+def test_unparseable_cache_is_replaced_at_next_flush(tmp_path, monkeypatch):
+    """The half of self-heal that isn't just "doesn't crash": the garbage has
+    to actually leave the disk, or every future run pays the same failed
+    parse. A run with zero cache misses is the case that proves it."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    cache_path.write_text('{not valid json', encoding='utf-8')
+
+    cc.CachedChorusClient(cache_path=cache_path).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert json.load(f) == {}
+
+
+def test_wrong_shape_cache_is_replaced_at_next_flush(tmp_path, monkeypatch):
+    """Valid JSON of the wrong shape takes the same branch -- unusable, not
+    unreadable."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    cache_path.write_text('[1, 2, 3]', encoding='utf-8')
+
+    cc.CachedChorusClient(cache_path=cache_path).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert json.load(f) == {}
+
+
+def test_unreadable_cache_is_not_replaced(tmp_path, monkeypatch):
+    """The deliberate asymmetry, and the one line the Never Do list is about.
+
+    An OSError means we could not READ the file. That is not evidence the
+    file is BAD: WinError 32 is transient-but-repeated here (see
+    SPEC-chorus-reliability-fix.md) and a concurrent process caught mid
+    os.replace looks identical. Replacing a good cache with {} because it was
+    locked for one moment would be worse than the failure being handled.
+    """
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        cc._cache_key('Styx', 'Mr. Roboto'): {'result': _RESULT_B, 'cached_at': now - 86400},
+    })
+    original = cache_path.read_bytes()
+
+    real_open = open
+    deny = [True]
+
+    def denied_while_loading(*a, **k):
+        if deny[0]:
+            raise OSError(13, 'Permission denied')
+        return real_open(*a, **k)
+    monkeypatch.setattr('builtins.open', denied_while_loading)
+
+    client = cc.CachedChorusClient(cache_path=cache_path)  # the read fails
+    deny[0] = False
+    client.flush()
+
+    assert cache_path.read_bytes() == original, 'a cache we merely could not read was clobbered'
+
+
+def test_load_failure_does_not_swallow_keyboardinterrupt(tmp_path, monkeypatch):
+    """The backstop is `except Exception`, never `except BaseException`. A
+    Ctrl-C during the 0.80s json.load of a 126 MB file has to abort the run --
+    swallowing it makes the app feel hung at exactly the moment the user is
+    trying to stop it."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {})
+
+    def _interrupted(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(cc.json, 'load', _interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        cc.CachedChorusClient(cache_path=cache_path)
+
+
+def test_compact_failure_is_survivable(tmp_path, monkeypatch):
+    """The backstop has to cover compaction, not just the parse. _compact()'s
+    per-entry handler is enumerated, and the next person to add a line to that
+    loop shouldn't have to re-derive which exceptions kill __init__."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        cc._cache_key('Styx', 'Mr. Roboto'): {'result': _RESULT_B, 'cached_at': now - 86400},
+    })
+
+    real_trim = cc._trim
+    exploding = [True]
+
+    def _exploding_trim(result):
+        if exploding[0]:
+            raise RecursionError('maximum recursion depth exceeded')
+        return real_trim(result)
+    monkeypatch.setattr(cc, '_trim', _exploding_trim)
+
+    client = cc.CachedChorusClient(cache_path=cache_path)  # must not raise
+    exploding[0] = False
+
+    assert client.search_by_artist_title('3 Doors Down', 'Kryptonite') == _RESULT_A
+
+
+def test_save_does_not_raise_on_recursionerror(tmp_path, monkeypatch):
+    """The write-path half of the same hole. Verified 2026-08-10 on Python
+    3.14.4: json.dump raises RecursionError too, which _save()'s
+    (OSError, TypeError, ValueError) equally missed.
+
+    Blast radius is arguably worse here than at load: flush() is called from
+    a `finally` in enrich_library(), where a raise would REPLACE the
+    exception that actually killed the run. And a failed write must still
+    keep its pending window -- a survived failure does the same thing to the
+    counters whatever raised it.
+    """
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    monkeypatch.setattr(cc, 'FLUSH_EVERY_N_INSERTS', 1000)
+    cache_path = tmp_path / 'chorus_cache.json'
+
+    client = cc.CachedChorusClient(cache_path=cache_path)
+    client.search_by_artist_title('3 Doors Down', 'Kryptonite')
+
+    real_dump = cc.json.dump
+    fail = [True]
+
+    def recursive_dump(*a, **k):
+        if fail[0]:
+            raise RecursionError('maximum recursion depth exceeded')
+        return real_dump(*a, **k)
+    monkeypatch.setattr(cc.json, 'dump', recursive_dump)
+
+    client.flush()  # must not raise
+    assert not cache_path.exists()
+
+    fail[0] = False
+    client.flush()  # the entry must still be pending, and land this time
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert len(json.load(f)) == 1
+
+
 def test_entry_at_exactly_ttl_is_pruned(tmp_path, monkeypatch):
     """The read path uses `< ttl`, so `>= ttl` in _compact is the consistent
     choice. Pinned so the two cannot silently diverge."""
@@ -794,3 +993,74 @@ def test_entry_at_exactly_ttl_is_pruned(tmp_path, monkeypatch):
 
     with open(cache_path, encoding='utf-8') as f:
         assert json.load(f) == {}
+
+
+# --- Prune horizon vs read horizon (SPEC-chorus-cache-robustness.md) --------
+# _compact() pruned against self.ttl_seconds and the shrunken result was
+# written back, so a client constructed with a SHORTER ttl_days against a
+# shared cache file permanently deleted entries a default-TTL caller would
+# still have served. Reading and pruning are different questions -- "will I
+# serve this?" is per-instance, "may I delete this for everyone?" is not --
+# so only the second one is floored at the default.
+
+
+def test_shorter_ttl_does_not_delete_what_a_default_caller_would_serve(tmp_path, monkeypatch):
+    """The data-loss shape. A 5-day-old entry is stale to a 1-day client but
+    perfectly good to the 7-day default, and one must not delete it out from
+    under the other."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    key = cc._cache_key('Styx', 'Mr. Roboto')
+    _write_cache(cache_path, {key: {'result': _RESULT_B, 'cached_at': now - 5 * 86400}})
+
+    cc.CachedChorusClient(cache_path=cache_path, ttl_days=1).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert list(json.load(f)) == [key]
+    # and the default-TTL caller can still be served by it
+    assert cc.CachedChorusClient(cache_path=cache_path).search_by_artist_title(
+        'Styx', 'Mr. Roboto') == _RESULT_B
+    assert calls == []
+
+
+def test_shorter_ttl_still_refuses_to_serve_a_stale_entry(tmp_path, monkeypatch):
+    """The other half. Keeping the entry on disk must not turn into serving
+    it: a 1-day client still considers a 5-day-old entry stale and goes back
+    to the network."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    _write_cache(cache_path, {
+        cc._cache_key('Styx', 'Mr. Roboto'): {'result': _RESULT_B, 'cached_at': now - 5 * 86400},
+    })
+
+    client = cc.CachedChorusClient(cache_path=cache_path, ttl_days=1)
+
+    assert client.search_by_artist_title('Styx', 'Mr. Roboto') == _RESULT_A
+    assert calls == [('Styx', 'Mr. Roboto')]
+
+
+def test_longer_ttl_prunes_at_its_own_horizon(tmp_path, monkeypatch):
+    """The floor must not become a ceiling. A 30-day client prunes at 30
+    days, not 7 -- otherwise the file stops being bounded, which is the
+    growth problem SPEC-chorus-cache-write-perf.md closed."""
+    calls = []
+    _stub(monkeypatch, calls, result=_RESULT_A)
+    now = 1_000_000.0
+    monkeypatch.setattr(cc.time, 'time', lambda: now)
+    cache_path = tmp_path / 'chorus_cache.json'
+    kept_key = cc._cache_key('Styx', 'Mr. Roboto')
+    _write_cache(cache_path, {
+        kept_key: {'result': _RESULT_B, 'cached_at': now - 10 * 86400},
+        'past-thirty-days': {'result': _RESULT_A, 'cached_at': now - 40 * 86400},
+    })
+
+    cc.CachedChorusClient(cache_path=cache_path, ttl_days=30).flush()
+
+    with open(cache_path, encoding='utf-8') as f:
+        assert list(json.load(f)) == [kept_key]

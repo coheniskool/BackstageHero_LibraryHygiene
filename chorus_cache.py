@@ -86,24 +86,35 @@ class CachedChorusClient:
     Writes are batched, so a caller doing a run of lookups must flush() when
     the run ends.
 
-    ttl_days is DESTRUCTIVE, not advisory: _compact() drops expired entries at
-    load and the shrunken form is written back, so constructing this against a
-    shared cache_path with a shorter ttl_days than another caller uses will
-    permanently delete entries that caller would still have served. Harmless
-    today -- library_enrichment.enrich_library() is the only construction site
-    and takes the default -- but pass a custom ttl_days against a shared file
-    only if you mean to prune it for everyone.
+    ttl_days controls what THIS instance will serve, and nothing more. Because
+    _compact() prunes at load and the shrunken form is written back, a short
+    ttl_days used to permanently delete entries a default-TTL caller would
+    still have been served -- a data-loss-shaped consequence of prune-on-load
+    that SPEC-chorus-cache-write-perf.md did not anticipate. Deletion is now
+    floored at DEFAULT_TTL_DAYS (see _prune_seconds), so a shorter ttl_days
+    narrows what you get served without narrowing what anyone else keeps. A
+    longer one prunes at its own horizon, which takes nothing from anybody.
     """
 
     def __init__(self, cache_path=None, ttl_days=DEFAULT_TTL_DAYS):
         self.cache_path = Path(cache_path) if cache_path else None
         self.ttl_seconds = ttl_days * _SECONDS_PER_DAY
+        # Reading and pruning are different questions, so they get different
+        # horizons. ttl_seconds answers "will I serve this entry?", which is
+        # rightly per-instance. This answers "may I DELETE this entry, for
+        # everyone?" -- floored at the default so no instance can drop an
+        # entry a default-TTL caller would still have been served. Not
+        # redundant when ttl_days is the default; it is what keeps a shorter
+        # one from being destructive.
+        self._prune_seconds = max(self.ttl_seconds, DEFAULT_TTL_DAYS * _SECONDS_PER_DAY)
         self._entries = {}
-        # All three MUST be initialized before _load(): it sets _dirty when it
-        # drops or rewrites what it read, and that mark is how a shrunken
-        # cache reaches disk. Initializing any of them after _load() would
-        # silently discard that -- and if _load() ever grows a flush of its
-        # own, _maybe_flush() would hit an AttributeError on the other two.
+        # All of these MUST be initialized before _load(). It READS
+        # _prune_seconds to decide what to drop, and it SETS _dirty when it
+        # drops or rewrites what it read (or resets an unusable file), and
+        # that mark is how a shrunken or healed cache reaches disk.
+        # Initializing any of them after _load() would silently discard that
+        # -- and if _load() ever grows a flush of its own, _maybe_flush()
+        # would hit an AttributeError on the other two.
         #
         # Flush cadence runs on the MONOTONIC clock, not time.time(). These
         # measure elapsed time, and a backward wall-clock step (NTP
@@ -118,23 +129,69 @@ class CachedChorusClient:
         self._retry_not_before = 0.0
         self._load()
 
+    def _reset(self):
+        """Empty the cache AND mark it for replacement on disk.
+
+        The dirty mark is the self-heal. Without it, a file we couldn't make
+        sense of survives every run that happens to have zero cache misses,
+        and we pay the same failed parse forever. Deliberately NOT used for a
+        read failure -- see _load()'s OSError branch.
+        """
+        self._entries = {}
+        self._dirty += 1
+
     def _load(self):
         if not self.cache_path or not self.cache_path.exists():
             return
+        # Handler ORDER is load-bearing: OSError must precede the catch-all,
+        # or the one branch that deliberately does NOT overwrite the file
+        # becomes unreachable.
         try:
+            # Parsed into a local and assigned only once the shape check
+            # passes, so no failure path can leave the instance holding a
+            # half-processed structure.
             with open(self.cache_path, encoding='utf-8') as f:
-                self._entries = json.load(f)
-        except (OSError, ValueError) as e:
+                entries = json.load(f)
+            if not isinstance(entries, dict):
+                # Valid JSON of the wrong shape. Unusable, not unreadable --
+                # reset AND replace, same as unparseable.
+                log.warning('Chorus cache %s is not an object; starting empty',
+                            self.cache_path)
+                self._reset()
+                return
+            self._entries = entries
+            self._compact()
+        except OSError as e:
+            # UNREADABLE, which is not evidence the file is BAD. WinError 32
+            # is transient-but-repeated here (SPEC-chorus-reliability-fix.md),
+            # and a concurrent process caught mid-os.replace looks identical.
+            # Overwriting a file we merely couldn't read THIS ONCE would
+            # replace a good cache with {} -- worse than the failure being
+            # handled. So: empty in memory, untouched on disk.
             log.warning('Could not read Chorus cache %s: %s', self.cache_path, e)
             self._entries = {}
-            return
-        if not isinstance(self._entries, dict):
-            # Valid JSON of the wrong shape. Same outcome as unparseable --
-            # start empty rather than let it fail later at the first lookup.
-            log.warning('Chorus cache %s is not an object; ignoring', self.cache_path)
-            self._entries = {}
-            return
-        self._compact()
+        except Exception as e:
+            # The backstop, and the point is to stop enumerating. Reaching
+            # here means the file could not be turned into a usable cache by
+            # any path we know. The verified case is RecursionError from
+            # deeply nested JSON (2026-08-10, Python 3.14.4: json.load raises
+            # it, and it is NOT a ValueError) -- unreachable from the API,
+            # since chorus_client.py caps responses at 1 MiB and catches bare
+            # Exception, so only a hand-crafted or corrupted disk file gets
+            # here.
+            #
+            # Before this, such a failure escaped __init__ before anything had
+            # been written, so the bad file was never pruned or replaced:
+            # enrichment died the same way every run until the user deleted
+            # the cache by hand. Under the GUI that happens on the daemon
+            # enrichment thread -- the app survives, the feature doesn't.
+            #
+            # Exception, NEVER BaseException: a Ctrl-C during the 0.80s
+            # json.load of a 126 MB file has to abort the run, not be
+            # swallowed at exactly the moment the user is trying to stop.
+            log.warning('Chorus cache %s is unusable (%s: %s); starting empty',
+                        self.cache_path, type(e).__name__, e)
+            self._reset()
 
     def _compact(self):
         """Drop entries the TTL already made unreachable, and trim legacy
@@ -145,6 +202,11 @@ class CachedChorusClient:
         ever removed one, so it was re-serialized by every save forever. On
         the live cache on 2026-08-10 that was 5,379 of 7,743 entries (69%)
         riding along in every 126 MB rewrite.
+
+        Pruning uses _prune_seconds, NOT ttl_seconds, and the difference is
+        the point: refusing to serve an entry costs one re-lookup and affects
+        only this instance, while deleting it is permanent and affects every
+        caller of this file. Only the second one needs a floor.
 
         Trimming: entries written before the payload trim carry the whole
         Chorus response. This is their migration path -- the file shrinks in
@@ -172,7 +234,7 @@ class CachedChorusClient:
                 # the cache by hand.
                 changed = True
                 continue
-            if not math.isfinite(age) or age >= self.ttl_seconds:
+            if not math.isfinite(age) or age >= self._prune_seconds:
                 # json accepts the non-standard Infinity/NaN literals, and an
                 # infinite cached_at would otherwise read as never-expiring --
                 # served forever, refreshed never.
@@ -210,14 +272,26 @@ class CachedChorusClient:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(self._entries, f)
             os.replace(tmp_path, self.cache_path)
-        except (OSError, TypeError, ValueError) as e:
+        except Exception as e:
             # OSError is the expected case. TypeError/ValueError cover
             # json.dump choking on a value the API sent that isn't
             # JSON-native: flush() is called from a `finally` in
             # enrich_library(), where any raise would replace the run's real
             # exception with this one. A convenience cache must not be able to
             # rewrite what killed a run.
-            log.warning('Could not write Chorus cache %s: %s', self.cache_path, e)
+            #
+            # Caught as Exception rather than that tuple because the tuple was
+            # exactly as complete as _load()'s used to be: json.dump raises
+            # RecursionError on deeply nested input too (verified 2026-08-10,
+            # Python 3.14.4), and it is neither a TypeError nor a ValueError.
+            # Accepted cost, stated rather than discovered later: a catch-all
+            # can mask a bug a future refactor introduces as a logged warning
+            # instead of a red test. That is the price of the never-raise
+            # contract this docstring promises, and the same price already
+            # being paid for OSError -- type(e).__name__ in the log line is
+            # what keeps an unanticipated cause identifiable in log.txt.
+            log.warning('Could not write Chorus cache %s (%s): %s',
+                        self.cache_path, type(e).__name__, e)
             # _dirty deliberately survives: the pending window is retried, not
             # discarded. But that leaves _dirty over the threshold, so without
             # pacing every later lookup would re-attempt a failing write --
